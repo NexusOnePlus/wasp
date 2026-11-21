@@ -1,0 +1,364 @@
+//! Shared utility functions for the WhatsApp UI
+
+use chrono::{DateTime, Datelike as _, Local, Utc};
+use gpui::ImageFormat;
+
+/// How GPUI should decode these bytes, when they are a still picture at all.
+///
+/// `None` is the answer for everything that is not one, and it is a real
+/// answer rather than a failure: a row's `data` is whatever can be *shown*
+/// for it, and for a video that is a poster thumbnail right up until the file
+/// itself is fetched — after which [`MediaContent::adopt_full_bytes`] puts
+/// the MP4 in `data` and `video/mp4` beside it. Every surface that draws a
+/// still asks here first, so the one that has a frame to draw instead falls
+/// through to it.
+///
+/// [`MediaContent::adopt_full_bytes`]: velo_core::MediaContent::adopt_full_bytes
+pub fn mime_to_image_format(mime: &str) -> Option<ImageFormat> {
+    // The type, without its parameters and without regard to case: both are
+    // the sender's to choose (RFC 2045 §5.1), and `Image/JPEG` or
+    // `image/jpeg; charset=binary` are the same photo as `image/jpeg`.
+    // Compared rather than lowercased into a `String`, because this is asked
+    // per row per frame.
+    let essence = mime.split(';').next().unwrap_or(mime).trim();
+    for (name, format) in [
+        ("image/jpeg", ImageFormat::Jpeg),
+        // image/jpg is non-standard but some senders emit it
+        ("image/jpg", ImageFormat::Jpeg),
+        ("image/png", ImageFormat::Png),
+        ("image/gif", ImageFormat::Gif),
+        ("image/webp", ImageFormat::Webp),
+        ("image/bmp", ImageFormat::Bmp),
+    ] {
+        if essence.eq_ignore_ascii_case(name) {
+            return Some(format);
+        }
+    }
+
+    // A picture in a subtype we do not name. PNG is a guess, and one worth
+    // making: the bytes claim to be an image, and GPUI sniffing them itself
+    // is a better outcome than a row that draws nothing.
+    if essence
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+    {
+        log::warn!("unrecognized image MIME type {mime}, falling back to PNG");
+        return Some(ImageFormat::Png);
+    }
+
+    None
+}
+
+fn weekday(day: chrono::Weekday, short: bool) -> &'static str {
+    use crate::i18n::{Language, TextKey};
+    let names = if short {
+        [
+            TextKey::Mon,
+            TextKey::Tue,
+            TextKey::Wed,
+            TextKey::Thu,
+            TextKey::Fri,
+            TextKey::Sat,
+            TextKey::Sun,
+        ]
+    } else {
+        [
+            TextKey::Monday,
+            TextKey::Tuesday,
+            TextKey::Wednesday,
+            TextKey::Thursday,
+            TextKey::Friday,
+            TextKey::Saturday,
+            TextKey::Sunday,
+        ]
+    };
+    Language::current().text(names[day.num_days_from_monday() as usize])
+}
+
+/// Scale media dimensions to fit within `max_size` without upscaling, with a
+/// ~50px floor on the short side. Both fit and floor are single uniform
+/// factors so aspect ratio is always preserved; the floor yields to the
+/// `max_size` cap, so a pathological ratio (e.g. 200x20) keeps its shape and
+/// accepts a sub-50px short side instead of stretching or overflowing.
+pub fn scale_media_dimensions(width: u32, height: u32, max_size: f32) -> (f32, f32) {
+    let w = width.max(1) as f32;
+    let h = height.max(1) as f32;
+    let fit = (max_size / w).min(max_size / h).min(1.0);
+    let floor = 50.0 / (w.min(h) * fit);
+    let cap = (max_size / (w.max(h) * fit)).max(1.0);
+    let scale = fit * floor.clamp(1.0, cap);
+    (w * scale, h * scale)
+}
+
+/// How a timestamp reads in a conversation list.
+///
+/// The list answers "when", not "exactly when": today only needs a clock,
+/// this week only needs a weekday, and anything older needs a date. Spelling
+/// out a full date on every row would make the column unscannable.
+pub fn format_list_time(timestamp: &DateTime<Utc>) -> String {
+    let local: DateTime<Local> = timestamp.with_timezone(&Local);
+    let today = wacore::time::now_utc().with_timezone(&Local).date_naive();
+    let date = local.date_naive();
+
+    match (today - date).num_days() {
+        0 => local.format("%H:%M").to_string(),
+        1 => crate::tr!(Yesterday).to_string(),
+        // Inside the last week a weekday is both shorter and easier to place
+        // than a date.
+        2..=6 => weekday(local.weekday(), true).to_owned(),
+        _ => local.format("%d/%m/%Y").to_string(),
+    }
+}
+
+/// When a status update was posted.
+///
+/// Always with a clock time, unlike a chat row: a status lives 24 hours, so
+/// every one of them is either today or yesterday and "Yesterday" on its own
+/// narrows it to nothing. The one that matters is how long is left, and that
+/// is what the hour tells you.
+pub fn format_status_time(timestamp: &DateTime<Utc>) -> String {
+    let local: DateTime<Local> = timestamp.with_timezone(&Local);
+    let today = wacore::time::now_utc().with_timezone(&Local).date_naive();
+
+    match (today - local.date_naive()).num_days() {
+        0 => local.format(crate::tr!(TodayAtHM)).to_string(),
+        1 => local.format(crate::tr!(YesterdayAtHM)).to_string(),
+        _ => local.format(crate::tr!(DMYAtHM)).to_string(),
+    }
+}
+
+/// The heading over a group of messages sent on the same day.
+pub fn format_date_divider(timestamp: &DateTime<Utc>) -> String {
+    let local: DateTime<Local> = timestamp.with_timezone(&Local);
+    let today = wacore::time::now_utc().with_timezone(&Local).date_naive();
+
+    match (today - local.date_naive()).num_days() {
+        0 => crate::tr!(Today).to_string(),
+        1 => crate::tr!(YesterdayText).to_string(),
+        2..=6 => weekday(local.weekday(), false).to_string(),
+        _ => local
+            .format(
+                if crate::i18n::Language::current() == crate::i18n::Language::Portuguese {
+                    "%d/%m/%Y"
+                } else {
+                    "%d %b %Y"
+                },
+            )
+            .to_string(),
+    }
+}
+
+/// Whether two messages fall on different local days, and so need a divider
+/// between them.
+pub fn crosses_day(previous: &DateTime<Utc>, current: &DateTime<Utc>) -> bool {
+    previous.with_timezone(&Local).date_naive() != current.with_timezone(&Local).date_naive()
+}
+
+/// Format a UTC timestamp as local time (HH:MM format).
+///
+/// Converts from UTC to the system's local timezone before formatting.
+/// This ensures timestamps are displayed correctly regardless of where
+/// the user is located.
+pub fn format_time_local(timestamp: &DateTime<Utc>) -> String {
+    let local: DateTime<Local> = timestamp.with_timezone(&Local);
+    local.format("%H:%M").to_string()
+}
+
+/// Longest a person's name may be where one is drawn.
+///
+/// A push name is whatever the peer typed and the wire carries it whole. It
+/// reaches the sidebar's preview line and the call card's pill, and both are
+/// laid out around it: a three-hundred-character name turns the sidebar row
+/// into nothing but the name, with the preview squeezed to zero, and pushes
+/// the call card off the left edge of the window with its drag handle. Sixty
+/// four is far past any name anybody chooses and short enough that the
+/// layout still owns the row.
+const MAX_NAME_CHARS: usize = 64;
+
+/// A name at a length a layout can hold.
+///
+/// Counted in `chars`, never in bytes: a name is somebody's, most of the
+/// world's are not ASCII, and cutting a UTF-8 sequence in half panics.
+/// Truncated here rather than only in the component, because the string is
+/// also measured, compared and put in tooltips.
+#[must_use]
+pub fn capped_name(name: &str) -> String {
+    let mut chars = name.chars();
+    let head: String = chars.by_ref().take(MAX_NAME_CHARS).collect();
+    if chars.next().is_none() {
+        head
+    } else {
+        format!("{head}\u{2026}")
+    }
+}
+
+/// A byte count as a person reads one.
+///
+/// MiB rather than MB, because every ceiling this is used on is a power of
+/// two and the two units are not the same: 64 MiB printed as "64.0 MB"
+/// understates itself by three megabytes, which matters exactly when somebody
+/// is reading the number to decide whether a file will fit.
+///
+/// Here rather than beside either caller, because both the sentence at the
+/// file chooser and the one on a refused send are read by the same person and
+/// must not disagree about what the limit is.
+pub fn format_size(bytes: u64) -> String {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a figure printed to one decimal place; the exact byte count is not the point"
+    )]
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    format!("{mib:.1} MiB")
+}
+
+/// Whether `haystack` contains `needle`, ignoring case, without allocating.
+///
+/// `needle` must already be lowercase — the search box lowercases what was
+/// typed once, when it is typed. The haystack is what cannot be prepared:
+/// it is a chat's name and JID, and the sidebar asks this of every chat it
+/// holds on every frame. `to_lowercase()` there is two `String`s per chat per
+/// frame for a question whose answer is almost always "no" by the second
+/// character.
+///
+/// Case folding is per character, which is what `char::to_lowercase` does and
+/// is very slightly less than `str::to_lowercase` promises: Greek final sigma
+/// is decided by its position in the word, and this cannot see the word. A
+/// search box is the right place to spend that.
+pub fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.char_indices().any(|(at, _)| {
+        let mut want = needle.chars();
+        let mut have = haystack[at..].chars().flat_map(char::to_lowercase);
+        loop {
+            match (want.next(), have.next()) {
+                // Every character of the needle matched.
+                (None, _) => return true,
+                // The haystack ran out first.
+                (Some(_), None) => return false,
+                (Some(w), Some(h)) if w != h => return false,
+                _ => {}
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    /// A push name is whatever the peer typed and the wire carries it whole:
+    /// three hundred characters turned the sidebar row into nothing but the
+    /// name, with the preview squeezed to zero and the message gone from the
+    /// list, and pushed the call card's pill off the left of the window.
+    #[test]
+    fn a_name_from_the_peer_cannot_be_any_length() {
+        let flood = "a".repeat(300);
+        let capped = super::capped_name(&flood);
+        assert_eq!(capped.chars().count(), super::MAX_NAME_CHARS + 1);
+        assert!(capped.ends_with('\u{2026}'));
+
+        // An ordinary name is handed back exactly as it was.
+        assert_eq!(super::capped_name("Ana Souza"), "Ana Souza");
+    }
+
+    /// Counted in characters, never in bytes: most of the world's names are
+    /// not ASCII, and cutting a UTF-8 sequence in half panics.
+    #[test]
+    fn a_name_is_cut_between_characters() {
+        let accented = "á".repeat(super::MAX_NAME_CHARS + 10);
+        let capped = super::capped_name(&accented);
+        assert_eq!(capped.chars().count(), super::MAX_NAME_CHARS + 1);
+        // Emoji are several bytes and one character each.
+        let emoji = "🇧🇷".repeat(super::MAX_NAME_CHARS);
+        assert!(super::capped_name(&emoji).chars().count() <= super::MAX_NAME_CHARS + 1);
+    }
+
+    use super::{mime_to_image_format, scale_media_dimensions};
+    use gpui::ImageFormat;
+
+    #[test]
+    fn names_the_formats_senders_actually_use() {
+        assert_eq!(mime_to_image_format("image/jpeg"), Some(ImageFormat::Jpeg));
+        // Non-standard, and emitted anyway.
+        assert_eq!(mime_to_image_format("image/jpg"), Some(ImageFormat::Jpeg));
+        assert_eq!(mime_to_image_format("image/webp"), Some(ImageFormat::Webp));
+    }
+
+    #[test]
+    fn guesses_only_within_images() {
+        assert_eq!(mime_to_image_format("image/avif"), Some(ImageFormat::Png));
+    }
+
+    /// Case and parameters are the sender's to choose, and neither changes
+    /// what the bytes are.
+    #[test]
+    fn the_type_is_read_as_the_sender_may_spell_it() {
+        assert_eq!(mime_to_image_format("Image/JPEG"), Some(ImageFormat::Jpeg));
+        assert_eq!(
+            mime_to_image_format("image/webp; charset=binary"),
+            Some(ImageFormat::Webp)
+        );
+        assert_eq!(mime_to_image_format("IMAGE/AVIF"), Some(ImageFormat::Png));
+        assert_eq!(mime_to_image_format("Video/MP4"), None);
+    }
+
+    #[test]
+    fn a_video_is_not_a_still() {
+        // What a status posted as a photo with music arrives as: an MP4 with
+        // two keyframes. Decoding it as a picture is a guess that can only
+        // draw nothing, and the surfaces that ask have a frame to draw.
+        assert_eq!(mime_to_image_format("video/mp4"), None);
+        assert_eq!(mime_to_image_format("audio/ogg; codecs=opus"), None);
+        assert_eq!(mime_to_image_format("application/pdf"), None);
+    }
+
+    fn assert_close(actual: (f32, f32), expected: (f32, f32)) {
+        assert!(
+            (actual.0 - expected.0).abs() < 0.01 && (actual.1 - expected.1).abs() < 0.01,
+            "{actual:?} != {expected:?}"
+        );
+    }
+
+    #[test]
+    fn shrinks_large_media_uniformly() {
+        assert_close(scale_media_dimensions(4000, 3000, 300.0), (300.0, 225.0));
+    }
+
+    #[test]
+    fn floors_tiny_media_uniformly() {
+        assert_close(scale_media_dimensions(10, 10, 300.0), (50.0, 50.0));
+    }
+
+    #[test]
+    fn extreme_ratio_keeps_shape_and_respects_cap() {
+        // 10:1 stays 10:1; the floor grow stops at max_size instead of
+        // stretching only the short side (the old per-axis behavior).
+        assert_close(scale_media_dimensions(200, 20, 300.0), (300.0, 30.0));
+    }
+}
+
+#[cfg(test)]
+mod case_insensitive_search {
+    use super::contains_ignore_case;
+
+    #[test]
+    fn it_agrees_with_the_allocating_form() {
+        for (haystack, needle) in [
+            ("Ana Paula", "ana"),
+            ("Ana Paula", "PAULA"),
+            ("Ana Paula", "paulo"),
+            ("ÅNGSTRÖM", "ngström"),
+            ("grupo do prédio", "prédio"),
+            ("", "a"),
+            ("a", ""),
+            ("5511999999999@s.whatsapp.net", "9999"),
+        ] {
+            let lowered = needle.to_lowercase();
+            assert_eq!(
+                contains_ignore_case(haystack, &lowered),
+                haystack.to_lowercase().contains(&lowered),
+                "{haystack:?} contains {needle:?}"
+            );
+        }
+    }
+}

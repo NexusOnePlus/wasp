@@ -1,0 +1,257 @@
+# Cross-platform binary build, called by both nightly.yml and release.yml so
+# the artifact a tag ships is produced exactly like the one main produces.
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version string embedded in artifact names
+        required: true
+        type: string
+      ref:
+        description: >
+          Revision to build. Empty means the one the run was started from,
+          which is right for a tag push and wrong for a manual release: a
+          `workflow_dispatch` naming an existing tag is launched from a
+          branch, so without this the archives would carry that branch's
+          code under the tag's name.
+        required: false
+        default: ""
+        type: string
+    secrets:
+      # Authenticode signing for the Windows binaries. All optional: without
+      # them the build is unsigned, exactly as before. See
+      # packaging/windows/SIGNING.md for what each one is.
+      WINDOWS_SIGNING_PFX_BASE64:
+        required: false
+      WINDOWS_SIGNING_PFX_PASSWORD:
+        required: false
+      WINDOWS_SIGNING_THUMBPRINT:
+        required: false
+
+# Read-only, and a called workflow does not inherit the caller's permissions
+# unless they are passed: building never needs to write to the repository.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing must not hide a working binary for the others;
+      # the caller decides whether a partial set is publishable.
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04, not latest: the binary links against the runner's glibc, and
+          # this keeps the floor low enough for stable distributions.
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: linux-aarch64
+            os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          # Apple Silicon only. The macos-13 (Intel) pool queues for tens of
+          # minutes on free runners, and an Intel build would hold the whole
+          # nightly behind it. Intel Macs can be covered later by building both
+          # targets here and joining them with `lipo`, at the cost of doubling
+          # this job.
+          - name: macos-aarch64
+            os: macos-15
+            target: aarch64-apple-darwin
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Empty checks out the ref the run was started from, which is the
+          # default and what a tag push wants.
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.100.0"
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # `--no-install-recommends`: what these headers recommend is
+          # documentation and tooling nothing links against, and it is a
+          # download and an unpack on every run of every job that needs them.
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libwayland-dev libxcb1-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libfontconfig1-dev libfreetype6-dev
+
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: protoc
+
+      # The registry and the git checkouts, and deliberately not `target/`.
+      #
+      # A repository gets 10 GB of Actions cache in total and GitHub evicts the
+      # least recently used entry to stay under it. What the other workflows
+      # write on a push to `main`, read off their own upload logs:
+      #
+      #   ci.yml   Check (Linux)     2.17 GB
+      #   ci.yml   Check (Windows)   2.07 GB
+      #   ci.yml   Check (macOS)     1.64 GB
+      #   ci.yml   MSRV              0.87 GB
+      #   pages.yml pages-wasm       1.14 GB
+      #
+      # Which is already 8 GB before this job writes a byte, and this job
+      # writes three more — a release target directory under fat LTO with
+      # `codegen-units = 1`, per platform. So the budget was being overrun on
+      # every push, and what went missing rotated: across the pull requests
+      # sampled while writing this, the macOS and Windows `Check` jobs
+      # restored nothing on any of them, which is what turned a 3m49 Windows
+      # job on `main` into 12m26 on the pull request twenty minutes later.
+      #
+      # There is no version of this that keeps all three. So this job keeps the
+      # half of the cache that is cheap — the crates.io registry and the
+      # `whatsapp-rust` git checkout — and gives up the half that is over
+      # budget.
+      #
+      # It is a real trade rather than a free win, and the Windows job is where
+      # it is worth stating: with its cache it restored for 2m05, built for
+      # 7m51, and then spent 7m10 uploading — 9m15 of a 17m45 job moving a
+      # cache around. Cold, it loses the 7m51 and gains a full release
+      # compile; whether that job comes out ahead or behind is not something
+      # this change can predict, and it is the one job here that nobody is
+      # waiting on. What every pull request gains is not in doubt: a warm cache
+      # on the two platforms where a cold one costs eight minutes.
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          # The one cache in this repository whose key does not carry the
+          # root manifest's hash, and for the reason the others do: what is
+          # stored here is `~/.cargo` alone, which is downloaded crates rather
+          # than compiled ones. A profile cannot make a `.crate` file stale.
+          key: ${{ matrix.target }}
+          cache-targets: "false"
+
+      # Three binaries, because they are one product now: the front end owns
+      # no WhatsApp session and starts `velod` beside itself when none is
+      # running, and `velo-cli` is the scriptable front end onto that same
+      # daemon. Shipping the UI alone would ship something that cannot connect
+      # to anything, and shipping without the CLI would leave the feature
+      # undiscoverable from the releases page.
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} --bin velo --bin velod --bin velo-cli
+
+      # Before packaging, so the archive carries signed files. Skipped, not
+      # failed, when no certificate is configured; when one is, a file that
+      # does not verify fails the job. The certificate arrives through secrets
+      # and the script never writes it anywhere but a temp file it deletes.
+      # A step's `if` cannot read secrets, nor its own `env`, so whether a
+      # certificate is configured is asked one step earlier.
+      - name: Check for a signing certificate
+        id: signing
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          PFX: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_THUMBPRINT }}
+        run: |
+          if [ -n "$PFX" ] || [ -n "$THUMBPRINT" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No signing certificate configured; the Windows build is unsigned."
+          fi
+
+      - name: Sign the Windows binaries
+        if: runner.os == 'Windows' && steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          WINDOWS_SIGNING_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_THUMBPRINT }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          ./packaging/windows/sign.ps1 -Files @(
+            "target/$env:TARGET/release/velo.exe",
+            "target/$env:TARGET/release/velod.exe",
+            "target/$env:TARGET/release/velo-cli.exe"
+          )
+
+      - name: Package the binaries for their platform
+        shell: bash
+        # Through the environment, not into the script. `release.yml` takes a
+        # tag from `workflow_dispatch`, and an expression interpolated into a
+        # `run:` block is substituted before bash ever sees it — quotes and
+        # all. Validated as well as quoted, because the value also becomes a
+        # file name.
+        env:
+          VERSION: ${{ inputs.version }}
+          PLATFORM: ${{ matrix.name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "$VERSION" in
+            *[!A-Za-z0-9._-]* | "" | -* | .*)
+              echo "refusing a version that is not a plain name: $VERSION" >&2
+              exit 1
+              ;;
+          esac
+          # One archive per platform, and the platform is in its *file* name.
+          # A directory would not do: `upload-artifact` stores a directory's
+          # contents at the artifact root, and the publish jobs download every
+          # platform with `merge-multiple`, so three sets of identically named
+          # binaries would land on top of each other and only one platform
+          # would survive into the release.
+          out="velo-$VERSION-$PLATFORM"
+          mkdir -p "$out"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            mv "target/$TARGET/release/velo.exe" "$out/"
+            mv "target/$TARGET/release/velod.exe" "$out/"
+            mv "target/$TARGET/release/velo-cli.exe" "$out/"
+            7z a -tzip "$out.zip" "$out" > /dev/null
+            echo "ASSET=$out.zip" >> "$GITHUB_ENV"
+          else
+            mv "target/$TARGET/release/velo" "$out/"
+            mv "target/$TARGET/release/velod" "$out/"
+            mv "target/$TARGET/release/velo-cli" "$out/"
+            # Preserving the execute bit, which the bare binaries never had:
+            # an archive can carry it where a raw asset download cannot.
+            chmod +x "$out/velo" "$out/velod" "$out/velo-cli"
+            if [ "${{ runner.os }}" = "Linux" ]; then
+              cp packaging/linux/install-desktop.sh packaging/linux/io.github.RuchinAudichya.Velo.png "$out/"
+              chmod +x "$out/install-desktop.sh"
+            fi
+            tar -czf "$out.tar.gz" "$out"
+            echo "ASSET=$out.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Verify archive contents and binary architecture
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          PLATFORM: ${{ matrix.name }}
+        run: python3 .github/scripts/check-release.py "$ASSET" "$VERSION" "$PLATFORM"
+
+      - name: Run the packaged CLI on its native runner
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          PLATFORM: ${{ matrix.name }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          cli="./velo-$VERSION-$PLATFORM/velo-cli"
+          if [ "$RUNNER_OS" = "Windows" ]; then cli="$cli.exe"; fi
+          "$cli" --help
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: velo-${{ matrix.name }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error

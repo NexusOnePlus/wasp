@@ -1,0 +1,74 @@
+[package]
+name = "velo-chat-store"
+description = "SQLite-backed chat and message history materialized from the whatsapp-rust event stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+# Held back from crates.io: the schema and the query surface are still moving,
+# and publishing pins both.
+publish = false
+
+[features]
+default = []
+# Full-text message search via SQLite FTS5 (virtual table + sync triggers,
+# created lazily at open; requires an FTS5-enabled SQLite, which the bundled
+# build of whatsapp-rust-sqlite-storage provides).
+search = []
+
+[dependencies]
+buffa = { workspace = true }
+# Selective proto compression (zlib-rs backend: pure Rust, same code on wasm).
+flate2 = { workspace = true }
+# `now` implies `std` and skips the local-timezone backends; only `Utc` is used.
+chrono = { workspace = true, features = ["now"] }
+diesel = { workspace = true }
+diesel_migrations = { workspace = true }
+# Legacy vCards can encode names using UTF-8 or a declared legacy charset.
+encoding_rs = "0.8.42"
+log = { workspace = true }
+velo-core = { workspace = true }
+# The one executor this crate names, on both targets: `tokio::spawn` inside
+# the session's runtime, the page's own loop in a browser. See `src/spawn.rs`.
+velo-platform = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+wacore = { workspace = true }
+wacore-binary = { workspace = true }
+waproto = { workspace = true }
+
+# The storage crate, twice, for the one feature that differs. The workspace
+# names no defaults, so the host half takes `bundled-sqlite` by name.
+#
+# Bundled SQLite exists to compile SQLite in-tree through `libsqlite3-sys`,
+# whose build script looks for a C toolchain and a system library — neither
+# of which a `wasm32-unknown-unknown` build has. Dropped there, diesel
+# supplies SQLite itself: it depends on `sqlite-wasm-rs` for wasm targets
+# and `libsqlite3-sys` for the rest, so the store is the same code over a
+# different C library rather than a second implementation.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+whatsapp-rust-sqlite-storage = { workspace = true, features = ["bundled-sqlite"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+whatsapp-rust-sqlite-storage = { workspace = true, default-features = false }
+# Both majors are in this graph and each refuses to build for wasm without
+# being told where the entropy comes from. The browser's own generator, as
+# everywhere else in the workspace.
+getrandom = { workspace = true }
+getrandom_02 = { workspace = true }
+
+[dev-dependencies]
+portable-atomic = { workspace = true }
+tokio = { workspace = true, features = [
+    "sync",
+    "rt",
+    "rt-multi-thread",
+    "time",
+    "macros",
+] }
+
+[lints]
+workspace = true

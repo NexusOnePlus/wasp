@@ -1,0 +1,1037 @@
+//! The bridge's own tests, and the fixtures the read tracker's share.
+//!
+//! `pub(super)` rather than private because [`super::read_tracker`] tests the
+//! unread model through the bridge — a read is bounded by what the daemon has
+//! observed, so the events that teach it are the fixture.
+
+use std::sync::Arc;
+
+use velo_core::{Chat, ChatMessage, UiEvent, fixtures};
+use velo_ipc::{ConnectionState, DaemonMessage};
+
+use super::translate::deadline_ms;
+use super::*;
+
+#[test]
+/// An incomplete close takes priority over every ordinary exit reason.
+fn failed_teardown_never_requests_recovery_or_a_clean_stop() {
+    for stopping in [false, true] {
+        for logged_out in [false, true] {
+            assert_eq!(
+                session_exit(false, true, stopping, logged_out),
+                AccountExit::SessionTeardownIncomplete
+            );
+            assert_eq!(
+                session_exit(true, false, stopping, logged_out),
+                AccountExit::SessionTeardownIncomplete
+            );
+        }
+    }
+    assert_eq!(
+        session_exit(true, true, false, false),
+        AccountExit::SessionEnded
+    );
+    assert_eq!(session_exit(true, true, true, false), AccountExit::Stopped);
+    assert_eq!(
+        session_exit(true, true, false, true),
+        AccountExit::SessionLoggedOut
+    );
+}
+
+pub(super) fn message(id: &str, sender: &str, secs: i64, from_me: bool, read: bool) -> ChatMessage {
+    let mut message = fixtures::message(id, sender, "hi");
+    // `secs` is the whole instant rather than an offset from [`fixtures::at`]:
+    // the read tracker is about ordering against timestamps its own tests
+    // build the same way, and small round numbers are what those read as.
+    message.timestamp = chrono::DateTime::from_timestamp(secs, 0).unwrap();
+    message.is_from_me = from_me;
+    message.is_read = read;
+    message
+}
+
+pub(super) fn received(chat_jid: &str, message: ChatMessage, sender_name: Option<&str>) -> UiEvent {
+    UiEvent::MessageReceived {
+        chat_jid: chat_jid.into(),
+        message: Box::new(message),
+        sender_name: sender_name.map(str::to_string),
+        chat_name: None,
+        notification_allowed: false,
+        notification_title: None,
+        notification_archived: None,
+        chat_muted_until_ms: None,
+    }
+}
+
+/// One chat as a store reload would present it — the shared fixture, under
+/// the name this module's callers already know it by.
+pub(super) fn stored_chat(jid: &str, unread: u32, messages: Vec<ChatMessage>) -> Chat {
+    fixtures::chat_with(jid, unread, messages)
+}
+
+pub(super) fn loaded(chats: Vec<Chat>) -> UiEvent {
+    UiEvent::HistoryLoaded {
+        chats,
+        complete: true,
+        next: None,
+    }
+}
+
+pub(super) fn bridge() -> Bridge {
+    // Folding an event is a pure function of the event and the state;
+    // a host with nothing loaded keeps it that way.
+    Bridge::new(
+        StateHub::new(),
+        Arc::new(velo_plugin_host::Plugins::nothing_loaded(Arc::new(|_| {}))),
+    )
+}
+
+#[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+#[tokio::test]
+async fn outgoing_accept_handler_reaches_daemon_wire() {
+    use velo_ipc::{DaemonEvent, StateVersion};
+    use velo_session::{OutgoingAcceptCase, outgoing_accept_events};
+
+    for case in OutgoingAcceptCase::ALL {
+        let events = outgoing_accept_events(case).await;
+        let (id, recipient) = events
+            .iter()
+            .find_map(|event| match event {
+                UiEvent::OutgoingCallStarted {
+                    call_id,
+                    recipient_jid,
+                    ..
+                } => Some((call_id.clone(), recipient_jid.clone())),
+                _ => None,
+            })
+            .unwrap();
+        let mut bridge = bridge();
+        let mut updates = bridge.hub.subscribe();
+        bridge.hub.calls(|calls| {
+            calls.set_outgoing(velo_core::OutgoingCall::new(
+                "placeholder",
+                recipient.clone(),
+                "Peer".into(),
+                true,
+            ))
+        });
+        let mut version = StateVersion::INITIAL;
+        let mut state = velo_core::CallState::default();
+        for event in std::iter::once(None).chain(events.into_iter().map(Some)) {
+            if let Some(event) = event {
+                bridge.observe(event);
+            }
+            while let Ok(line) = updates.try_recv() {
+                let DaemonMessage::Update {
+                    version: next,
+                    event,
+                } = serde_json::from_str(&line).unwrap()
+                else {
+                    panic!("{case:?}: unexpected wire update");
+                };
+                let DaemonEvent::CallsChanged(calls) = *event else {
+                    panic!("{case:?}: unexpected wire update");
+                };
+                assert_eq!(next, version.next(), "{case:?}");
+                version = next;
+                state = calls;
+            }
+            assert_eq!(state, bridge.hub.call_state(), "{case:?}");
+        }
+        assert_eq!(state.stage().unwrap().call_id(), id, "{case:?}");
+        assert_eq!(state.active().is_some(), case.connects(), "{case:?}");
+        assert_eq!(state.video().remote, case.remote_expected(), "{case:?}");
+        if let Some(active) = state.active() {
+            assert_eq!(active.peer_jid, recipient, "{case:?}");
+        }
+    }
+}
+
+/// The participant who spoke is not the conversation. Naming a group after
+/// them publishes a misleading name to every client until a store reload
+/// happens to correct it.
+#[test]
+fn a_group_is_not_named_after_whoever_spoke_in_it() {
+    let mut bridge = bridge();
+    bridge.observe(received(
+        "12345-678@g.us",
+        message("m1", "1@s.whatsapp.net", 10, false, false),
+        Some("Alice"),
+    ));
+    assert_eq!(
+        bridge.hub.chat("12345-678@g.us").unwrap().name,
+        "12345-678@g.us",
+        "the JID is a worse label than a name, but not a wrong one"
+    );
+}
+
+/// A broadcast list is participant-keyed too — the session's own helper
+/// says so — and it was the one this rule missed.
+#[test]
+fn a_broadcast_list_is_not_named_after_whoever_spoke_in_it() {
+    let mut bridge = bridge();
+    bridge.observe(received(
+        "12345678@broadcast",
+        message("m1", "1@s.whatsapp.net", 10, false, false),
+        Some("Alice"),
+    ));
+    assert_eq!(
+        bridge.hub.chat("12345678@broadcast").unwrap().name,
+        "12345678@broadcast"
+    );
+}
+
+/// And so is the status feed, which is a broadcast JID with a reserved
+/// user rather than a different server.
+#[test]
+fn the_status_feed_is_not_named_after_whoever_posted() {
+    let mut bridge = bridge();
+    bridge.observe(received(
+        "status@broadcast",
+        message("m1", "1@s.whatsapp.net", 10, false, false),
+        Some("Alice"),
+    ));
+    assert_eq!(
+        bridge.hub.chat("status@broadcast").unwrap().name,
+        "status@broadcast"
+    );
+}
+
+/// A one-to-one chat is the sender, so their push name is the best label
+/// available before the store hands one over.
+#[test]
+fn a_direct_chat_is_named_after_the_sender() {
+    let mut bridge = bridge();
+    bridge.observe(received(
+        "1@s.whatsapp.net",
+        message("m1", "1@s.whatsapp.net", 10, false, false),
+        Some("Alice"),
+    ));
+    assert_eq!(bridge.hub.chat("1@s.whatsapp.net").unwrap().name, "Alice");
+}
+
+/// On an outgoing message the sender is us, so it names nothing.
+#[test]
+fn an_outgoing_message_does_not_name_the_chat_after_us() {
+    let mut bridge = bridge();
+    bridge.observe(received(
+        "1@s.whatsapp.net",
+        message("m1", "Me", 10, true, false),
+        Some("Me"),
+    ));
+    assert_eq!(
+        bridge.hub.chat("1@s.whatsapp.net").unwrap().name,
+        "1@s.whatsapp.net"
+    );
+}
+
+/// The ordering that produced the bug: a live message creates a chat, and
+/// an early complete-but-empty reload (a push-name commit during pairing)
+/// arrives before the store has any row for it.
+#[test]
+fn a_complete_reload_does_not_wipe_a_chat_it_has_never_held() {
+    let mut bridge = bridge();
+    bridge.observe(received(
+        "1@s.whatsapp.net",
+        message("m1", "1@s.whatsapp.net", 10, false, false),
+        Some("Alice"),
+    ));
+    bridge.observe(loaded(Vec::new()));
+
+    assert!(
+        bridge.hub.chat("1@s.whatsapp.net").is_some(),
+        "a live-only chat survives a reload that has never seen it"
+    );
+}
+
+/// An archived conversation is deliberately absent from the daemon's active
+/// snapshot. An offline message for it carries the store's archive answer and
+/// must not recreate the row before an archived page is explicitly requested.
+#[test]
+fn an_archived_message_does_not_enter_the_active_snapshot() {
+    let jid = "2@g.us";
+    let mut event = received(
+        jid,
+        message("m1", "3@lid", 10, false, false),
+        Some("Member"),
+    );
+    let UiEvent::MessageReceived {
+        notification_archived,
+        ..
+    } = &mut event
+    else {
+        unreachable!("received fixture is a message")
+    };
+    *notification_archived = Some(true);
+
+    let mut bridge = bridge();
+    bridge.observe(event);
+
+    assert!(
+        bridge.hub.chat(jid).is_none(),
+        "an archived message must not resurrect its chat in the active snapshot"
+    );
+}
+
+/// A message can arrive before the active page has hydrated the conversation.
+/// The store-backed conversation name must replace both a generated fallback
+/// and a participant label in the daemon snapshot.
+#[test]
+fn a_live_message_uses_its_durable_chat_name() {
+    let jid = "2@g.us";
+    let mut event = received(
+        jid,
+        message("m1", "3@lid", 10, false, false),
+        Some("Member"),
+    );
+    let UiEvent::MessageReceived { chat_name, .. } = &mut event else {
+        unreachable!("received fixture is a message")
+    };
+    *chat_name = Some("Example group".into());
+
+    let mut bridge = bridge();
+    bridge.observe(event);
+
+    assert_eq!(
+        bridge.hub.chat(jid).map(|chat| chat.name),
+        Some("Example group".into())
+    );
+}
+
+/// A pin the store published reaches the hub's summary: without it the pin
+/// lived in the database and died on the way to every front end.
+#[test]
+fn a_reload_carries_a_chat_pin_into_the_summary() {
+    let mut pinned = stored_chat(
+        "1@s.whatsapp.net",
+        0,
+        vec![message("m1", "1@s.whatsapp.net", 10, false, true)],
+    );
+    pinned.pinned_at =
+        Some(chrono::DateTime::from_timestamp_millis(1_700_000_010_000).expect("a valid instant"));
+    let mut bridge = bridge();
+    bridge.observe(loaded(vec![pinned]));
+
+    assert_eq!(
+        bridge.hub.chat("1@s.whatsapp.net").unwrap().pinned_at_ms,
+        Some(1_700_000_010_000),
+    );
+}
+
+/// The other half of the same rule: once the store has published a chat,
+/// its absence from a complete reload really does mean deleted.
+#[test]
+fn a_complete_reload_still_prunes_what_the_store_dropped() {
+    let mut bridge = bridge();
+    bridge.observe(loaded(vec![stored_chat(
+        "1@s.whatsapp.net",
+        0,
+        vec![message("m1", "1@s.whatsapp.net", 10, false, true)],
+    )]));
+    assert!(bridge.hub.chat("1@s.whatsapp.net").is_some());
+
+    bridge.observe(loaded(Vec::new()));
+    assert!(
+        bridge.hub.chat("1@s.whatsapp.net").is_none(),
+        "deleted elsewhere, so it must leave here too"
+    );
+}
+
+#[test]
+fn an_inactive_chat_does_not_retain_a_live_read_boundary() {
+    let jid = "2@s.whatsapp.net";
+    let mut bridge = bridge();
+    bridge.observe(loaded(vec![stored_chat(
+        jid,
+        1,
+        vec![message("stored", jid, 10, false, false)],
+    )]));
+    assert!(bridge.reads().boundary(jid).is_some());
+
+    bridge.observe(loaded(Vec::new()));
+    assert!(bridge.hub.chat_is_inactive(jid));
+    assert!(bridge.reads().boundary(jid).is_none());
+
+    bridge.observe(received(jid, message("late", jid, 11, false, false), None));
+    assert!(bridge.hub.chat(jid).is_none());
+    assert!(
+        bridge.reads().boundary(jid).is_none(),
+        "the suppressed live event was observed before translation"
+    );
+}
+
+/// A pairing code expires. A client that is handed the state late must be
+/// able to tell, which a relative "expires in N" replayed in a snapshot
+/// cannot express.
+#[test]
+fn a_pairing_code_carries_a_deadline_that_survives_being_replayed() {
+    let mut bridge = bridge();
+    let before = wacore::time::now_millis();
+    bridge.observe(UiEvent::QrCode {
+        code: "2@abc".into(),
+        timeout_secs: 60,
+    });
+
+    match bridge.hub.connection() {
+        ConnectionState::Pairing { qr: Some(qr), .. } => {
+            assert_eq!(qr.code, "2@abc");
+            assert!(
+                qr.expires_at_ms >= before + 60_000,
+                "the deadline is the issue time plus its lifetime"
+            );
+        }
+        other => panic!("expected a QR, got {other:?}"),
+    }
+}
+
+/// Both credentials can be live at once, and either can be renewed on its
+/// own clock. An event about one must not make the other disappear from
+/// every later snapshot.
+#[test]
+fn a_renewed_qr_does_not_erase_a_live_pair_code() {
+    let mut bridge = bridge();
+    bridge.observe(UiEvent::PairCode {
+        code: "ABCD-1234".into(),
+        timeout_secs: 300,
+    });
+    bridge.observe(UiEvent::QrCode {
+        code: "2@first".into(),
+        timeout_secs: 60,
+    });
+    bridge.observe(UiEvent::QrCode {
+        code: "2@second".into(),
+        timeout_secs: 60,
+    });
+
+    match bridge.hub.connection() {
+        ConnectionState::Pairing { qr, pair_code } => {
+            assert_eq!(qr.unwrap().code, "2@second", "the QR rotated");
+            assert_eq!(
+                pair_code.unwrap().code,
+                "ABCD-1234",
+                "and the phone-number code is still live"
+            );
+        }
+        other => panic!("expected pairing, got {other:?}"),
+    }
+}
+
+/// Leaving pairing and coming back must not resurrect a dead credential:
+/// the merge reads the state it is replacing, and once that is no longer
+/// `Pairing` there is nothing to carry over.
+#[test]
+fn a_credential_does_not_survive_leaving_the_pairing_state() {
+    let mut bridge = bridge();
+    bridge.observe(UiEvent::PairCode {
+        code: "ABCD-1234".into(),
+        timeout_secs: 300,
+    });
+    bridge.observe(UiEvent::PairSuccess);
+    bridge.observe(UiEvent::QrCode {
+        code: "2@fresh".into(),
+        timeout_secs: 60,
+    });
+
+    match bridge.hub.connection() {
+        ConnectionState::Pairing { qr, pair_code } => {
+            assert_eq!(qr.unwrap().code, "2@fresh");
+            assert!(pair_code.is_none(), "the consumed code is gone");
+        }
+        other => panic!("expected pairing, got {other:?}"),
+    }
+}
+
+/// A ludicrous lifetime must not wrap into a deadline in the past, which
+/// would render as an already-expired code.
+#[test]
+fn an_absurd_pairing_lifetime_saturates_rather_than_wrapping() {
+    assert_eq!(deadline_ms(u64::MAX), i64::MAX);
+}
+
+/// A history load must not start a profile-picture lookup.
+///
+/// This is the coupling the split removes: receipts, acknowledged messages
+/// and every store invalidation used to reload history, and history used to
+/// query WhatsApp for pictures. A picture is stable metadata; a receipt is
+/// not news about one. Only an explicit `AvatarResolved` from the session's
+/// own resolver may reach [`crate::avatar`].
+#[test]
+fn a_history_load_starts_no_picture_lookup() {
+    let mut bridge = bridge();
+    let chat = stored_chat(
+        "1@s.whatsapp.net",
+        0,
+        vec![message("m1", "1@s.whatsapp.net", 10, false, true)],
+    );
+    bridge.observe(loaded(vec![chat]));
+
+    assert!(
+        !crate::avatar::has_selection(&bridge.hub, "1@s.whatsapp.net"),
+        "loading history asked about a picture, which is the coupling this removes"
+    );
+}
+
+/// A receipt must not either: it is the same argument, one event over.
+#[test]
+fn a_receipt_starts_no_picture_lookup() {
+    let mut bridge = bridge();
+    bridge.observe(received(
+        "1@s.whatsapp.net",
+        message("m1", "1@s.whatsapp.net", 10, false, false),
+        None,
+    ));
+    bridge.observe(UiEvent::ReceiptReceived {
+        chat_jid: "1@s.whatsapp.net".into(),
+        message_ids: vec!["m1".into()],
+        receipt_type: velo_core::ReceiptType::Read,
+    });
+
+    assert!(
+        !crate::avatar::has_selection(&bridge.hub, "1@s.whatsapp.net"),
+        "a receipt asked about a picture"
+    );
+}
+
+/// The daemon reads a resolved picture as a fetch it may make, and the session
+/// is the one that decided the metadata moved. Nothing about the front end is
+/// touched by the metadata itself.
+#[test]
+fn a_resolved_picture_is_the_only_thing_that_starts_a_fetch() {
+    let mut bridge = bridge();
+    bridge.observe(UiEvent::AvatarsResolved {
+        resolutions: vec![velo_core::AvatarResolution {
+            jid: "1@s.whatsapp.net".into(),
+            outcome: velo_core::AvatarOutcome::Found {
+                picture_id: "picture-1".into(),
+                source: None,
+            },
+        }],
+    });
+
+    assert!(
+        crate::avatar::has_selection(&bridge.hub, "1@s.whatsapp.net"),
+        "a resolved picture is what the fetcher waits for"
+    );
+}
+
+/// `NotFound` is the one outcome that removes, and it is a fact the library
+/// now tells apart from a refusal.
+#[tokio::test]
+async fn a_not_found_answer_removes_the_picture() {
+    let mut bridge = bridge();
+    bridge.observe(UiEvent::AvatarsResolved {
+        resolutions: vec![velo_core::AvatarResolution {
+            jid: "1@s.whatsapp.net".into(),
+            outcome: velo_core::AvatarOutcome::NotFound,
+        }],
+    });
+
+    // The removal takes a selection for the same reason a fetch does: so a
+    // picture resolved afterwards is not undone by it.
+    assert!(
+        crate::avatar::has_selection(&bridge.hub, "1@s.whatsapp.net"),
+        "a removal is a resolution too, and it is what the chat's picture now is"
+    );
+}
+
+/// A front end reacts to what it is told the instant it is told, and the
+/// runtime is multithreaded. Publishing before applying lets a `MarkRead`
+/// racing a message find a hub that has not seen it — refused as stale,
+/// after the client had already cleared its own badge.
+#[tokio::test]
+async fn the_hub_is_current_before_anyone_is_told() {
+    let mut bridge = bridge();
+    let mut sessions = bridge.hub.subscribe_sessions();
+
+    bridge.observe(received(
+        "1@s.whatsapp.net",
+        message("m1", "1@s.whatsapp.net", 10, false, false),
+        None,
+    ));
+
+    // The frame is on the wire, so the state it describes must already be
+    // readable — including the boundary a reader would immediately act on.
+    let frame: DaemonMessage = serde_json::from_str(&sessions.recv().await.unwrap()).unwrap();
+    assert!(matches!(frame, DaemonMessage::Session { .. }));
+    assert!(
+        bridge.read_plan("1@s.whatsapp.net", Some("m1")).is_ok(),
+        "a read racing this event would have been refused as stale"
+    );
+}
+
+/// A call rings in the daemon, so a window opened during it has no other
+/// way to learn about the offer: it went out once, before that window
+/// existed, and no history contains it.
+#[test]
+fn a_ringing_call_is_state_a_new_window_can_attach_to() {
+    let mut bridge = bridge();
+    let call = velo_core::IncomingCall {
+        call_id: "call-1".into(),
+        caller_name: "Alice".into(),
+        caller_jid: "1@s.whatsapp.net".into(),
+        is_video: false,
+        is_offline: false,
+        received_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+    };
+    bridge.observe(UiEvent::IncomingCall(call));
+    assert!(bridge.hub.call_state().incoming().is_some());
+
+    // Answered or hung up, it is no longer something to attach to.
+    bridge.observe(UiEvent::CallEnded("call-1".into()));
+    assert!(bridge.hub.call_state().incoming().is_none());
+}
+
+/// An account reset is a departure. The hub only ever learned by event,
+/// so a snapshot taken after the next pairing opened with the previous
+/// account's identity and chat list.
+#[test]
+fn a_logout_preserves_account_history_in_the_next_snapshot() {
+    let mut bridge = bridge();
+    bridge.observe(loaded(vec![stored_chat(
+        "1@s.whatsapp.net",
+        1,
+        vec![message("a", "1@s.whatsapp.net", 10, false, false)],
+    )]));
+    bridge.observe(UiEvent::AccountUpdated {
+        name: Some("Ana".to_string()),
+        jid: Some("1@s.whatsapp.net".to_string()),
+        lid: None,
+    });
+    assert!(bridge.hub.chat("1@s.whatsapp.net").is_some());
+
+    bridge.observe(UiEvent::LoggedOut("the server said no".into()));
+
+    assert!(bridge.hub.chat("1@s.whatsapp.net").is_some());
+    assert!(!bridge.hub.store_backed_chat_jids().is_empty());
+    assert!(matches!(
+        bridge.hub.connection(),
+        velo_ipc::ConnectionState::LoggedOut { .. }
+    ));
+    assert!(
+        bridge.reads().boundary("1@s.whatsapp.net").is_none(),
+        "and nothing this account taught the read tracker survives it"
+    );
+}
+
+#[test]
+fn terminal_logout_cannot_be_overwritten_by_queued_reconnect_events() {
+    let mut bridge = bridge();
+    bridge.observe(UiEvent::LoggedOut("synthetic unlink".into()));
+    for event in [
+        UiEvent::InitComplete,
+        UiEvent::Connected,
+        UiEvent::PairSuccess,
+        UiEvent::Disconnected("late disconnect".into()),
+    ] {
+        bridge.observe(event);
+        assert!(matches!(
+            bridge.hub.connection(),
+            velo_ipc::ConnectionState::LoggedOut { .. }
+        ));
+    }
+}
+
+/// Nothing on the session side ends a call when the socket dies, so the
+/// stage stood: after the reconnect every new call was refused as busy,
+/// and the only cancel that could clear it named an id no window held.
+#[test]
+fn a_lost_connection_does_not_leave_the_call_stage_standing() {
+    let mut bridge = bridge();
+    bridge.observe(UiEvent::IncomingCall(velo_core::IncomingCall {
+        call_id: "call-1".into(),
+        caller_name: "Alice".into(),
+        caller_jid: "1@s.whatsapp.net".into(),
+        is_video: false,
+        is_offline: false,
+        received_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+    }));
+    assert!(bridge.hub.call_state().is_busy());
+
+    bridge.observe(UiEvent::Disconnected("the socket went away".into()));
+    assert!(
+        !bridge.hub.call_state().is_busy(),
+        "a call cannot outlive the connection it runs over"
+    );
+    assert!(bridge.hub.call_state().stage().is_none());
+}
+
+/// The request is optimistic and the announcement can fail, so the state
+/// a front end drew is a claim, not a fact. The library keeps the
+/// microphone from being live while the peer is shown a muted one, which
+/// means an unmute that could not be announced leaves the device muted —
+/// and the window drawing an open mic over it.
+#[test]
+fn a_mute_the_peer_was_never_told_about_is_corrected_in_the_state() {
+    let mut bridge = bridge();
+    let call = velo_core::IncomingCall {
+        call_id: "call-1".into(),
+        caller_name: "Alice".into(),
+        caller_jid: "1@s.whatsapp.net".into(),
+        is_video: false,
+        is_offline: false,
+        received_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+    };
+    bridge.observe(UiEvent::IncomingCall(call));
+    bridge.hub.calls(|s| {
+        s.connect(&"call-1".to_string());
+        s.set_muted(&"call-1".to_string(), true);
+    });
+    assert!(bridge.hub.call_state().active().unwrap().muted);
+
+    // The unmute went nowhere, so the microphone is still muted.
+    bridge.observe(UiEvent::CallMuteChanged {
+        call_id: "call-1".into(),
+        muted: true,
+    });
+    assert!(
+        bridge.hub.call_state().active().unwrap().muted,
+        "the state says what the device is doing, not what was asked"
+    );
+
+    bridge.observe(UiEvent::CallMuteChanged {
+        call_id: "call-1".into(),
+        muted: false,
+    });
+    assert!(!bridge.hub.call_state().active().unwrap().muted);
+}
+
+/// A call the phone answered is not a call this window missed. The
+/// removal is identical either way, so the reason has to ride the same
+/// frame — a front end writes the conversation's record off the stage
+/// that disappeared.
+#[test]
+fn a_call_answered_on_another_device_says_so_in_the_state() {
+    let mut taken = bridge();
+    let call = velo_core::IncomingCall {
+        call_id: "call-1".into(),
+        caller_name: "Alice".into(),
+        caller_jid: "1@s.whatsapp.net".into(),
+        is_video: false,
+        is_offline: false,
+        received_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+    };
+    taken.observe(UiEvent::IncomingCall(call.clone()));
+    taken.observe(UiEvent::CallEndedElsewhere("call-1".into()));
+
+    let state = taken.hub.call_state();
+    assert!(state.incoming().is_none(), "the offer is gone either way");
+    assert!(state.is_unrecorded("call-1"));
+
+    // The ordinary ending says nothing of the sort, and that is what
+    // makes a genuine missed call still count as one.
+    let mut missed = bridge();
+    missed.observe(UiEvent::IncomingCall(call));
+    missed.observe(UiEvent::CallEnded("call-1".into()));
+    assert!(!missed.hub.call_state().is_unrecorded("call-1"));
+}
+
+/// Live messages are not ordered: history decryption and offline catch-up
+/// deliver out of order. Moving the preview backwards onto an older
+/// message put the daemon's boundary behind what every client held, and
+/// the bounded read was refused until a store reload repaired it.
+#[test]
+fn an_out_of_order_arrival_does_not_move_the_preview_backwards() {
+    let mut bridge = bridge();
+    bridge.observe(received(
+        "1@s.whatsapp.net",
+        message("newest", "1@s.whatsapp.net", 30, false, false),
+        None,
+    ));
+    bridge.observe(received(
+        "1@s.whatsapp.net",
+        message("late", "1@s.whatsapp.net", 10, false, false),
+        None,
+    ));
+
+    let summary = bridge.hub.chat("1@s.whatsapp.net").unwrap();
+    assert_eq!(
+        summary.last_message.and_then(|m| m.id).as_deref(),
+        Some("newest"),
+        "an older arrival is still news, but it is not the preview"
+    );
+    assert_eq!(summary.unread, 2, "both are unread all the same");
+}
+
+/// There is one waiting slot. A third offer has nowhere to go, and no
+/// front end can be asked to refuse a caller it was never told about — so
+/// the daemon, which owns the session, answers the session itself.
+#[test]
+fn a_third_offer_is_declined_by_the_daemon() {
+    let mut bridge = bridge();
+    let offer = |id: &str| {
+        UiEvent::IncomingCall(velo_core::IncomingCall {
+            call_id: id.into(),
+            caller_name: "Someone".into(),
+            caller_jid: format!("{id}@s.whatsapp.net"),
+            is_video: false,
+            is_offline: false,
+            received_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        })
+    };
+
+    assert_eq!(bridge.observe(offer("one")), Answer::Nothing);
+    bridge.hub.calls(|s| {
+        s.connect(&"one".to_string());
+    });
+    assert_eq!(bridge.observe(offer("two")), Answer::Nothing, "parked");
+
+    assert_eq!(
+        bridge.observe(offer("three")),
+        Answer::Decline("three".into())
+    );
+    assert_eq!(
+        bridge.hub.call_state().waiting().unwrap().call_id(),
+        "two",
+        "the caller already on screen keeps the slot"
+    );
+}
+
+/// A call this account placed was never an event: the front end that
+/// dialled built it locally. Nothing replays it, so the daemon has to
+/// hold it for a window that attaches mid-call.
+#[test]
+fn an_outgoing_call_is_state_a_new_window_can_attach_to() {
+    let mut bridge = bridge();
+    // What the daemon records when it takes the request.
+    bridge.hub.calls(|s| {
+        s.set_outgoing(velo_core::OutgoingCall::new(
+            "ui-call-1",
+            "1@s.whatsapp.net".into(),
+            "Alice".into(),
+            false,
+        ));
+    });
+
+    // The server names it, and the peer answers.
+    bridge.observe(UiEvent::OutgoingCallStarted {
+        call_id: "call-1".into(),
+        recipient_jid: "1@s.whatsapp.net".into(),
+        placeholder_id: "ui-call-1".into(),
+        is_video: false,
+    });
+    bridge.observe(UiEvent::CallAccepted("call-1".into()));
+
+    let calls = bridge.hub.call_state();
+    let active = calls.active().expect("still on the call");
+    assert_eq!(active.call_id, "call-1", "renamed from its placeholder");
+    assert_eq!(active.peer_jid, "1@s.whatsapp.net");
+
+    bridge.observe(UiEvent::CallEnded("call-1".into()));
+    assert!(!bridge.hub.call_state().is_busy());
+}
+
+/// Give up on a call before the server has named it, dial the same person
+/// again, and the first attempt's answer arrives while the second is on
+/// the stage. Matched by recipient it renamed the redial, so the daemon
+/// published an id nobody was ringing under — and the window, seeing the
+/// state hold it, skipped cancelling the call that really was ringing.
+#[test]
+fn a_late_answer_does_not_rename_the_redial_that_replaced_it() {
+    let mut bridge = bridge();
+    bridge.hub.calls(|s| {
+        s.set_outgoing(velo_core::OutgoingCall::new(
+            "ui-call-2",
+            "1@s.whatsapp.net".into(),
+            "Alice".into(),
+            false,
+        ));
+    });
+
+    bridge.observe(UiEvent::OutgoingCallStarted {
+        call_id: "call-1".into(),
+        recipient_jid: "1@s.whatsapp.net".into(),
+        placeholder_id: "ui-call-1".into(),
+        is_video: false,
+    });
+
+    let calls = bridge.hub.call_state();
+    assert_eq!(
+        calls.outgoing().map(|c| c.call_id.as_str()),
+        Some("ui-call-2"),
+        "the redial keeps its own placeholder"
+    );
+    assert!(
+        !calls.holds("call-1"),
+        "so the abandoned call is an orphan the window will cancel"
+    );
+}
+
+/// A failed send changes no state, so no snapshot can carry it: without
+/// this the client that asked for the send never learns it did not happen.
+#[tokio::test]
+async fn a_failed_send_is_published_rather_than_swallowed() {
+    let mut bridge = bridge();
+    let mut signals = bridge.hub.subscribe_signals();
+
+    bridge.observe(UiEvent::SendFailed {
+        chat_jid: "1@s.whatsapp.net".into(),
+        message_id: "m1".into(),
+        reason: "no route".into(),
+    });
+    assert!(
+        bridge.hub.chat("1@s.whatsapp.net").is_none(),
+        "the chat is exactly as it was"
+    );
+
+    let frame: DaemonMessage = serde_json::from_str(&signals.recv().await.unwrap()).unwrap();
+    assert_eq!(
+        frame,
+        DaemonMessage::SendFailed {
+            jid: "1@s.whatsapp.net".into(),
+            reason: "no route".into(),
+        }
+    );
+}
+
+/// Take every permit there is, and hand back the ones still held.
+///
+/// Returned rather than dropped: a permit released is a permit the next
+/// command gets, which is the opposite of what a caller setting up a busy
+/// daemon wants. Shared with [`super::act`]'s tests, which need the same
+/// bridge with no room left in it.
+pub(super) fn saturate(bridge: &Bridge) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+    let held: Vec<_> = std::iter::repeat_with(|| bridge.permit())
+        .take(MAX_IN_FLIGHT)
+        .map(|permit| permit.expect("under the cap"))
+        .collect();
+    assert!(bridge.permit().is_none(), "and refused past it");
+    held
+}
+
+/// The bound the command channel cannot provide: every session call spawns
+/// and returns, so admission alone would let a client that reads its
+/// acknowledgements keep queueing network work forever.
+#[tokio::test]
+async fn work_in_flight_is_capped_rather_than_queued() {
+    let bridge = bridge();
+    let held = saturate(&bridge);
+
+    drop(held);
+    assert!(
+        bridge.permit().is_some(),
+        "permits come back when the work they paid for is over"
+    );
+}
+
+#[test]
+fn business_cli_summary_includes_labels_without_response_payloads() {
+    use velo_core::{BusinessAction, BusinessButton, BusinessContent, BusinessKind};
+    let mut message = fixtures::message("template-fixture", "example@lid", "Ready");
+    message.business = Some(BusinessContent {
+        kind: BusinessKind::Template,
+        header: "Order".into(),
+        body: "Ready".into(),
+        footer: "Example shop".into(),
+        buttons: vec![BusinessButton {
+            label: "Track order".into(),
+            action: BusinessAction::OpenLink,
+        }],
+        notice: None,
+    });
+    let dto = super::wire_events::chat_message_to_dto("example@lid", message);
+    assert_eq!(dto.kind, "template");
+    assert_eq!(
+        dto.text.as_deref(),
+        Some("Order\nReady\nExample shop\nTrack order")
+    );
+}
+
+#[test]
+fn a_successor_pin_refuses_reset_without_stopping_the_valid_session() {
+    let lifecycle = RuntimeLifecycle::new();
+    let pin = lifecycle.pin().unwrap();
+    assert_eq!(
+        lifecycle.set_disposition(AccountDisposition::Reset),
+        DispositionOutcome::Conflict
+    );
+    assert!(!lifecycle.is_stopping());
+    assert_eq!(lifecycle.disposition(), None);
+    drop(pin);
+    assert_eq!(
+        lifecycle.set_disposition(AccountDisposition::Reset),
+        DispositionOutcome::Recorded
+    );
+    assert!(lifecycle.is_stopping());
+    assert!(lifecycle.pin().is_none());
+}
+#[cfg(not(target_family = "wasm"))]
+#[tokio::test(start_paused = true)]
+async fn retirement_drains_existing_media_and_rejects_new_writers() {
+    let lifecycle = RuntimeLifecycle::new();
+    let upload = lifecycle.media_lease().await.unwrap();
+    assert_eq!(
+        lifecycle.set_disposition(AccountDisposition::Remove),
+        DispositionOutcome::Recorded
+    );
+    assert!(lifecycle.media_lease().await.is_none());
+    let drain = lifecycle.drain_media();
+    tokio::pin!(drain);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut drain)
+            .await
+            .is_err()
+    );
+    drop(upload);
+    let _exclusive = tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+        .await
+        .unwrap();
+}
+
+#[test]
+fn first_live_message_carries_mute_to_tray_before_chat_hydration() {
+    let mut bridge = bridge();
+    bridge.observe(UiEvent::Connected);
+    let jid = "120363000000000002@newsletter";
+    let mut event = received(jid, message("CHANNEL-MUTE", jid, 10, false, false), None);
+    if let UiEvent::MessageReceived {
+        notification_archived,
+        chat_muted_until_ms,
+        ..
+    } = &mut event
+    {
+        *notification_archived = Some(false);
+        *chat_muted_until_ms = Some(i64::MAX);
+    }
+    bridge.observe(event);
+    let summary = bridge.hub.chat(jid).unwrap();
+    assert_eq!(summary.unread, 1);
+    assert!(summary.is_muted(wacore::time::now_utc().timestamp_millis()));
+    assert_eq!(bridge.hub.watch_tray().borrow().unread, 0);
+}
+
+#[test]
+/// Overflow requests a replacement and a subsequent connection restores state.
+fn control_overflow_requests_session_replacement_and_reconnect_restores_state() {
+    let mut bridge = bridge();
+    bridge.observe(UiEvent::Connected);
+    assert_eq!(
+        bridge.observe(UiEvent::SessionResyncRequired("overflow".into())),
+        Answer::Restart
+    );
+    assert!(matches!(
+        bridge.hub.snapshot().connection,
+        ConnectionState::Disconnected { .. }
+    ));
+    assert_eq!(
+        bridge.lifecycle.disposition(),
+        None,
+        "recovery must retain account storage"
+    );
+    bridge.observe(UiEvent::InitComplete);
+    bridge.observe(UiEvent::Connected);
+    assert_eq!(bridge.hub.snapshot().connection, ConnectionState::Connected);
+}
+
+#[test]
+/// A terminal logout must not be hidden by overflow recovery.
+fn overflow_cannot_restart_a_logged_out_account() {
+    let mut bridge = bridge();
+    bridge.observe(UiEvent::LoggedOut("rejected".into()));
+    assert_eq!(
+        bridge.observe(UiEvent::SessionResyncRequired("overflow".into())),
+        Answer::Nothing
+    );
+    assert!(matches!(
+        bridge.hub.snapshot().connection,
+        ConnectionState::LoggedOut { .. }
+    ));
+}

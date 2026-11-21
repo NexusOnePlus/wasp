@@ -1,0 +1,87 @@
+//! Application state management
+//!
+//! This module contains all state-related structures:
+//! - `AppState`: The overall application state machine
+//! - `Chat` and `ChatMessage`: Chat data structures
+//! - `IncomingCall`, `OutgoingCall`, `OutgoingCallState`: Call state
+//! - `MessageStatus`: how far an outgoing message travelled
+//! - `PresenceRegistry`: who is typing, and who is around
+//! - `GroupRoster`: who is in a group
+//! - `CallVideo`, `CallVideoFrame`: which of a call's cameras are on, and the
+//!   encoded frames they produce
+//! - `PluginSurface`: what a plugin asked to have drawn, and what it may do
+//! - `LogLevel`: how much the client says about itself
+//! - `UiEvent`: Events for UI updates
+
+pub mod base64;
+/// Synthetic chats and messages the tests above this crate share. Off unless
+/// asked for, so nothing an embedder links carries it.
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures;
+
+mod account;
+mod app_state;
+mod avatar;
+mod call;
+mod call_devices;
+mod calls;
+mod chat;
+mod events;
+mod group;
+mod group_membership;
+mod links;
+mod log_level;
+mod media_budget;
+mod mentions;
+mod message_status;
+mod plugin;
+mod presence;
+mod quoted;
+mod rich_text;
+mod status;
+mod system_notice;
+pub use group_membership::{
+    GroupMembership, MembershipAction, NoticeParticipant, format_phone_jid,
+};
+mod video;
+
+pub use account::{AccountId, InvalidAccountId};
+pub use app_state::{AppState, CachedQrCode, Fault, Issued, Lifetime, Recovery};
+pub use avatar::AvatarDemand;
+pub use avatar::cache_key as avatar_cache_key;
+pub use call::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
+pub use call_devices::*;
+pub use calls::{ActiveCall, Admission, CallState, Ending, Stage, WaitingCall};
+pub use chat::STATUS_BROADCAST_JID;
+pub use chat::{
+    Chat, ChatMessage, DownloadableMedia, GroupHierarchy, MediaContent, MediaType, OutgoingMedia,
+    PollContent, ReleasedMedia, Resend, SubgroupKind,
+};
+pub use chat::{fallback_chat_name, fallback_sender_name};
+pub use events::{AvatarOutcome, AvatarResolution, ReceiptType, UiEvent};
+pub use group::{GroupMember, GroupRoster};
+pub use links::{LinkSpan, find_links as find_message_links, find_links_in};
+pub use log_level::{LogLevel, UnknownLogLevel};
+pub use media_budget::{
+    DECODED_IMAGE_BUDGET_BYTES, MAX_AVATAR_DIMENSION, MAX_AVATAR_PIXELS,
+    RETAINED_MEDIA_BUDGET_BYTES, WEB_MEDIA_BUDGET_BYTES,
+};
+pub use mentions::format_mentions;
+pub use message_status::MessageStatus;
+pub use plugin::{PluginAction, PluginNode, PluginRoot, PluginSlot, PluginSurface, PluginWidget};
+pub use presence::{
+    Availability, ChatTyping, ComposingKind, PresenceRegistry, TypingSummary, Typist,
+};
+pub use quoted::{QuotedKind, QuotedMessage};
+pub use rich_text::{
+    Emphasis, RichText, Span as TextSpan, parse as parse_rich_text,
+    plain_text as plain_message_text,
+};
+pub use status::{StatusAuthor, StatusFeed};
+mod call_history;
+pub use call_history::CallHistoryEntry;
+pub use system_notice::{CallOutcome, CallRecord, SystemNotice, format_duration};
+pub use video::{CallVideo, CallVideoFrame, VideoStream};
+
+mod business;
+pub use business::{BusinessAction, BusinessButton, BusinessContent, BusinessKind};

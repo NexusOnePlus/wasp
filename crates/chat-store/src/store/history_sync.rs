@@ -1,0 +1,502 @@
+//! History sync: the server's copy of the past, streamed a conversation at a
+//! time. History is the stale copy throughout — it fills gaps and never
+//! clobbers what live traffic already materialized.
+
+use diesel::prelude::*;
+use log::warn;
+use waproto::whatsapp as wa;
+
+use crate::materialize::{MessageOp, classify};
+use crate::schema;
+use crate::storage_proto::{PendingQuote, strip_pending_quotes};
+use crate::store::chat_rows::{chat_row, recompute_chat_preview};
+use crate::store::contacts::{apply_removal_tombstone_to_history, upsert_contact_push_name};
+use crate::store::edit::apply_edit;
+use crate::store::message_rows::{NewMessage, StoredRow, insert_message};
+use crate::store::reaction::apply_reaction;
+use crate::store::read_state::UNREAD_MARKER;
+use crate::store::revoke::apply_revoke;
+use crate::store::writer::ChangeSet;
+
+pub(super) fn apply_history_sync(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    lazy: &wacore::types::events::LazyHistorySync,
+    cs: &mut ChangeSet,
+) -> QueryResult<()> {
+    let mut stream = lazy.stream();
+    loop {
+        let conv = match stream.next_conversation() {
+            Ok(Some(conv)) => conv,
+            Ok(None) => break,
+            Err(e) => {
+                // Framing/zlib failure: the stream position is gone, the rest
+                // of this chunk is unreadable (per-conversation decode errors
+                // are skipped inside the stream, not surfaced here).
+                warn!("chat-store: history sync chunk framing broken, aborting chunk: {e}");
+                return Ok(());
+            }
+        };
+        apply_history_conversation(conn, device_id, &conv, cs)?;
+    }
+    if stream.skipped_conversations() > 0 {
+        warn!(
+            "chat-store: history sync skipped {} undecodable conversation(s)",
+            stream.skipped_conversations()
+        );
+    }
+    match stream.remainder() {
+        Ok(rest) => {
+            for pushname in &rest.pushnames {
+                if let (Some(jid), Some(name)) = (&pushname.id, &pushname.pushname) {
+                    cs.contacts |= upsert_contact_push_name(conn, device_id, jid, name)?;
+                }
+            }
+        }
+        Err(e) => warn!("chat-store: history sync remainder unreadable: {e}"),
+    }
+    Ok(())
+}
+
+fn apply_history_conversation(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    conv: &wa::Conversation,
+    cs: &mut ChangeSet,
+) -> QueryResult<()> {
+    let chat = &crate::lid::route_chat_key(conn, device_id, conv.id.as_str(), cs)?;
+    let removed = apply_removal_tombstone_to_history(conn, device_id, conv.id.as_str())?;
+    let last_ts_ms = conv
+        .conversation_timestamp
+        .map(crate::types::wire_secs_to_ms)
+        .unwrap_or(0);
+    let unread_count = match conv.unread_count {
+        _ if conv.marked_as_unread == Some(true) => UNREAD_MARKER,
+        Some(count) if count > 0 => i32::try_from(count).unwrap_or(i32::MAX),
+        _ => 0,
+    };
+    let history_unread_known = conv.unread_count.is_some() || conv.marked_as_unread == Some(true);
+    // The conflict update below keeps a live-owned count, so read the row
+    // first: the seed must agree with the count the sync leaves behind.
+    let stored_unread: Option<i32> = chat_row(device_id, chat)
+        .select((
+            schema::chats::unread_count,
+            schema::chats::unread_initialized,
+        ))
+        .first::<(i32, bool)>(conn)
+        .optional()?
+        .and_then(|(count, initialized)| initialized.then_some(count));
+
+    {
+        use schema::chats::dsl;
+        let independent_name = conv
+            .display_name
+            .as_deref()
+            .or(conv.username.as_deref())
+            .filter(|name| !name.trim().is_empty());
+        let address_book_name = (!removed)
+            .then_some(conv.name.as_deref())
+            .flatten()
+            .filter(|name| !name.trim().is_empty());
+        let name = address_book_name.or(independent_name);
+        // History is the stale copy: a nameless chunk must not erase a name
+        // live traffic (or an earlier metadata pass) already stored. An
+        // incoming `Some` still updates; an incoming `None` leaves the row
+        // it would otherwise clobber alone.
+        let persist_name = name.filter(|n| !n.trim().is_empty());
+        let name_from_address_book = persist_name.is_some() && address_book_name.is_some();
+        let address_book_fallback = address_book_name.and(independent_name);
+        diesel::insert_into(dsl::chats)
+            .values((
+                dsl::device_id.eq(device_id),
+                dsl::jid.eq(chat),
+                dsl::name.eq(persist_name),
+                dsl::name_from_address_book.eq(name_from_address_book),
+                dsl::address_book_fallback.eq(address_book_fallback),
+                dsl::last_message_ts.eq(last_ts_ms),
+                dsl::unread_count.eq(unread_count),
+                dsl::unread_initialized.eq(history_unread_known),
+                // Wire values are unix SECONDS; the columns (and the live
+                // app-state paths) are milliseconds.
+                dsl::pinned_at.eq(conv
+                    .pinned
+                    .map(|p| crate::types::secs_to_ms(i64::from(p)))
+                    .filter(|&p| p > 0)),
+                dsl::muted_until.eq(conv
+                    .mute_end_time
+                    .map(crate::types::wire_secs_to_ms)
+                    .filter(|&m| m > 0)),
+                dsl::archived.eq(conv.archived.unwrap_or(false)),
+                dsl::ephemeral_expiration.eq(conv.ephemeral_expiration.map(|e| e as i32)),
+            ))
+            .on_conflict((dsl::device_id, dsl::jid))
+            .do_update()
+            // A live message can create the row before the phone's history
+            // snapshot has supplied its mute/archive preferences. History
+            // keeps refreshing those until an explicit app-state update has
+            // spoken for each one; then even false/NULL is newer authority
+            // than a delayed snapshot. Unread/pin remain owned by live state.
+            // A nameless chunk preserves an existing name rather than
+            // clobbering it with NULL; a named one still updates.
+            .set((
+                // A preference-only row has no live-owned unread state yet.
+                dsl::unread_count.eq(diesel::dsl::sql::<diesel::sql_types::Integer>(
+                    "CASE WHEN unread_initialized OR NOT excluded.unread_initialized THEN unread_count ELSE excluded.unread_count END",
+                )),
+                dsl::unread_initialized.eq(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                    "unread_initialized OR excluded.unread_initialized",
+                )),
+                dsl::name.eq(diesel::dsl::sql::<
+                    diesel::sql_types::Nullable<diesel::sql_types::Text>,
+                >("COALESCE(excluded.name, name)")),
+                dsl::name_from_address_book.eq(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                    "CASE WHEN excluded.name IS NOT NULL THEN excluded.name_from_address_book ELSE name_from_address_book END",
+                )),
+                dsl::address_book_fallback.eq(diesel::dsl::sql::<
+                    diesel::sql_types::Nullable<diesel::sql_types::Text>,
+                >(
+                    "CASE WHEN excluded.name IS NOT NULL THEN excluded.address_book_fallback ELSE address_book_fallback END",
+                )),
+                dsl::last_message_ts.eq(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+                    "MAX(last_message_ts, excluded.last_message_ts)",
+                )),
+                dsl::muted_until.eq(diesel::dsl::sql::<
+                    diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
+                >(
+                    "CASE WHEN mute_appstate_seen THEN muted_until ELSE excluded.muted_until END",
+                )),
+                dsl::archived.eq(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                    if conv.archived.is_some() {
+                        "CASE WHEN archive_appstate_seen THEN archived ELSE excluded.archived END"
+                    } else {
+                        "archived"
+                    },
+                )),
+            ))
+            .execute(conn)?;
+    }
+
+    // Replies whose parent lands later in this same conversation keep their
+    // inline snapshot at insert time (the parent is not visible yet); the
+    // post-pass strips them once everything is in.
+    let mut pending_quotes: Vec<PendingQuote> = Vec::new();
+    for hist_msg in &conv.messages {
+        let Some(wmi) = hist_msg.message.as_option() else {
+            continue;
+        };
+        apply_history_message(conn, device_id, chat, wmi, cs, &mut pending_quotes, false)?;
+    }
+    strip_pending_quotes(conn, device_id, chat, &pending_quotes)?;
+    // Backfill the denormalized preview from the newest materialized row, so a
+    // freshly-paired client's chat list isn't blank until live traffic.
+    recompute_chat_preview(conn, device_id, chat)?;
+    // The phone explicitly reports this chat read (`unreadCount: 0`), and the
+    // stored count is the only record of that: seed the read watermark so a
+    // later recount does not treat the unset marker as "nothing read" and
+    // resurrect every incoming row as unread. An omitted count is not a read
+    // report — a metadata-only snapshot must not create durable read state —
+    // and neither is a manual-unread marker, which the computed count (but
+    // not the wire field) already excludes. Only when nothing live-owned
+    // disagrees either: a positive stored count belongs to live state, and a
+    // stale snapshot must not move its cursor. The advance itself is
+    // monotonic, so a newer live read is never moved backwards either.
+    if unread_count == 0
+        && conv.unread_count == Some(0)
+        && stored_unread.is_none_or(|stored| stored == 0)
+    {
+        let synced_max_ms = conv
+            .messages
+            .iter()
+            .filter_map(|hist_msg| {
+                hist_msg
+                    .message
+                    .as_option()?
+                    .message_timestamp
+                    .map(crate::types::wire_secs_to_ms)
+            })
+            .max()
+            .unwrap_or(0);
+        // Wire timestamps can be corrupt (u64::MAX clamps to a far-future
+        // cursor, and `bump_chat` consults this watermark before badging),
+        // so the frontier never outruns the local clock: a past cursor may
+        // overcount until the next read, but a future one would silently
+        // swallow every later badge. Incoming rows timestamped ahead of the
+        // capped frontier ride along as explicitly covered ids, so a later
+        // merge recount still sees the phone's read state for them — read
+        // back from the rows, so whatever an edit or revoke materialized
+        // under its target id is covered too. Past the id list's cap no
+        // cover is durable for every row, so an oversized snapshot seeds
+        // nothing at all and leaves the stored count (and later merges,
+        // which keep a stored zero over an unset marker) alone.
+        let now_ms = wacore::time::now_utc().timestamp_millis();
+        let frontier_ms = last_ts_ms.max(synced_max_ms).min(now_ms);
+        // Appending past the retained-id cap would evict older explicitly
+        // covered ids — possibly for rows not yet materialized — so only
+        // bring what fits beside what is already kept. Anything more (or
+        // an oversized snapshot on a fresh row) seeds nothing at all. Ids
+        // the new frontier already implies do not occupy room: the advance
+        // prunes them first.
+        let before = crate::store::read_state::read_state(conn, device_id, chat)?;
+        // Ids the new frontier implies free their slots — but only when no
+        // row under the same id outruns it: twins can straddle the frontier,
+        // and freeing the id for the older row would uncover the newer one.
+        // Scoped to the retained ids (bounded work) and to incoming rows:
+        // coverage only ever badges incoming traffic, so an outgoing twin
+        // above the frontier must not keep its id occupying room.
+        let below: std::collections::HashSet<String> = if before.extra_ids.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            use schema::messages::dsl as msgs;
+            msgs::messages
+                .filter(
+                    msgs::device_id
+                        .eq(device_id)
+                        .and(msgs::chat_jid.eq(chat.as_str()))
+                        .and(msgs::msg_id.eq_any(&before.extra_ids))
+                        .and(msgs::from_me.eq(false))
+                        .and(msgs::timestamp_ms.le(frontier_ms)),
+                )
+                .select(msgs::msg_id)
+                .distinct()
+                .load::<String>(conn)?
+                .into_iter()
+                .collect()
+        };
+        let above: std::collections::HashSet<String> = if before.extra_ids.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            use schema::messages::dsl as msgs;
+            msgs::messages
+                .filter(
+                    msgs::device_id
+                        .eq(device_id)
+                        .and(msgs::chat_jid.eq(chat.as_str()))
+                        .and(msgs::msg_id.eq_any(&before.extra_ids))
+                        .and(msgs::from_me.eq(false))
+                        .and(msgs::local_revoke_placeholder.eq(false))
+                        .and(msgs::timestamp_ms.gt(frontier_ms)),
+                )
+                .select(msgs::msg_id)
+                .distinct()
+                .load::<String>(conn)?
+                .into_iter()
+                .collect()
+        };
+        let freed = before
+            .extra_ids
+            .iter()
+            .filter(|id| below.contains(*id) && !above.contains(*id))
+            .count();
+        let room = crate::store::read_state::READ_EXTRA_IDS_CAP
+            .saturating_sub(before.extra_ids.len().saturating_sub(freed));
+        // Ids already retained occupy their slots without needing a write;
+        // only genuinely new coverage counts against the room above. Past
+        // the cap (`None`), or with no room beside what is kept, nothing
+        // seeds at all rather than evicting older coverage.
+        if let Some(mut future_ids) =
+            crate::store::read_state::coverable_future_ids(conn, device_id, chat, frontier_ms)?
+        {
+            future_ids.retain(|id| !before.extra_ids.contains(id));
+            if future_ids.len() <= room
+                && frontier_ms > 0
+                && crate::store::read_state::advance_read_state(
+                    conn,
+                    device_id,
+                    chat,
+                    frontier_ms,
+                    &future_ids,
+                )?
+                .is_some()
+            {
+                // Rows materialized above may have merged (and recounted
+                // against the old boundary) on their way in; settle the
+                // badge against the frontier just written so cursor and
+                // count agree.
+                let state = crate::store::read_state::read_state(conn, device_id, chat)?;
+                let unread = crate::store::read_state::count_unread(conn, device_id, chat, &state)?;
+                crate::store::read_state::set_unread_count(conn, device_id, chat, unread, cs)?;
+            }
+        }
+    }
+    cs.chats = true;
+    cs.message_chats.insert(chat.to_string());
+    Ok(())
+}
+
+pub(super) fn apply_history_message(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    wmi: &wa::WebMessageInfo,
+    cs: &mut ChangeSet,
+    pending_quotes: &mut Vec<PendingQuote>,
+    shared: bool,
+) -> QueryResult<()> {
+    let Some(key) = wmi.key.as_option() else {
+        return Ok(());
+    };
+    let Some(msg_id) = key.id.as_deref() else {
+        return Ok(());
+    };
+    let from_me = key.from_me.unwrap_or(false);
+    let sender = wmi
+        .participant
+        .as_deref()
+        .or(key.participant.as_deref())
+        .unwrap_or(if from_me { "" } else { chat });
+    let ts_ms = wmi
+        .message_timestamp
+        .map(crate::types::wire_secs_to_ms)
+        .unwrap_or(0);
+
+    if let Some(name) = wmi.push_name.as_deref()
+        && !name.is_empty()
+        && !from_me
+        && !sender.is_empty()
+    {
+        cs.contacts |= upsert_contact_push_name(conn, device_id, sender, name)?;
+    }
+
+    if let Some(message) = wmi.message.as_option() {
+        match classify(message) {
+            MessageOp::Store { kind, text } => {
+                if kind == "history_notice"
+                    && !super::shared_history::notice_visible(conn, device_id, message, from_me)?
+                {
+                    return Ok(());
+                }
+                // Same compaction as the live path. A parent later in this
+                // same conversation is not visible yet, so the post-pass
+                // below re-checks the replies that kept their snapshot.
+                let stored =
+                    crate::storage_proto::storage_bytes_for(conn, device_id, chat, message)?;
+                let crate::storage_proto::StorageBytes {
+                    bytes: proto_bytes,
+                    codec: proto_codec,
+                    kept_quote,
+                } = stored;
+                let stored_row = insert_message(
+                    conn,
+                    device_id,
+                    NewMessage {
+                        chat_jid: chat,
+                        msg_id,
+                        sender_jid: sender,
+                        from_me,
+                        timestamp_ms: ts_ms,
+                        kind,
+                        text: text.as_deref(),
+                        proto: Some(&proto_bytes),
+                        proto_codec,
+                        status: wmi
+                            .status
+                            .map(|s| s as i32)
+                            .unwrap_or(wa::web_message_info::Status::PENDING as i32),
+                        history_status: wmi.status.map(|status| status as i32),
+                        starred: wmi.starred.unwrap_or(false),
+                        // History is the stale copy: live rows win.
+                        overwrite: false,
+                    },
+                    cs,
+                )?;
+                if shared && stored_row == StoredRow::Inserted {
+                    use schema::messages::dsl;
+                    diesel::update(
+                        dsl::messages
+                            .filter(dsl::device_id.eq(device_id))
+                            .filter(dsl::chat_jid.eq(chat))
+                            .filter(dsl::msg_id.eq(msg_id))
+                            .filter(dsl::sender_jid.eq(
+                                crate::store::message_identity::stored_sender(sender, from_me),
+                            ))
+                            .filter(dsl::from_me.eq(from_me)),
+                    )
+                    .set(dsl::received_as_shared_history.eq(true))
+                    .execute(conn)?;
+                }
+                // A reply whose parent lands LATER in this conversation kept
+                // its inline snapshot above (the parent was not visible yet).
+                // Record it for the post-pass rather than re-reading every
+                // row of the conversation afterwards.
+                if stored_row == StoredRow::Inserted
+                    && let Some(target) = kept_quote
+                {
+                    pending_quotes.push(PendingQuote {
+                        msg_id: msg_id.to_string(),
+                        sender: crate::store::message_identity::stored_sender(sender, from_me),
+                        target,
+                    });
+                }
+            }
+            MessageOp::Reaction { target_id, emoji } => {
+                apply_reaction(conn, device_id, chat, &target_id, sender, &emoji, ts_ms)?;
+            }
+            MessageOp::Edit {
+                target_id,
+                new_text,
+                new_kind,
+                new_proto,
+                sender_timestamp_ms,
+            } => {
+                if apply_edit(
+                    conn,
+                    device_id,
+                    chat,
+                    &target_id,
+                    sender,
+                    from_me,
+                    new_text.as_deref(),
+                    new_kind,
+                    &new_proto,
+                    sender_timestamp_ms.unwrap_or(ts_ms),
+                    shared,
+                    cs,
+                )? {
+                    cs.chats = true;
+                }
+            }
+            MessageOp::Revoke {
+                target_id,
+                target_from_me,
+                target_participant,
+            } => {
+                if apply_revoke(
+                    conn,
+                    device_id,
+                    chat,
+                    &target_id,
+                    target_participant.as_deref().unwrap_or(sender),
+                    target_from_me,
+                    ts_ms,
+                    false,
+                    shared,
+                    cs,
+                )? {
+                    cs.chats = true;
+                }
+            }
+            MessageOp::HistoryBundle | MessageOp::Ignore => {}
+        }
+    }
+
+    // Reactions the server aggregated onto the target message.
+    for reaction in &wmi.reactions {
+        let Some(text) = reaction.text.as_deref() else {
+            continue;
+        };
+        let reactor = reaction
+            .key
+            .as_option()
+            .and_then(|k| {
+                if k.from_me.unwrap_or(false) {
+                    Some("")
+                } else {
+                    k.participant.as_deref().or(k.remote_jid.as_deref())
+                }
+            })
+            .unwrap_or("");
+        let reaction_ts = reaction.sender_timestamp_ms.unwrap_or(ts_ms);
+        apply_reaction(conn, device_id, chat, msg_id, reactor, text, reaction_ts)?;
+    }
+    Ok(())
+}

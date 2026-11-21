@@ -1,0 +1,93 @@
+# Rolling build of main. The `nightly` tag is moved on every push, so the
+# release page always holds exactly one set of development binaries.
+name: Nightly
+
+on:
+  # Manual only: releases are published from a Windows machine with
+  # packaging/windows/build-release.ps1, and nothing here may create,
+  # replace or delete a release (or a site) on a push.
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+# Read for everything by default; the publish job below raises its own to
+# `contents: write`, which is the only thing here that needs it.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      version: nightly
+
+  # The same client as a page, packaged so it can be hosted without being
+  # built. It is a separate workflow rather than a fourth matrix entry because
+  # nothing about it matches: a shared-memory target, a rebuilt standard library,
+  # trunk, and one artifact rather than one per platform.
+  web:
+    uses: ./.github/workflows/web-bundle.yml
+    with:
+      version: nightly
+
+  publish:
+    needs: [build, web]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish rolling nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          (cd artifacts && sha256sum velo-* > checksums.sha256)
+          cat > notes.md <<'NOTES'
+          Unsigned development build of `main`. Expect breakage.
+
+          Download the archive for your platform and unpack it. It holds three
+          binaries that belong together, and they must stay in the same
+          directory:
+
+          - `velo` is the window.
+          - `velod` holds the WhatsApp session. The window starts it when
+            nothing is already running.
+          - `velo-cli` is the scriptable front end onto that same daemon,
+            for use from a terminal or a script.
+
+          The tarballs carry the execute bit. On macOS, clear the quarantine
+          flag before the first run:
+
+              xattr -dr com.apple.quarantine velo velod velo-cli
+
+          On Windows, SmartScreen will object. All of this follows from the
+          binaries being unsigned.
+
+          `velo-nightly-web.zip` is the same client as a web page: the
+          bundle published to GitHub Pages, built to be served from anywhere
+          rather than from one directory. Unpack it and serve the files with
+          any static web server — over HTTPS or from `localhost`, and with
+          `coi-serviceworker.js` left beside `index.html`, which is what
+          obtains the cross-origin isolation the window needs. `README.md`
+          inside says the rest.
+          NOTES
+          echo "" >> notes.md
+          echo "Built from [\`${GITHUB_SHA:0:7}\`](https://github.com/$GH_REPO/commit/$GITHUB_SHA) on $(date -u +"%Y-%m-%d %H:%M") UTC." >> notes.md
+          echo "" >> notes.md
+          echo "Verify download integrity with \`sha256sum -c --ignore-missing checksums.sha256\`." >> notes.md
+          # Recreate rather than edit: `gh release edit` cannot move a tag, and
+          # a stale tag would leave the assets pointing at an older commit.
+          gh release delete nightly --yes --cleanup-tag || true
+          gh release create nightly artifacts/* \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Nightly (${GITHUB_SHA:0:7})" \
+            --notes-file notes.md

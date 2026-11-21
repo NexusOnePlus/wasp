@@ -1,0 +1,720 @@
+//! Mutations a front end asks the account to perform.
+//!
+//! Reactions, edits, revokes, forwards and chat-state changes (pin, mute,
+//! archive, unread). Reads live in [`super::paging`]; sends live beside
+//! [`WhatsAppClient::send_message`]. What is here follows the same shape: a
+//! synchronous constructor returning a [`Task`] that resolves once the network
+//! answered, with failures as strings a front end can display.
+
+use velo_chat_store::{MessageKind, MessageStatus};
+
+use whatsapp_rust::wacore_binary::jid::{Jid, JidExt as _, observe_str};
+use whatsapp_rust::waproto::{buffa::MessageField, whatsapp as wa};
+
+use super::WhatsAppClient;
+use crate::exec::Task;
+
+/// What a send-like mutation produced: the server-assigned message id.
+pub type SendId = String;
+
+/// Once the remote delete succeeds, a local writer failure must not invite a
+/// retry of a mutation that already happened. Keep the local update ordered
+/// after the remote answer, and report its failures through diagnostics.
+pub(super) async fn delete_and_record<T, E: std::fmt::Display>(
+    delete: impl std::future::Future<Output = Result<T, E>>,
+    record: impl FnOnce() -> velo_chat_store::Result<()>,
+    flush: impl std::future::Future<Output = velo_chat_store::Result<()>>,
+) -> Result<(), String> {
+    delete.await.map_err(|e| e.to_string())?;
+    if let Err(e) = record() {
+        log::warn!("delete succeeded remotely but could not be queued locally: {e}");
+        return Ok(());
+    }
+    if let Err(e) = flush.await {
+        log::warn!("delete succeeded remotely but could not be saved locally: {e}");
+    }
+    Ok(())
+}
+
+fn edit_text_content(original: Option<&wa::Message>, text: String) -> wa::Message {
+    let context = original
+        .map(velo_chat_store::normalized_message)
+        .and_then(|message| message.extended_text_message.as_option())
+        .and_then(|extended| extended.context_info.as_option());
+    if let Some(context) = context {
+        {
+            let mut constructed: wa::Message = Default::default();
+            constructed.extended_text_message = MessageField::some({
+                let mut constructed: wa::message::ExtendedTextMessage = Default::default();
+                constructed.text = Some(text);
+                constructed.context_info = MessageField::some(context.clone());
+                constructed
+            });
+            constructed
+        }
+    } else {
+        {
+            let mut constructed: wa::Message = Default::default();
+            constructed.conversation = Some(text);
+            constructed
+        }
+    }
+}
+
+fn sent_edit_content(sent: &wa::Message) -> Option<(&wa::Message, i64)> {
+    let protocol = velo_chat_store::normalized_message(sent)
+        .protocol_message
+        .as_option()?;
+    Some((protocol.edited_message.as_option()?, protocol.timestamp_ms?))
+}
+
+impl WhatsAppClient {
+    /// React to a message with an emoji (empty string removes the reaction).
+    ///
+    /// The key's authorship comes from the store rather than the caller: a
+    /// reaction names the message it targets, and who sent that message is a
+    /// fact this side already holds. A message this side has never seen is
+    /// refused instead of guessed at, because a key with the wrong `from_me`
+    /// is a reaction the server drops silently.
+    pub fn send_reaction(
+        &self,
+        chat_jid: String,
+        message_id: String,
+        emoji: String,
+    ) -> Task<Result<SendId, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let chat: Jid = chat_jid
+                .parse()
+                .map_err(|_| "not a chat address".to_string())?;
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let stored = live
+                .chat_store
+                .message(&chat, &message_id)
+                .await
+                .map_err(|e| format!("database query failed: {e}"))?
+                .ok_or_else(|| "message not found".to_string())?;
+            let participant = if stored.from_me {
+                None
+            } else {
+                Some(stored.sender_jid.clone())
+            };
+            let key = {
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some(message_id);
+                constructed.remote_jid = Some(chat.to_string());
+                constructed.from_me = Some(stored.from_me);
+                constructed.participant = participant.map(|j| j.to_string());
+                constructed
+            };
+            let result = live
+                .client
+                .send_reaction_raw(&chat, key, &emoji)
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Err(error) = live
+                .chat_store
+                .record_operation(&chat, result.message_id.as_str())
+            {
+                log::warn!(
+                    "reaction was sent but its acknowledgement could not be tracked: {error}"
+                );
+            }
+            Ok(result.message_id.into_string())
+        })
+    }
+
+    /// Edit one of our own recent text messages.
+    pub fn edit_message(
+        &self,
+        chat_jid: String,
+        message_id: String,
+        new_text: String,
+    ) -> Task<Result<SendId, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let chat: Jid = chat_jid
+                .parse()
+                .map_err(|_| "not a chat address".to_string())?;
+            if new_text.trim().is_empty() {
+                return Err("new text must not be empty".to_string());
+            }
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let stored = live
+                .chat_store
+                .own_message(&chat, &message_id)
+                .await
+                .map_err(|e| format!("database query failed: {e}"))?
+                .ok_or_else(|| "message not found".to_string())?;
+            if !stored.from_me || stored.revoked || stored.kind != MessageKind::Text {
+                return Err("only our own non-deleted text messages can be edited".to_string());
+            }
+            if matches!(stored.status, MessageStatus::Pending | MessageStatus::Error) {
+                return Err("message has not been sent".to_string());
+            }
+            if wacore::time::now_millis().saturating_sub(stored.timestamp.timestamp_millis())
+                >= 15 * 60 * 1_000
+            {
+                return Err("messages can be edited for 15 minutes after sending".to_string());
+            }
+            let content = edit_text_content(stored.message.as_deref(), new_text);
+            let result = live
+                .client
+                .edit_message_raw(
+                    chat.clone(),
+                    message_id.clone(),
+                    content.clone(),
+                    Default::default(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Err(error) = live
+                .chat_store
+                .record_operation(&chat, result.message_id.as_str())
+            {
+                log::warn!("edit was sent but its acknowledgement could not be tracked: {error}");
+            }
+            let (sent_content, timestamp_ms) =
+                sent_edit_content(&result.message).ok_or_else(|| {
+                    "edit was sent but its protocol content or timestamp is missing".to_string()
+                })?;
+            let timestamp = wacore::time::from_millis(timestamp_ms)
+                .ok_or_else(|| "edit was sent with an invalid timestamp".to_string())?;
+            live.chat_store
+                .record_edit(&chat, &message_id, sent_content, timestamp)
+                .map_err(|e| format!("edit was sent but could not be saved locally: {e}"))?;
+            live.chat_store
+                .flush()
+                .await
+                .map_err(|e| format!("edit was sent but could not be saved locally: {e}"))?;
+            let current = live
+                .chat_store
+                .own_message(&chat, &message_id)
+                .await
+                .map_err(|e| format!("edit was sent but its stored result could not be read: {e}"))?
+                .ok_or_else(|| "the edited message is no longer available".to_string())?;
+            if current.revoked
+                || current
+                    .edited_at
+                    .is_none_or(|at| at.timestamp_millis() != timestamp_ms)
+            {
+                return Err(
+                    "the message changed again before this edit was confirmed; reload it and retry"
+                        .to_string(),
+                );
+            }
+            Ok(result.message_id.into_string())
+        })
+    }
+
+    /// Delete a message: locally, or for everyone when asked.
+    ///
+    /// Revoking for everyone uses the sender path, so it only covers our own
+    /// messages; anyone else's is refused with the reason rather than sent as
+    /// a revoke the server would reject.
+    pub fn revoke_message(
+        &self,
+        chat_jid: String,
+        message_id: String,
+        for_everyone: bool,
+    ) -> Task<Result<(), String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let chat: Jid = chat_jid
+                .parse()
+                .map_err(|_| "not a chat address".to_string())?;
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            // A sender revoke names our row even if another group author
+            // reused its id. Local deletes can still target an incoming row.
+            let stored = if for_everyone {
+                live.chat_store.own_message(&chat, &message_id).await
+            } else {
+                live.chat_store.message(&chat, &message_id).await
+            }
+            .map_err(|e| format!("database query failed: {e}"))?;
+            if for_everyone {
+                let stored = stored.ok_or_else(|| "message not found".to_string())?;
+                if !stored.from_me {
+                    return Err("only our own messages can be revoked for everyone".to_string());
+                }
+                if stored.revoked {
+                    return Err("message was already deleted for everyone".to_string());
+                }
+                if matches!(stored.status, MessageStatus::Pending | MessageStatus::Error) {
+                    return Err("message has not been sent".to_string());
+                }
+                if wacore::time::now_millis().saturating_sub(stored.timestamp.timestamp_millis())
+                    > 2 * 24 * 60 * 60 * 1_000
+                {
+                    return Err(
+                        "messages can be deleted for everyone for two days after sending"
+                            .to_string(),
+                    );
+                }
+                delete_and_record(
+                    async {
+                        let result = live.client.revoke_message_raw(
+                            chat.clone(),
+                            message_id.clone(),
+                            whatsapp_rust::send::RevokeType::Sender,
+                        ).await?;
+                        if let Err(error) = live.chat_store.record_operation(&chat, result.message_id.as_str()) {
+                            log::warn!("revoke was sent but its acknowledgement could not be tracked: {error}");
+                        }
+                        Ok::<_, whatsapp_rust::send::SendError>(result)
+                    },
+                    || {
+                        live.chat_store
+                            .record_revoke(&chat, &message_id, wacore::time::now_utc())
+                    },
+                    live.chat_store.flush(),
+                )
+                .await
+            } else {
+                // Local delete rides the app-state path, so linked devices
+                // converge on it; the store catches up through the event
+                // stream. What the store holds decides the key: a group
+                // message from someone else names its sender.
+                let (from_me, participant, timestamp) = match stored {
+                    Some(stored) => (
+                        stored.from_me,
+                        (!stored.from_me && super::participant_keyed_chat(&chat)).then_some(stored.sender_jid),
+                        stored.timestamp.timestamp_millis(),
+                    ),
+                    None => return Err("message not found".to_string()),
+                };
+                let target = whatsapp_rust::MessageRef::new(
+                    &chat,
+                    whatsapp_rust::MessageId::new(&message_id).map_err(|e| e.to_string())?,
+                    participant.as_ref(),
+                    from_me,
+                ).map_err(|e| e.to_string())?;
+                delete_and_record(
+                    live.client.chat_actions().delete_message_for_me(
+                        &target,
+                        false,
+                        Some(timestamp),
+                    ),
+                    || {
+                        live.chat_store.record_delete_for_me(
+                            &chat,
+                            &message_id,
+                            from_me,
+                            participant.clone(),
+                            timestamp,
+                            wacore::time::now_utc(),
+                        )
+                    },
+                    live.chat_store.flush(),
+                )
+                .await
+            }
+        })
+    }
+
+    /// Forward a stored message to another chat.
+    ///
+    /// The stored proto is forwarded, not rebuilt: media already on the CDN
+    /// is relayed from the same blob rather than re-uploaded, which is what
+    /// makes forwarding a photo cheap.
+    pub fn forward_message(
+        &self,
+        source_chat_jid: String,
+        message_id: String,
+        target_chat_jid: String,
+    ) -> Task<Result<SendId, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let source: Jid = source_chat_jid
+                .parse()
+                .map_err(|_| "not a chat address".to_string())?;
+            let target: Jid = target_chat_jid
+                .parse()
+                .map_err(|_| "not a chat address".to_string())?;
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let stored = live
+                .chat_store
+                .message(&source, &message_id)
+                .await
+                .map_err(|e| format!("database query failed: {e}"))?
+                .ok_or_else(|| "message not found".to_string())?;
+            let Some(proto) = stored.message.map(|boxed| *boxed) else {
+                return Err("that message has no forwardable content".to_string());
+            };
+            let result = live
+                .client
+                .forward_message(target.clone(), &proto)
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Err(error) = live
+                .chat_store
+                .record_operation(&target, result.message_id.as_str())
+            {
+                log::warn!(
+                    "message was forwarded but its acknowledgement could not be tracked: {error}"
+                );
+            }
+            Ok(result.message_id.into_string())
+        })
+    }
+
+    /// Answer an interactive list message by selecting one of its rows.
+    ///
+    /// The row id is the caller's, taken from the list message the sender
+    /// wrote. The library has no named helper for this, so the response proto
+    /// is composed here and sent through the generic send, which is what
+    /// `send select` in the CLI needs and what a script automating a bot
+    /// menu is for.
+    pub fn send_list_response(
+        &self,
+        to: String,
+        title: String,
+        row_id: String,
+        reply_to: Option<String>,
+    ) -> Task<Result<SendId, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let chat: Jid = to.parse().map_err(|_| "not a chat address".to_string())?;
+            if row_id.is_empty() {
+                return Err("a list selection needs a row id".to_string());
+            }
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let context = match reply_to {
+                Some(id) => Some(super::convert::quote_context(
+                    &super::sends::quoted_for_reply(&live.chat_store, &chat, &id).await?,
+                )),
+                None => None,
+            };
+            let message = {
+                let mut constructed: wa::Message = Default::default();
+                constructed.list_response_message = whatsapp_rust::buffa::MessageField::some({
+                    let mut constructed: wa::message::ListResponseMessage = Default::default();
+                    constructed.title = Some(title);
+                    constructed.list_type =
+                        Some(wa::message::list_response_message::ListType::SingleSelect);
+                    constructed.single_select_reply = whatsapp_rust::buffa::MessageField::some({
+                        let mut constructed: wa::message::list_response_message::SingleSelectReply =
+                            Default::default();
+                        constructed.selected_row_id = Some(row_id);
+                        constructed
+                    });
+                    constructed.context_info = context
+                        .map(whatsapp_rust::buffa::MessageField::some)
+                        .unwrap_or_default();
+                    constructed
+                });
+                constructed
+            };
+            let msg_id = live.client.generate_message_id();
+            live.chat_store
+                .record_operation(&chat, msg_id.as_str())
+                .map_err(|error| format!("list response was not sent: {error}"))?;
+            let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
+            live.client
+                .send(whatsapp_rust::SendRequest::new(&chat, message).with_options(options))
+                .await
+                .map(|result| result.message_id.to_string())
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Pin or unpin a conversation.
+    pub fn pin_chat(&self, chat_jid: String, pin: bool) -> Task<Result<(), String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let chat: Jid = chat_jid
+                .parse()
+                .map_err(|_| "not a chat address".to_string())?;
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let actions = live.client.chat_actions();
+            if pin {
+                actions.pin_chat(&chat).await.map_err(|e| e.to_string())
+            } else {
+                actions.unpin_chat(&chat).await.map_err(|e| e.to_string())
+            }
+        })
+    }
+
+    /// Mute a conversation, optionally for a bounded duration.
+    ///
+    /// `None` mutes indefinitely; `Some(0)` unmutes, which is how the CLI
+    /// spells it.
+    pub fn mute_chat(
+        &self,
+        chat_jid: String,
+        duration_secs: Option<u64>,
+    ) -> Task<Result<(), String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let chat: Jid = chat_jid
+                .parse()
+                .map_err(|_| "not a chat address".to_string())?;
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            if chat.is_newsletter() {
+                if duration_secs.is_some_and(|seconds| seconds != 0) {
+                    return Err("channels support indefinite mute or unmute".to_string());
+                }
+                let muted = duration_secs != Some(0);
+                live.client
+                    .newsletter()
+                    .set_admin_mute(&chat, muted)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                live.chat_store
+                    .apply_channel_mutes(vec![(chat.to_string(), muted)])
+                    .map_err(|e| e.to_string())?;
+                return live.chat_store.flush().await.map_err(|e| e.to_string());
+            }
+            let actions = live.client.chat_actions();
+            match duration_secs {
+                Some(0) => actions.unmute_chat(&chat).await.map_err(|e| e.to_string()),
+                Some(secs) => {
+                    let until = mute_deadline_ms(whatsapp_rust::wacore::time::now_millis(), secs)
+                        .ok_or_else(|| "mute duration is out of range".to_string())?;
+                    actions
+                        .mute_chat_until(&chat, until)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                None => actions.mute_chat(&chat).await.map_err(|e| e.to_string()),
+            }
+        })
+    }
+
+    /// Archive or unarchive a conversation.
+    pub fn archive_chat(&self, chat_jid: String, archive: bool) -> Task<Result<(), String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let chat: Jid = chat_jid
+                .parse()
+                .map_err(|_| "not a chat address".to_string())?;
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let actions = live.client.chat_actions();
+            if archive {
+                actions
+                    .archive_chat(&chat, None)
+                    .await
+                    .map_err(|e| e.to_string())
+            } else {
+                actions
+                    .unarchive_chat(&chat, None)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        })
+    }
+
+    /// Delete a conversation and its media, on every linked device and the
+    /// phone. Irreversible: the caller confirms first.
+    pub fn delete_chat(&self, chat_jid: String) -> Task<Result<(), String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let chat: Jid = chat_jid
+                .parse()
+                .map_err(|_| "not a chat address".to_string())?;
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            live.client
+                .chat_actions()
+                .delete_chat(&chat, true, None)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Clear a conversation's messages, keeping the chat in the list and
+    /// starred messages in it.
+    pub fn clear_chat(&self, chat_jid: String) -> Task<Result<(), String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let chat: Jid = chat_jid
+                .parse()
+                .map_err(|_| "not a chat address".to_string())?;
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            live.client
+                .chat_actions()
+                .clear_chat_with_options(&chat, whatsapp_rust::ClearChatOptions::default(), None)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Save a contact to the phone's address book, the way WhatsApp's own
+    /// "New contact" does. The number must be a phone-number address.
+    pub fn save_contact(&self, jid: String, full_name: String) -> Task<Result<(), String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let contact: Jid = jid
+                .parse()
+                .map_err(|_| "not a phone number address".to_string())?;
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let full_name = full_name.trim().to_owned();
+            let first_name = full_name.split_whitespace().next().map(str::to_owned);
+            live.client
+                .chat_actions()
+                .save_contact(&contact, Some(full_name), first_name, true)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Mark a conversation unread, keeping whatever is behind it unread too.
+    pub fn mark_chat_unread(&self, chat_jid: String) -> Task<Result<(), String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let chat: Jid = chat_jid
+                .parse()
+                .map_err(|_| "not a chat address".to_string())?;
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            live.client
+                .chat_actions()
+                .mark_chat_as_read(&chat, false, None)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Appear online to everyone. Awaited, unlike the chat states: there is
+    /// no bubble to rename on failure, so the answer is the only signal.
+    pub fn set_available(&self) -> Task<Result<(), String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            live.client
+                .presence()
+                .set_available()
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Appear offline to everyone. Awaited, like [`Self::set_available`].
+    pub fn set_unavailable(&self) -> Task<Result<(), String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            live.client
+                .presence()
+                .set_unavailable()
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Send the "recording audio" chat state. Fire and forget, like the
+    /// composing and paused indicators it joins.
+    pub fn send_recording(&self, jid_str: &str) {
+        let session = self.session.clone();
+        let jid_str = jid_str.to_string();
+
+        self.exec.spawn(async move {
+            let jid: Jid = match jid_str.parse() {
+                Ok(j) => j,
+                Err(e) => {
+                    log::error!("Invalid JID {}: {}", observe_str(&jid_str), e);
+                    return;
+                }
+            };
+
+            let client = session
+                .lock()
+                .await
+                .as_ref()
+                .map(|live| live.client.clone());
+            if let Some(client) = client
+                && let Err(e) = client.chatstate().send_recording(&jid).await
+            {
+                log::warn!("Failed to send recording state: {}", e);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+    #[test]
+    fn edited_reply_retains_context_and_uses_the_sent_protocol_clock() {
+        let context = {
+            let mut constructed: wa::ContextInfo = Default::default();
+            constructed.stanza_id = Some("QUOTED".into());
+            constructed.participant = Some("peer@example.invalid".into());
+            constructed.quoted_message = MessageField::some({
+                let mut constructed: wa::Message = Default::default();
+                constructed.conversation = Some("quoted".into());
+                constructed
+            });
+            constructed
+        };
+        let original = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.extended_text_message = MessageField::some({
+                let mut constructed: wa::message::ExtendedTextMessage = Default::default();
+                constructed.text = Some("original".into());
+                constructed.context_info = MessageField::some(context.clone());
+                constructed
+            });
+            constructed
+        };
+        let edited = edit_text_content(Some(&original), "replacement".into());
+        let sent = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.protocol_message = MessageField::some({
+                let mut constructed: wa::message::ProtocolMessage = Default::default();
+                constructed.timestamp_ms = Some(1_700_000_050_123);
+                constructed.edited_message = MessageField::some(edited);
+                constructed
+            });
+            constructed
+        };
+        let (body, timestamp) = sent_edit_content(&sent).unwrap();
+        let extended = body.extended_text_message.as_option().unwrap();
+        assert_eq!(extended.text.as_deref(), Some("replacement"));
+        assert_eq!(extended.context_info.as_option().unwrap(), &context);
+        assert_eq!(timestamp, 1_700_000_050_123);
+    }
+}
+
+fn mute_deadline_ms(now_ms: i64, seconds: u64) -> Option<i64> {
+    i64::try_from(seconds)
+        .ok()?
+        .checked_mul(1_000)?
+        .checked_add(now_ms)
+}
+
+#[cfg(test)]
+mod mute_deadline_tests {
+    #[test]
+    fn duration_uses_milliseconds_and_rejects_overflow() {
+        assert_eq!(super::mute_deadline_ms(1000, 60), Some(61000));
+        assert_eq!(super::mute_deadline_ms(1000, u64::MAX), None);
+        assert_eq!(super::mute_deadline_ms(i64::MAX, 1), None);
+    }
+}

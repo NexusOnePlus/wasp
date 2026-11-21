@@ -1,0 +1,229 @@
+[package]
+name = "velo-gui"
+description = "Unofficial WhatsApp client: GPUI front end"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# One entry point, two targets. Built for the host this is the desktop
+# window; built for `wasm32-unknown-unknown` and run through `wasm-bindgen`
+# the same `main` becomes the module's start function, which is what trunk
+# builds from `web/index.html`.
+[[bin]]
+name = "velo"
+path = "src/main.rs"
+
+[build-dependencies]
+embed-resource = "3.0.12"
+
+[dependencies]
+# The video's own audio track: `mp4` demuxes the container and `symphonia`
+# decodes the AAC out of it. Both were desktop-only while the only caller was
+# `video/native.rs`, which needs openh264 and so was a desktop path from
+# end to end. That is the day the note beside them predicted: a page demuxes
+# for `web_sys::VideoDecoder` now, and the container was never the problem
+# there — the codec was. So they are shared, and they are real bytes in the
+# bundle rather than something LTO removes, which is the cost of the feature.
+# Voice notes are Opus and live in `velo-audio`, so only the AAC codec and
+# the ISO-MP4 reader are ever reachable; every other format symphonia can
+# register is dead weight in the probe tables.
+mp4 = "0.14.0"
+symphonia = { version = "0.6.1", default-features = false, features = ["aac", "isomp4"] }
+anyhow = { workspace = true }
+chrono = { workspace = true, features = ["std", "clock"] }
+
+# GPUI Kit and the client select the same gpui-fast backend.
+gpui = { package = "gpui-fast", version = "0.1.13" }
+gpui-base = { git = "https://github.com/longbridge/gpui-kit.git", features = ["gpui-fast"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-kit.git", features = ["gpui-fast"] }
+gpui-kit-assets = { git = "https://github.com/longbridge/gpui-kit.git", features = ["gpui-fast"] }
+
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+# Ordered maps for deterministic cache eviction
+indexmap = "2.14.2"
+log = { workspace = true }
+
+velo-audio = { workspace = true }
+# Settings validates advertised modes using the capture capability's exact codec limits.
+velo-video = { workspace = true }
+velo-core = { workspace = true }
+# The daemon's protocol, not the session itself: this front end has not owned
+# a WhatsApp connection since the daemon took it over.
+velo-ipc = { workspace = true, features = ["legacy-protocol"] }
+# The log level: one place decides where it is kept and how it is changed
+# while the process runs, because the daemon reads the same answer.
+velo-logging = { workspace = true }
+portable-atomic = { workspace = true }
+# `image` and nothing else. The crate's defaults add two more renderers this
+# file has never asked for — an SVG one and a `pic`/troff one — and the whole
+# use of it is `render::<image::Luma<u8>>()` in `views/pairing.rs`, which is
+# the `image` feature.
+qrcode = { version = "0.14.1", default-features = false, features = ["image"] }
+# `include-exclude` is not a default feature, and the icon set is selected
+# with `#[include]`. It resolves on the host through another crate in the
+# graph turning it on, and nothing does that for the web — where the same
+# attributes then fail to compile rather than being quietly ignored.
+rust-embed = { version = "8.13.0", features = ["include-exclude", "interpolate-folder-path"] }
+# theme.json: the palette is data, so it needs a schema and a parser.
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+smallvec = "1.16.4"
+# Verify same-origin script-font assets before parsing or caching their bytes.
+sha2 = { version = "0.11.1", default-features = false }
+# Racing two futures, and nothing else. The executor-free half of `smol`,
+# which is all the window ever used it for besides timers — and the only half
+# that builds for a page, since `smol`'s timer is an epoll loop.
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
+# Channels only. The session runs in another process now, so nothing here
+# needs a runtime to drive it.
+tokio = { workspace = true, features = ["sync"] }
+
+# `wacore::time` rather than std clocks, which /clippy.toml disallows, and
+# `Jid` parsing for the header. The satellites directly rather than through
+# `whatsapp-rust`, which re-exports both: a front end has not owned a session
+# since the daemon took it over, and depending on the client to reach two type
+# modules dragged the whole Tokio runtime, transport and VoIP stack in behind
+# them — none of which a browser has, and none of which the window ever
+# called.
+wacore = { workspace = true }
+wacore-binary = { workspace = true }
+
+# The desktop window. Everything here needs an operating system underneath it:
+# a windowing system to draw on, a sound card to open, a C decoder to link.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# Timers, on a platform that has a reactor to run them on.
+smol = "2.0.2"
+gpui_platform = { package = "gpui-fast-platform", version = "0.1.13", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+openh264 = "0.9.9" # H.264 software decoder
+
+[target.'cfg(windows)'.dependencies]
+velo-platform = { workspace = true }
+raw-window-handle = "0.6.2"
+# The taskbar badge: `ITaskbarList3` is COM, which `windows-sys` leaves out.
+windows = { version = "0.62.2", features = [
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Native notification authorization and the process-level active state. GPUI
+# already uses this objc2 family internally; declared because this crate calls
+# the platform APIs directly.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSBundle", "NSDictionary", "NSError", "NSObject", "NSString", "NSURL", "std"] }
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["block2", "UNNotificationAttachment", "UNNotificationContent", "UNNotificationRequest", "UNNotificationSettings", "UNNotificationSound", "UNNotificationTrigger", "UNUserNotificationCenter"] }
+
+# The same window as a page. `gpui_platform` picks the web backend by target,
+# so the dependency differs only in the features a browser has no use for —
+# there is no font-kit, no X11 and no Wayland behind a canvas.
+[target.'cfg(target_family = "wasm")'.dependencies]
+# The daemon, as a library, because in a page it is not a process: there is no
+# socket to reach one over and nothing to start. `embedded::start` is the same
+# state hub, bridge and protocol a desktop front end talks to across a socket,
+# running in this address space — so the rule this looks like it breaks holds
+# exactly as before. There is one session per user, and the window owns none
+# of it.
+velo-daemon = { workspace = true }
+# One tab has to be able to tell itself apart from another; see `front_end_id`.
+getrandom = { workspace = true }
+# `setTimeout`, as a future, with the worker fallback the window's own copy
+# never had. Web only: the desktop half of `platform::clock` is `smol`'s
+# timer, which needs no runtime, and the shared one waits on a Tokio wheel the
+# window has nowhere to put.
+velo-platform = { workspace = true }
+# The oneshot behind "wait for the file dialog to end"; see `platform/plugins.rs`.
+futures-channel = "0.3.34"
+js-sys = "0.3.106"
+gpui_platform = { package = "gpui-fast-platform", version = "0.1.13" }
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+web-sys = { version = "0.3.106", features = [
+    "console",
+    "Navigator",
+    "Notification",
+    "NotificationOptions",
+    "NotificationPermission",
+    "ServiceWorker",
+    "ServiceWorkerContainer",
+    "ServiceWorkerRegistration",
+    "MessageEvent",
+    "UserActivation",
+    "Blob",
+    "BlobPropertyBag",
+    "Document",
+    "Element",
+    "EventTarget",
+    "CssStyleDeclaration",
+    "File",
+    "FileList",
+    "HtmlAnchorElement",
+    "HtmlElement",
+    # The file dialog a page installs a plugin through.
+    "HtmlInputElement",
+    "Location",
+    "Node",
+    "PageTransitionEvent",
+    # The emoji face, fetched from beside `index.html` rather than embedded;
+    # see `platform/fonts.rs`.
+    "Response",
+    "AbortController",
+    "AbortSignal",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "RequestInit",
+    "RequestCache",
+    "RequestMode",
+    "RequestRedirect",
+    "Storage",
+    "StorageEvent",
+    "Url",
+    "Performance",
+    "Window",
+    # Cache Storage API for persistent avatar caching across F5 reloads
+    "CacheStorage",
+    "Cache",
+    "ResponseInit",
+    "Headers",
+    "Request",
+    # WebCodecs: the browser's own H.264 decoder, which is what stands in for
+    # openh264 where there is no C toolchain. See `video/webcodecs.rs`.
+    "VideoDecoder",
+    "VideoDecoderConfig",
+    "VideoDecoderInit",
+    "VideoFrame",
+    "DomRectReadOnly",
+    "VideoPixelFormat",
+    "VideoFrameCopyToOptions",
+    "PlaneLayout",
+    "EncodedVideoChunk",
+    "EncodedVideoChunkInit",
+    "EncodedVideoChunkType",
+    "DomException",
+] }
+
+# The page's text system, on the host. `gpui_web` builds its own over
+# `CosmicTextSystem::new_without_system_fonts`, so `platform/fonts.rs` can
+# hold a browser-only failure under `cargo test` by building the same thing —
+# the crate is already in the graph on every platform, and this only names it.
+[dev-dependencies]
+gpui = { package = "gpui-fast", version = "0.1.13", features = ["test-support"] }
+gpui_wgpu = { package = "gpui-fast-wgpu", version = "0.1.13" }
+# The same synthetic chats and messages every crate above core tests against.
+velo-core = { workspace = true, features = ["fixtures"] }
+
+[lints]
+workspace = true

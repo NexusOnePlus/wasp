@@ -1,0 +1,291 @@
+//! Event order, kept per subject and nowhere else.
+//!
+//! The stream reaches this side already ordered. Handling each event on its
+//! own task threw that away; handling them all on one gave the order back at
+//! the price of a pairing code queueing behind a history sync. So an event is
+//! keyed by what it is about and a key always reaches the same lane, which is
+//! what [`EventLanes`] is.
+
+use std::sync::Arc;
+
+use tokio::sync::mpsc;
+use whatsapp_rust::client::Client;
+use whatsapp_rust::wacore::types::events::Event;
+use whatsapp_rust::wacore_binary::JidExt;
+use whatsapp_rust::wacore_binary::jid::Jid;
+
+use super::{UiEventSender, calls::CallRegistry};
+use crate::names::NameBook;
+
+/// How many lanes events about a subject are spread across.
+///
+/// Fixed rather than one per subject: a lane is a task and a queue, and a
+/// lane per chat is one of each for every conversation an account has ever
+/// had. Subjects share a lane by hash, so two busy chats can queue behind
+/// each other — which costs latency, where the alternative costs order.
+const EVENT_LANES: usize = 8;
+const LANE_CAPACITY: usize = 64;
+
+/// Events about one subject, handled in the order they arrived.
+///
+/// The event stream reaches this side already ordered, and handling each
+/// event on its own task threw that away: a `CallEndedElsewhere` could run
+/// before the `IncomingCall` it ends, leaving a card ringing for a call that
+/// is over, and a receipt could run before the message it answers. Ordering
+/// only matters between events about the same thing, so events are keyed by
+/// their call or their chat and a key always reaches the same lane. Anything
+/// naming neither is session-wide and gets a lane of its own, so a pairing
+/// code never waits behind a conversation.
+pub(super) struct EventLanes {
+    lanes: Vec<mpsc::Sender<(Arc<Event>, u64)>>,
+    calls: CallRegistry,
+    ui: UiEventSender,
+}
+
+impl EventLanes {
+    pub(super) fn new<F, Fut>(
+        handle: F,
+        stopping: tokio::sync::watch::Receiver<()>,
+        calls: CallRegistry,
+        ui: UiEventSender,
+    ) -> Self
+    where
+        F: Fn(Arc<Event>, u64) -> Fut + Clone + crate::exec::MaybeSend + 'static,
+        Fut: Future<Output = ()> + crate::exec::MaybeSend + 'static,
+    {
+        let lanes = (0..=EVENT_LANES)
+            .map(|_| {
+                let (tx, mut rx) = mpsc::channel::<(Arc<Event>, u64)>(LANE_CAPACITY);
+                let handle = handle.clone();
+                let mut stopping = stopping.clone();
+                crate::exec::spawn_owned(async move {
+                    loop {
+                        let event = tokio::select! {
+                            event = rx.recv() => match event {
+                                Some(event) => event,
+                                None => return,
+                            },
+                            // Dropping the senders is not enough on its own:
+                            // a receiver hands out everything already queued
+                            // before it answers `None`, so a lane would work
+                            // through a backlog belonging to an account this
+                            // session no longer speaks for. On a page that
+                            // matters twice over, where nothing cancels a
+                            // spawned task and the backlog keeps the old
+                            // client and its store alive.
+                            _ = stopping.changed() => return,
+                        };
+                        handle(event.0, event.1).await;
+                    }
+                });
+                tx
+            })
+            .collect();
+        Self { lanes, calls, ui }
+    }
+
+    /// Dispatch an event and report recoverable events dropped because their
+    /// lane was full. ChatStore receives the same stream independently, so the
+    /// caller can use the durable-state recovery pass for metadata the UI
+    /// lane missed; preserving the dropped special-chat JIDs also lets that
+    /// pass use the selective channel fallback for a new/unsubscribed chat.
+    pub(super) async fn dispatch(
+        &mut self,
+        client: &Client,
+        names: &NameBook,
+        event: Arc<Event>,
+    ) -> DispatchOutcome {
+        let mut outcome = DispatchOutcome::default();
+        let epoch = self.calls.connection_event(&event, &self.ui);
+        // A batch may span chats, and a lane is one chat's order: sent whole
+        // on the first message's lane, a receipt for a later chat in it runs
+        // on that chat's own lane and can overtake the message it answers.
+        // Split, each chat's messages keep their order against everything
+        // else about that chat, and two chats in one batch were never ordered
+        // against each other.
+        for event in split_by_subject(&event) {
+            let lane = lane_for(client, names, &event).await;
+            if recoverable(&event) {
+                if self.lanes[lane]
+                    .try_send((Arc::clone(&event), epoch))
+                    .is_err()
+                {
+                    outcome.dropped_recoverable = true;
+                    if let Event::Messages(batch) = &*event {
+                        for inbound in batch.iter() {
+                            let chat = &inbound.info.source.chat;
+                            if (chat.is_group() || chat.is_newsletter())
+                                && !outcome
+                                    .special_chat_jids
+                                    .iter()
+                                    .any(|jid| jid == &chat.to_string())
+                            {
+                                outcome.special_chat_jids.push(chat.to_string());
+                            }
+                        }
+                    }
+                    log::warn!(
+                        "dropping recoverable WhatsApp event from full lane {}; ChatStore invalidation will drive recovery after commit",
+                        lane,
+                    );
+                }
+            } else {
+                // Give a transient burst a bounded chance to drain. Awaiting
+                // capacity without a deadline lets one subject stall every
+                // unrelated lane, including connection and call control.
+                let admission = crate::exec::with_timeout(
+                    self.lanes[lane].send((event, epoch)),
+                    std::time::Duration::from_millis(25),
+                )
+                .await;
+                if !matches!(admission, Some(Ok(()))) {
+                    self.ui.signal_control_overflow();
+                    return outcome;
+                }
+            }
+        }
+        outcome
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct DispatchOutcome {
+    pub(super) dropped_recoverable: bool,
+    pub(super) special_chat_jids: Vec<String>,
+}
+
+pub(super) fn recoverable(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Messages(_) | Event::ServerAck(_) | Event::Receipt(_)
+    )
+}
+
+/// One event per subject it is about, which for everything but a batch of
+/// messages is the event itself.
+pub(super) fn split_by_subject(event: &Arc<Event>) -> Vec<Arc<Event>> {
+    let Event::Messages(batch) = &**event else {
+        return vec![Arc::clone(event)];
+    };
+    let mut chats: Vec<String> = Vec::new();
+    for inbound in batch.iter() {
+        let chat = inbound.info.source.chat.to_string();
+        if !chats.contains(&chat) {
+            chats.push(chat);
+        }
+    }
+    if chats.len() <= 1 {
+        return vec![Arc::clone(event)];
+    }
+    chats
+        .into_iter()
+        .map(|chat| {
+            let messages: Arc<[whatsapp_rust::wacore::types::events::InboundMessage]> = batch
+                .iter()
+                .filter(|inbound| inbound.info.source.chat.to_string() == chat)
+                .cloned()
+                .collect();
+            // The origin travels with every part: it says how the batch was
+            // delivered, which is as true of one chat's share of it as of the
+            // whole, and it is what decides whether media is fetched eagerly.
+            Arc::new(Event::Messages(
+                whatsapp_rust::wacore::types::events::MessageBatch::builder()
+                    .messages(messages)
+                    .origin(batch.origin)
+                    .build(),
+            ))
+        })
+        .collect()
+}
+
+/// Which lane an event is handled on. Same subject, same lane.
+///
+/// The address is canonicalized first, which is the whole reason this is not
+/// a pure function of the event. The wire names one peer two ways and the two
+/// hash to different lanes, so a message under a phone number and its receipt
+/// under the LID were handled concurrently: the receipt could overtake the
+/// message it answers -- most easily while that message waits on an eager
+/// media fetch -- and a front end drops a receipt naming a row it has not
+/// been given yet. It is asked of the one book that answers it, which memoizes
+/// the pair, so this is a map read for a peer already seen and not asked at
+/// all of a LID -- and the handler on the other end of the lane finds the same
+/// answer already there.
+///
+/// A pair nobody could read picks the lane the address as written hashes to.
+/// A lane is an ordering choice and never a key: two events about one chat
+/// that disagree about its address lose their order against each other, which
+/// is what this cost before the pairing was consulted at all, and nothing is
+/// filed anywhere on the strength of it.
+async fn lane_for(client: &Client, names: &NameBook, event: &Event) -> usize {
+    let subject = match event_subject(event) {
+        Some(Subject::Call(id)) => Some(id),
+        Some(Subject::Chat(jid)) => Some(
+            names
+                .chat_key(client, &jid)
+                .await
+                .unwrap_or_else(|| jid.to_non_ad_string()),
+        ),
+        None => None,
+    };
+    lane_of(subject.as_deref())
+}
+
+/// The lane a subject hashes to, or the session-wide one for no subject.
+pub(super) fn lane_of(subject: Option<&str>) -> usize {
+    match subject {
+        Some(subject) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&subject, &mut hasher);
+            (std::hash::Hasher::finish(&hasher) as usize) % EVENT_LANES
+        }
+        None => EVENT_LANES,
+    }
+}
+
+/// What an event is about, for the lane that keeps its order.
+///
+/// A call or a chat. `None` is a session-wide event, which is about the
+/// account rather than about anything in it.
+pub(super) enum Subject {
+    Call(String),
+    Chat(Jid),
+}
+
+pub(super) fn event_subject(event: &Event) -> Option<Subject> {
+    match event {
+        Event::RawNode(node) if node.get().tag == "call" => node
+            .get()
+            .get_optional_child("accept")
+            .and_then(|accept| accept.attrs().optional_string("call-id"))
+            .map(|id| Subject::Call(id.into_owned())),
+        Event::IncomingCall(call) => Some(Subject::Call(call.action.call_id().to_string())),
+        Event::MissedCall(missed) => Some(Subject::Call(missed.call_id.clone())),
+        Event::CallEndedElsewhere(ended) => Some(Subject::Call(ended.call_id.clone())),
+        Event::Messages(batch) => batch
+            .iter()
+            .next()
+            .map(|inbound| Subject::Chat(inbound.info.source.chat.clone())),
+        Event::ServerAck(ack) => ack.from.clone().map(Subject::Chat),
+        Event::Receipt(receipt) => Some(Subject::Chat(receipt.source.chat.clone())),
+        Event::ChatPresence(update) => Some(Subject::Chat(update.source.chat.clone())),
+        // Both name somebody, and both handlers go to the store for a name or
+        // an identity. On the session-wide lane a burst of either delayed
+        // `Connected`, `PairingQrCode` and `LoggedOut` behind it, which are
+        // the events a window is waiting on to draw anything at all.
+        Event::Presence(update) => Some(Subject::Chat(update.from.clone())),
+        Event::GroupUpdate(update) => Some(Subject::Chat(update.group_jid.clone())),
+        _ => None,
+    }
+}
+
+impl Subject {
+    /// The address, before canonicalization. For tests and for logging: a
+    /// lane is chosen from the canonical form, which needs the client.
+    #[cfg(test)]
+    pub(super) fn as_written(&self) -> String {
+        match self {
+            Self::Call(id) => id.clone(),
+            Self::Chat(jid) => jid.to_string(),
+        }
+    }
+}

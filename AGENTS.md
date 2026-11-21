@@ -1,0 +1,188 @@
+# Velo
+
+Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap/whatsapp-rust).
+GPUI front end. The same tree builds a desktop app and a web front end for
+`wasm32-unknown-unknown`. **Native builds and ordinary WASM tests use Rust 1.100.0.**
+The shared-memory web build and browser tests use `nightly-2026-10-29`, because
+`build-std` and wasm_thread need unstable features. The standard library is
+rebuilt with atomics. See
+[docs/building.md](docs/building.md) before provisioning a toolchain.
+
+**This file holds decisions, not inventories.** Anything countable — which
+crates exist, which dependency does a job, what a command's flags are, what the
+module weighs — is derived from the tree and goes stale here faster than it goes
+stale there. Where this file names a source of truth, read it rather than
+trusting the sentence next to it.
+
+## Shape
+
+There is exactly **one WhatsApp session per user, and it lives in the daemon.**
+A front end holds no session, no store and no media; it speaks a line protocol
+to the daemon over whatever transport the platform has. On the web the page
+starts a daemon in its own address space — same protocol, no process — so the
+rule holds there too, and a second tab is a front end onto the first.
+
+The layering, which is what a crate's placement has to respect:
+
+- **core** is domain types, and they *are* the wire format. No UI, no I/O.
+- **audio**, **video**, **chat-store** are capability crates. No UI, and each
+  owns its own platform split rather than exporting one.
+- **session** owns the WhatsApp connection and the devices. It names no
+  platform except inside the modules that exist to be split.
+- **ipc** is the protocol and the client end of the transport; **daemon** is the
+  state every front end observes, plus the process around it.
+- **gui** is a front end, and **never depends on session** — that is the rule,
+  and its manifest is where a violation would show. On wasm it does depend on
+  daemon, which is the same rule rather than an exception: a page has no process
+  to reach one in. The manifest comments the gating.
+- **plugin-abi / plugin-host / plugin-sdk** are the wasm ABI, the host that runs
+  modules inside the daemon, and the SDK a plugin is written against.
+
+`Cargo.toml`'s `members` is the list of crates, and each crate's `lib.rs` header
+says what that one is for. Read those; do not trust a table for it. Note that a
+directory name and a package name differ in at least one place.
+
+Two directories sit outside the workspace on purpose, each carrying its own
+`[workspace]` table: `examples/` (plugins link imports only the daemon provides,
+so a host build fails at every `oxi_*` symbol) and `xtask/` (it takes no
+dependencies at all, so the Pages job can compile it from a sparse checkout).
+Only the first is in `exclude`; the second is simply not a member. The reasoning
+is commented at both. `xtask/` has its own CI job; `examples/` is checked at
+the end of the Linux `Check` job — linted and tested on the host, built for
+wasm32 through `cargo xtask plugin build`, and the module loaded by the host's
+`#[ignore]`d test. **Build a plugin through that task, never with a bare
+`cargo build --target wasm32-unknown-unknown`:** the root `.cargo/config.toml`
+gives that target the web front end's flags and cargo joins them into every
+build under the tree, so the bare command produces a module with a shared
+memory that the daemon refuses. The task is the one place that knows to clear
+them, and the READMEs, the building guide and CI all name it rather than
+carrying their own `RUSTFLAGS=`.
+
+## Build & verify
+
+`.github/workflows/ci.yml` is what actually gates a pull request — **check the
+flags there rather than copying them from here**, since the two drift and the
+workflow is the one that is right. As of writing it runs, per job:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+
+# The tooling is its own workspace, so none of the above compiles a byte of it.
+cargo fmt --manifest-path xtask/Cargo.toml --all -- --check
+cargo clippy --manifest-path xtask/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path xtask/Cargo.toml
+
+# And the example plugins, which are their own workspaces too: the same three
+# on the host for each, then built for wasm32 through the task and loaded by
+# the host's ignored test (`rustup target add wasm32-unknown-unknown` first).
+for example in examples/*/; do
+  cargo fmt --manifest-path "$example/Cargo.toml" --all -- --check
+  cargo clippy --manifest-path "$example/Cargo.toml" --all-targets -- -D warnings
+  cargo test --manifest-path "$example/Cargo.toml"
+  cargo xtask plugin build "$example"
+done
+cargo test -p velo-plugin-host --all-features -- --ignored
+```
+
+`cargo xtask help` lists the repository's own tooling — prefer asking it to
+assuming, since tasks are added there. Running the client is the window and the
+daemon, and the window looks for the daemon beside itself; `cargo build
+--release` then run the front-end binary. `velo-cli` is a third binary, a
+front end onto the same daemon. The web build, plugin builds, the browser test
+runner and the profiling and source-map builds are in
+**[docs/building.md](docs/building.md)**.
+
+## Rules that are not obvious
+
+These are decisions. None is derivable by reading the code that obeys them,
+which is why they are here and the inventories are not.
+
+- **Never pin the `whatsapp-rust` crates individually by `rev`.** They resolve
+  from one git source on one branch so `cargo update` moves them together; a
+  mismatch surfaces as "expected `Jid`, found `Jid`" and reads like a compiler
+  bug. `Cargo.toml` has the source and the current set.
+- **Colours come from `cx.theme()`.** A literal is invisible to theme switching
+  and drifts. There are a couple of deliberate exceptions, and
+  `crates/gui/src/theme/` is where one has to argue for itself — the palette
+  and its override table are there, so a colour with no token is visible.
+- **Sizes come from the rem**, never from `px` literals — the window's size
+  reaches the interface as one factor on the base font, applied once from the
+  root's render pass. A component never learns that small screens exist. Follow
+  the callers of the fit helper in `crates/gui/src/theme/metrics.rs`.
+- **Render helpers take `&App` and return `impl IntoElement + use<>`** — without
+  `use<>` the 2024 capture rules make them inherit a lifetime the virtual list's
+  closure rejects.
+- **The trimmed SQLite build is deliberate, and FTS5 must stay** — the search
+  index is built on it. The feature list is in `.cargo/config.toml`.
+- **The store is one file.** Device identity, Signal state and chat history
+  share a database keyed by device id, so a partial wipe orphans everything
+  behind the new device; the wipe deletes the file and its `-wal`/`-shm`.
+- **A *transport's* platform split lives in exactly two places** — the endpoint
+  side under `crates/ipc/src/endpoint/` and the listener side under
+  `crates/daemon/src/listener/`. A new transport is added *there*; everything
+  above them — framing, requests, the protocol — is written once, and the module
+  headers in both say so. This is the rule for transports only: a capability
+  crate owns its own split, which is why `audio/src/web/`, `video/src/web/` and
+  `session/src/exec/` are where they are and not under ipc or daemon. There are
+  about sixteen such split modules now, not the three named here — `find crates
+  -name web.rs` is the list, and the point of naming any is the rule, not the
+  inventory.
+- **A platform split is a module, not a `#[cfg]` per item.** One function the
+  caller names, two implementations behind it, and no `cfg` at the call. The
+  inner module is called `imp` — one word that compiles on both targets, where
+  `native::save(..)` would need a `#[cfg]` at every call site and so put back
+  exactly what the module removes. Small answers stay an inline `mod imp` pair
+  in the one file; a half earns its own file once it grows submodules or
+  outgrows the file. **`#[cfg_attr(path)] mod platform;` does not work when a
+  half has submodules** — rustfmt resolves a `#[path]` module's children against
+  the wrong directory and `cargo fmt --check` fails with "failed to resolve
+  mod". Use the `#[cfg] mod native; #[cfg] mod web;` pair there and say why;
+  `daemon/src/plugins/mod.rs` is the worked example.
+- **A page has no threads, and several std/tokio APIs compile for it and fail at
+  run time** — `std::thread::spawn`, `tokio::time`, `spawn_blocking`. The
+  `velo-platform` crate is the seam that answers them — it sits below
+  everything precisely so `plugin-host`, which must not depend on `session`, can
+  reach it too; that rule used to name the session's `exec/` and the tree had
+  quietly forked three copies of one browser timer because `plugin-host` could
+  not obey it. Route asynchronous waits and task execution through it rather
+  than calling browser timers or runtime pools directly. Reading elapsed time
+  is separate. Use `wacore::time::Instant`, as required by `clippy.toml`.
+  The web startup registers its monotonic provider before the application runs;
+  `velo-platform` does not expose a clock-reading API. What decides where
+  work goes is what the work *is*, not where the code lives.
+- **A browser API never gets a view into wasm memory.** The module is built with
+  `--shared-memory`, so the specs refuse a shared `ArrayBufferView`: copy before
+  crossing out. This cost three outages, so the spelling is now banned rather
+  than remembered — `clippy.toml` lists the offending bindings under
+  `disallowed-methods` with the copying replacement in the reason, and CI's
+  `Test (web)` job is what runs that rule against the wasm target. There is one
+  declared exception; the gotchas entry names it and the reason.
+- **A plugin declares its capabilities once, and declaring grants nothing.**
+  Approval is recorded separately, read live, and nothing loads from a directory
+  another local account can write.
+- **No real PII in tests**, including fixtures derived from captures.
+
+## Where the reasoning lives
+
+Read the relevant document before changing the code it describes — most entries
+exist because the obvious alternative was tried and failed silently. They carry
+the detail and the measurements this file deliberately does not.
+
+- **[docs/architecture.md](docs/architecture.md)** — the crate map in prose, the
+  theme, and how responsiveness derives from one number.
+- **[docs/gotchas.md](docs/gotchas.md)** — non-obvious behaviour and why: the
+  session/front-end split, calls, video, plugins, the store, the wire format.
+- **[docs/web.md](docs/web.md)** — the page: its own daemon, the tab claim, the
+  relay, media, service-worker caching, and what a page cannot do.
+- **[docs/building.md](docs/building.md)** — every build beyond the ones above.
+- **[docs/ci.md](docs/ci.md)** — the library dependency, and why the Actions
+  cache budget decides how long a pull request waits.
+- **[docs/plugin-abi.md](docs/plugin-abi.md)** — the contract for anyone not
+  using the SDK. Load-bearing: a test loads the module it prints.
+- **[docs/roadmap.md](docs/roadmap.md)** — known gaps and their reasoning.
+
+Numbers in those documents are measurements, each true of the commit that took
+it. Re-measure before relying on one; **a number is about the difference that
+produced it**, which docs/ci.md explains at the cost of having got it wrong once.

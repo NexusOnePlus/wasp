@@ -1,0 +1,759 @@
+//! One place a person becomes a label.
+//!
+//! WhatsApp answers "who is this" three ways and they do not agree: the
+//! address book this account synced, the push name the sender chose for
+//! themselves, and the number. Every surface that names somebody — a group
+//! bubble, the typing row, a chat's title, a quote bar — has to pick the
+//! same one, or the same person shows up twice under two names in the same
+//! window. That choice is made here, once, in one order: the address book,
+//! then the push name, then the number.
+//!
+//! The same question decides *what a conversation is called on the wire*: one
+//! peer has a phone number and a LID, the two hash to different chats, and a
+//! message filed under one with its receipt filed under the other is a read
+//! mark on a conversation nobody is looking at. So the canonical key comes
+//! from here too — [`NameBook::chat_key`] — rather than from a second lookup
+//! per event that memoized nothing and answered a failed read with the phone
+//! number.
+//!
+//! It is also where the lookups are paid for. A name costs two queries (the
+//! PN/LID pair behind a JID, then the contact row), and a group page names
+//! the same handful of people over and over, so both are memoized per JID —
+//! misses included, which are the common case for a stranger in a large
+//! group. A full history reload is what re-reads the address book, so it is
+//! also what forgets these.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+use log::warn;
+use velo_chat_store::ChatStore;
+use velo_core::fallback_chat_name;
+// The library's own error type, named through the library: `anyhow` is a
+// direct dependency of this crate on the browser target only.
+use whatsapp_rust::anyhow::Result;
+use whatsapp_rust::client::Client;
+use whatsapp_rust::lid_pn_cache::LidPnEntry;
+use whatsapp_rust::wacore_binary::jid::{Jid, JidExt};
+
+use crate::exec::MaybeSend;
+
+/// Where the pair behind a JID is read from.
+///
+/// A seam, not an abstraction: the session has exactly one implementation and
+/// it is the client's own mapping store. It exists because the answer this
+/// module has to get right is the *failed* one — a read that errors must not
+/// quietly become a phone number — and a live client cannot be asked to fail.
+///
+/// The bound on the future is [`MaybeSend`] for the reason every bound in
+/// [`crate::exec`] is: the same call is awaited on a work-stealing runtime and
+/// on a page's single thread.
+pub(crate) trait LidPnSource {
+    fn lid_pn_entry(
+        &self,
+        jid: &Jid,
+    ) -> impl Future<Output = Result<Option<LidPnEntry>>> + MaybeSend;
+}
+
+impl LidPnSource for Client {
+    fn lid_pn_entry(
+        &self,
+        jid: &Jid,
+    ) -> impl Future<Output = Result<Option<LidPnEntry>>> + MaybeSend {
+        self.get_lid_pn_entry(jid)
+    }
+}
+
+/// So a caller holding the shared client — which is most of them — names it
+/// the way it already holds it.
+impl<T: LidPnSource + ?Sized> LidPnSource for Arc<T> {
+    fn lid_pn_entry(
+        &self,
+        jid: &Jid,
+    ) -> impl Future<Output = Result<Option<LidPnEntry>>> + MaybeSend {
+        (**self).lid_pn_entry(jid)
+    }
+}
+
+/// How much weight a name carries, so a better source is never overwritten
+/// by a worse one arriving later.
+pub(crate) mod priority {
+    /// The address book: what this account's owner decided to call them.
+    pub const ADDRESS_BOOK: u8 = 3;
+    /// A name the sender chose for themselves, or the one the history sync
+    /// carried for a chat.
+    pub const SELF_CHOSEN: u8 = 1;
+    /// The number, or "Unnamed group". True, and nothing more.
+    pub const NONE: u8 = 0;
+}
+
+/// The two JIDs one person can be addressed by, and what to call them when
+/// nobody has a name.
+pub(crate) struct ChatIdentity {
+    /// The JID this conversation is keyed by everywhere: the LID when the
+    /// pair is known, so a chat migrated from a phone number does not split
+    /// in two.
+    pub canonical_jid: String,
+    /// Both aliases, because address-book names are normally PN-keyed while
+    /// push names may be LID-keyed.
+    pub contact_jids: Vec<Jid>,
+    pub fallback_name: String,
+    /// Whether a phone number is known for this person, which is what makes
+    /// the server's own masked label ("+55 ·· ····") worse than useless.
+    pub has_phone: bool,
+    /// Whether anybody actually answered. `false` means the mapping store
+    /// errored, so this identity is the source JID standing in for an answer
+    /// nobody got — never "there is no mapping", which is a real answer and
+    /// settles.
+    pub settled: bool,
+}
+
+/// The address book, memoized, and the order every label is chosen in.
+pub(crate) struct NameBook {
+    /// Where the address book is. The book is handed to the event loop, which
+    /// has the client but not the store, so it carries its own source rather
+    /// than making every caller thread one through.
+    ///
+    /// The store itself, not a slot that might hold one: a book is built
+    /// *after* the store it reads, so there is no moment at which one exists
+    /// without the other. `None` is for the history paths, which are handed a
+    /// store with every call and never read this.
+    chat_store: Option<Arc<ChatStore>>,
+    /// Both memoized answers and their generation share one lock. Lookups do
+    /// I/O without holding it, then compare-and-insert under this same lock;
+    /// consequently `forget` cannot slip between that comparison and write
+    /// and let an old miss repopulate the cache it just cleared.
+    cache: Mutex<NameCache>,
+}
+
+#[derive(Default)]
+struct NameCache {
+    generation: u64,
+    /// Address-book name per *contact* JID, misses included.
+    contacts: HashMap<String, Option<String>>,
+    /// The PN/LID pair behind a sender JID. A separate map on purpose: the
+    /// two are keyed by JIDs that look alike and mean different things, and
+    /// one map for both lets a resolved label be read back as an address-book
+    /// entry it never was.
+    identities: HashMap<String, Arc<ChatIdentity>>,
+}
+
+impl NameBook {
+    pub(crate) fn new(chat_store: Option<Arc<ChatStore>>) -> Self {
+        Self {
+            chat_store,
+            cache: Mutex::new(NameCache::default()),
+        }
+    }
+
+    /// The same durable store the live path uses for names and chat policy.
+    /// History-only and synthetic call fixtures have none; alert decisions
+    /// from those paths are unknown, never implicitly allowed.
+    pub(crate) fn chat_store(&self) -> Option<&ChatStore> {
+        self.chat_store.as_deref()
+    }
+
+    /// Drop everything learned. Called where the address book is being
+    /// re-read anyway, so a contact renamed on the phone appears under its
+    /// new name without a restart.
+    pub(crate) fn forget(&self) {
+        let mut cache = lock(&self.cache);
+        cache.generation = cache.generation.wrapping_add(1);
+        cache.contacts.clear();
+        cache.identities.clear();
+    }
+
+    /// The PN/LID pair behind a JID.
+    pub(crate) async fn identity<S: LidPnSource + ?Sized>(
+        &self,
+        client: &S,
+        jid: &Jid,
+    ) -> Arc<ChatIdentity> {
+        let key = jid.to_non_ad_string();
+        let generation = {
+            let cache = lock(&self.cache);
+            if let Some(known) = cache.identities.get(&key) {
+                return Arc::clone(known);
+            }
+            cache.generation
+        };
+        let identity = Arc::new(build_identity(client, jid).await);
+        // A lookup that failed answers the source JID, which is the same
+        // answer as "no mapping" and is wrong in a way nothing later
+        // corrects: memoized, a transient store error files one person under
+        // two identities for the life of the session — their `composing`
+        // under a phone number, their `paused` under a LID, and a typing line
+        // nothing clears until its TTL runs out.
+        if identity.settled {
+            let mut cache = lock(&self.cache);
+            if cache.generation == generation {
+                cache.identities.insert(key, identity.clone());
+            }
+        }
+        identity
+    }
+
+    /// What a conversation is keyed by everywhere — the LID when the pair is
+    /// known — or `None` when nobody could say.
+    ///
+    /// `None` is not "there is no mapping": that is an answer, and it is the
+    /// phone number. It means the mapping store errored on a phone number, so
+    /// *which of a peer's two addresses this chat is filed under* is exactly
+    /// what nobody knows. Answering the phone number anyway is what routed a
+    /// read receipt into a second, PN-keyed copy of a conversation whose
+    /// messages live under the LID.
+    ///
+    /// Only a phone number can be an alias. A LID is already canonical, and a
+    /// group or a broadcast has no pair to look up, so their key is known
+    /// whatever the store did.
+    ///
+    /// What a caller does with `None` depends on what it is publishing: an
+    /// event that only annotates a row somebody already has — a receipt, a
+    /// presence, a reaction — is dropped and said out loud, because a row
+    /// keyed by a guess is somebody else's row; one that carries content the
+    /// user would otherwise never see falls back to the address as written,
+    /// which is no worse than the address the event arrived under.
+    pub(crate) async fn chat_key<S: LidPnSource + ?Sized>(
+        &self,
+        client: &S,
+        jid: &Jid,
+    ) -> Option<String> {
+        let identity = self.identity(client, jid).await;
+        (identity.settled || !jid.is_pn()).then(|| identity.canonical_jid.clone())
+    }
+
+    /// What to call whoever is at `jid`, and how much the answer is worth.
+    ///
+    /// `offered` is whatever the envelope carried — a push name on a live
+    /// message, the stored chat name on a hydrated one. It is used only when
+    /// the address book has nothing, which is what makes a live bubble and a
+    /// reloaded one say the same thing.
+    pub(crate) async fn resolve(
+        &self,
+        store: &ChatStore,
+        jid: &Jid,
+        offered: Option<&str>,
+        identity: &ChatIdentity,
+    ) -> (String, u8) {
+        if jid.is_pn() || jid.is_lid() {
+            for candidate in &identity.contact_jids {
+                if let Some(name) = self
+                    .contact_name(store, candidate)
+                    .await
+                    .filter(|name| usable_name(name, identity.has_phone))
+                {
+                    return (name, priority::ADDRESS_BOOK);
+                }
+            }
+        }
+
+        if let Some(name) =
+            offered.filter(|name| usable_offered_name(jid, name, identity.has_phone))
+        {
+            return (name.to_string(), priority::SELF_CHOSEN);
+        }
+
+        (identity.fallback_name.clone(), priority::NONE)
+    }
+
+    /// [`resolve`](Self::resolve)'s answer, or `None` when nobody has ever
+    /// said.
+    ///
+    /// The number is deliberately not an answer: a label that only ever
+    /// gains a value can never be renamed by the push name arriving a second
+    /// later, so drawing a number where nothing is known is the front end's
+    /// job. Every caller that stamps a name onto a row goes through this, so
+    /// the bubble, the quote bar and the typing line cannot disagree about
+    /// when somebody is nameless.
+    pub(crate) async fn named(
+        &self,
+        store: &ChatStore,
+        jid: &Jid,
+        offered: Option<&str>,
+        identity: &ChatIdentity,
+    ) -> Option<String> {
+        match self.resolve(store, jid, offered, identity).await {
+            (_, priority::NONE) => None,
+            (name, _) => Some(name),
+        }
+    }
+
+    /// What somebody is actually called, for the paths that were not handed
+    /// the store — [`named`](Self::named) with the address book read off the
+    /// handle.
+    ///
+    /// While the store is still coming up there is no address book to ask, so
+    /// what the envelope offered stands: an event can reach the loop before
+    /// the chat store is installed, and a push name then beats nothing.
+    pub(crate) async fn known<S: LidPnSource + ?Sized>(
+        &self,
+        client: &S,
+        jid: &Jid,
+        offered: Option<&str>,
+    ) -> Option<String> {
+        let identity = self.identity(client, jid).await;
+        let Some(store) = self.chat_store.clone() else {
+            return offered
+                .filter(|name| usable_name(name, identity.has_phone))
+                .map(str::to_owned);
+        };
+        self.named(&store, jid, offered, &identity).await
+    }
+
+    /// The address book's answer for one alias.
+    async fn contact_name(&self, store: &ChatStore, jid: &Jid) -> Option<String> {
+        let key = jid.to_string();
+        let generation = {
+            let cache = lock(&self.cache);
+            if let Some(known) = cache.contacts.get(&key) {
+                return known.clone();
+            }
+            cache.generation
+        };
+        // An error is not an answer, so it is not written down: memoizing it
+        // would file somebody as nameless for the rest of the session over a
+        // pool that was busy for a moment.
+        let contact = match store.contact(jid).await {
+            Ok(contact) => contact,
+            Err(e) => {
+                warn!("Address book lookup for {} failed: {}", key, e);
+                return None;
+            }
+        };
+        let name = contact
+            .and_then(|contact| contact.display_name().map(str::to_owned))
+            .filter(|name| !name.trim().is_empty());
+        let mut cache = lock(&self.cache);
+        if cache.generation == generation {
+            cache.contacts.insert(key, name.clone());
+        }
+        name
+    }
+}
+
+/// The pair behind a JID.
+///
+/// [`ChatIdentity::settled`] is false when the mapping lookup failed rather
+/// than found nothing: the library keeps those apart deliberately, and so
+/// must this.
+async fn build_identity<S: LidPnSource + ?Sized>(client: &S, jid: &Jid) -> ChatIdentity {
+    let source = jid.to_non_ad();
+    let mut canonical = source.clone();
+    let mut contact_jids = vec![source.clone()];
+    let mut fallback_jid = source.clone();
+    let mut has_phone = source.is_pn();
+
+    let mut settled = true;
+    match client.lid_pn_entry(&source).await {
+        Ok(Some(mapping)) => {
+            let pn = Jid::pn(mapping.phone_number.as_ref());
+            let lid = Jid::lid(mapping.lid.as_ref());
+            canonical = lid.clone();
+            fallback_jid = pn.clone();
+            has_phone = true;
+            contact_jids = vec![pn, lid];
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!("identity lookup for {} failed: {e}", source.observe());
+            settled = false;
+        }
+    }
+
+    ChatIdentity {
+        canonical_jid: canonical.to_string(),
+        contact_jids,
+        fallback_name: fallback_chat_name(&fallback_jid),
+        has_phone,
+        settled,
+    }
+}
+
+/// Whether a name is worth carrying.
+///
+/// One predicate rather than one per caller: the resolution order applies it
+/// to the address book and to the push name, and [`NameBook::known`] applies
+/// it on the path that runs before the chat store exists — where an unfiltered
+/// push name of three spaces used to become somebody's name, and stay it,
+/// since a name only ever gains weight.
+pub(crate) fn usable_name(name: &str, has_phone: bool) -> bool {
+    !(name.trim().is_empty() || has_phone && is_masked_phone_label(name))
+}
+
+/// Whether a name carried by a stored chat is a real user/server answer.
+///
+/// Older builds could persist a UI fallback as if it came from the peer or
+/// metadata. Keep those labels unresolved so history does not give them
+/// `SELF_CHOSEN` priority and block repair. Group placeholders are scoped to
+/// groups; the direct placeholder is scoped to LIDs, where it is generated.
+fn usable_offered_name(jid: &Jid, name: &str, has_phone: bool) -> bool {
+    usable_name(name, has_phone)
+        && !is_generated_group_placeholder(jid, name)
+        && !(jid.is_lid() && name.trim() == "Unknown contact")
+}
+
+fn is_generated_group_placeholder(jid: &Jid, name: &str) -> bool {
+    jid.is_group() && matches!(name.trim(), "Unnamed group" | "Group name unavailable")
+}
+
+/// The server's own stand-in for a number it will not spell out, e.g.
+/// `+55 ·· ···· ··43`. Worse than the number we already hold.
+fn is_masked_phone_label(name: &str) -> bool {
+    name.starts_with('+')
+        && name
+            .chars()
+            .filter(|c| matches!(c, '\u{00b7}' | '\u{2022}' | '\u{2219}'))
+            .count()
+            >= 2
+}
+
+// A poisoned lock here means a panic while holding a `HashMap`, which cannot
+// leave one inconsistent. Recovering is strictly better than turning a naming
+// question into a second panic.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use whatsapp_rust::lid_pn_cache::LearningSource;
+
+    use super::*;
+
+    /// Synthetic, and the same person the rest of the session's tests use:
+    /// the subscriber part is a run of zeros, which no real number has.
+    const PEER: &str = "559900000001@s.whatsapp.net";
+    const PEER_LID: &str = "111000011112222@lid";
+    const STRANGER: &str = "559900000002@s.whatsapp.net";
+    const STRANGER_LID: &str = "111000033334444@lid";
+    const GROUP: &str = "120363000000000001@g.us";
+
+    /// A mapping store that can be made to fail, which is the whole point:
+    /// a live client cannot be asked to, and the answer that matters here is
+    /// the failed one.
+    ///
+    /// It also counts its reads, because the second half of what this book is
+    /// for is that a per-event lookup happens once per peer and not once per
+    /// receipt.
+    struct Pairs {
+        entry: Option<LidPnEntry>,
+        failing: AtomicBool,
+        reads: AtomicUsize,
+    }
+
+    impl Pairs {
+        fn knowing(lid: &str, phone: &str) -> Self {
+            Self {
+                entry: Some(LidPnEntry {
+                    lid: lid.into(),
+                    phone_number: phone.into(),
+                    created_at: 0,
+                    learning_source: LearningSource::Usync,
+                }),
+                failing: AtomicBool::new(false),
+                reads: AtomicUsize::new(0),
+            }
+        }
+
+        /// The store is busy, or the pool is: a read from here on errors.
+        fn breaks(&self) {
+            self.failing.store(true, Ordering::Relaxed);
+        }
+
+        fn heals(&self) {
+            self.failing.store(false, Ordering::Relaxed);
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::Relaxed)
+        }
+    }
+
+    struct LearningPairs {
+        entry: Mutex<Option<LidPnEntry>>,
+        reads: AtomicUsize,
+    }
+
+    struct PausingPairs {
+        entry: Mutex<Option<LidPnEntry>>,
+        pause_next: AtomicBool,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        reads: AtomicUsize,
+    }
+
+    impl LearningPairs {
+        fn unknown() -> Self {
+            Self {
+                entry: Mutex::new(None),
+                reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn learns(&self, lid: &str, phone: &str) {
+            *self
+                .entry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(LidPnEntry {
+                lid: lid.into(),
+                phone_number: phone.into(),
+                created_at: 0,
+                learning_source: LearningSource::Usync,
+            });
+        }
+    }
+
+    impl PausingPairs {
+        fn unknown() -> Self {
+            Self {
+                entry: Mutex::new(None),
+                pause_next: AtomicBool::new(true),
+                started: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn learns(&self, lid: &str, phone: &str) {
+            *lock(&self.entry) = Some(LidPnEntry {
+                lid: lid.into(),
+                phone_number: phone.into(),
+                created_at: 0,
+                learning_source: LearningSource::Usync,
+            });
+        }
+    }
+
+    impl LidPnSource for LearningPairs {
+        fn lid_pn_entry(
+            &self,
+            _jid: &Jid,
+        ) -> impl Future<Output = Result<Option<LidPnEntry>>> + MaybeSend {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let answer = self
+                .entry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            async move { Ok(answer) }
+        }
+    }
+
+    impl LidPnSource for PausingPairs {
+        fn lid_pn_entry(
+            &self,
+            _jid: &Jid,
+        ) -> impl Future<Output = Result<Option<LidPnEntry>>> + MaybeSend {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let answer = lock(&self.entry).clone();
+            let pause = self.pause_next.swap(false, Ordering::Relaxed);
+            async move {
+                if pause {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                }
+                Ok(answer)
+            }
+        }
+    }
+
+    impl LidPnSource for Pairs {
+        fn lid_pn_entry(
+            &self,
+            _jid: &Jid,
+        ) -> impl Future<Output = Result<Option<LidPnEntry>>> + MaybeSend {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let answer = if self.failing.load(Ordering::Relaxed) {
+                Err(whatsapp_rust::anyhow::Error::msg(
+                    "the mapping store is busy",
+                ))
+            } else {
+                Ok(self.entry.clone())
+            };
+            async move { answer }
+        }
+    }
+
+    /// A book with nothing behind its handle: a key costs no address book.
+    fn book() -> NameBook {
+        NameBook::new(None)
+    }
+
+    fn jid(text: &str) -> Jid {
+        text.parse().expect("test JID")
+    }
+
+    /// The bug this module answers. A message arrives, its chat is keyed by
+    /// the peer's LID; the mapping store then has a bad moment, and the
+    /// receipt acknowledging that very message arrives. It has to land on the
+    /// row the message made, which means the same key — and one read of the
+    /// pair, not one per event.
+    #[tokio::test]
+    async fn a_receipt_is_keyed_by_what_the_message_was_keyed_by() {
+        let pairs = Pairs::knowing("111000011112222", "559900000001");
+        let book = book();
+
+        let message_key = book.chat_key(&pairs, &jid(PEER)).await;
+        assert_eq!(message_key.as_deref(), Some(PEER_LID));
+
+        pairs.breaks();
+        let receipt_key = book.chat_key(&pairs, &jid(PEER)).await;
+        assert_eq!(receipt_key, message_key);
+        assert_eq!(
+            pairs.reads(),
+            1,
+            "the pair is read once per peer, not once per event"
+        );
+    }
+
+    /// And when nobody ever got an answer, there is no key: the phone number
+    /// is not a stand-in for it, because it is the other half of the very
+    /// pair that could not be read.
+    #[tokio::test]
+    async fn an_unreadable_pair_is_not_a_phone_number() {
+        let pairs = Pairs::knowing("111000033334444", "559900000002");
+        pairs.breaks();
+        let book = book();
+
+        assert_eq!(book.chat_key(&pairs, &jid(STRANGER)).await, None);
+
+        // And the failure is not remembered as one, so the next event asks
+        // again and gets the real key.
+        pairs.heals();
+        assert_eq!(
+            book.chat_key(&pairs, &jid(STRANGER)).await.as_deref(),
+            Some(STRANGER_LID)
+        );
+    }
+
+    /// Only a phone number can be an alias. A LID is already what a chat is
+    /// keyed by and a group has no pair at all, so a store having a bad
+    /// moment does not cost them their key.
+    #[tokio::test]
+    async fn a_lid_or_a_group_is_its_own_key_whatever_the_store_did() {
+        let pairs = Pairs::knowing("111000011112222", "559900000001");
+        pairs.breaks();
+        let book = book();
+
+        assert_eq!(
+            book.chat_key(&pairs, &jid(PEER_LID)).await.as_deref(),
+            Some(PEER_LID)
+        );
+        assert_eq!(
+            book.chat_key(&pairs, &jid(GROUP)).await.as_deref(),
+            Some(GROUP)
+        );
+    }
+
+    /// A LID may be visible in history before its phone-number mapping is
+    /// learned. The first honest miss must not become a session-long answer:
+    /// once the mapping arrives, the same row needs the phone-number fallback
+    /// (or its PN-keyed address-book name) instead of "Unknown contact".
+    #[tokio::test]
+    async fn an_absent_mapping_is_memoized_until_identity_data_changes() {
+        let pairs = LearningPairs::unknown();
+        let book = book();
+
+        let before = book.identity(&pairs, &jid(PEER_LID)).await;
+        assert_eq!(before.fallback_name, "Unknown contact");
+        let repeated = book.identity(&pairs, &jid(PEER_LID)).await;
+        assert_eq!(repeated.fallback_name, "Unknown contact");
+        assert_eq!(
+            pairs.reads.load(Ordering::Relaxed),
+            1,
+            "messages from the same unmapped participant share one lookup"
+        );
+
+        pairs.learns("111000011112222", "559900000001");
+        book.forget();
+        let after = book.identity(&pairs, &jid(PEER_LID)).await;
+
+        assert_eq!(after.canonical_jid, PEER_LID);
+        assert_eq!(after.fallback_name, "+559900000001");
+        assert_eq!(
+            pairs.reads.load(Ordering::Relaxed),
+            2,
+            "a contact/mapping invalidation re-reads the learned pair"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_miss_cannot_repopulate_after_identity_data_changes() {
+        let pairs = Arc::new(PausingPairs::unknown());
+        let book = Arc::new(book());
+        let lookup = tokio::spawn({
+            let pairs = Arc::clone(&pairs);
+            let book = Arc::clone(&book);
+            async move { book.identity(&pairs, &jid(PEER_LID)).await }
+        });
+
+        pairs.started.notified().await;
+        pairs.learns("111000011112222", "559900000001");
+        book.forget();
+        pairs.release.notify_one();
+
+        let stale = lookup.await.expect("lookup task");
+        assert_eq!(stale.fallback_name, "Unknown contact");
+
+        let current = book.identity(&pairs, &jid(PEER_LID)).await;
+        assert_eq!(current.fallback_name, "+559900000001");
+        let repeated = book.identity(&pairs, &jid(PEER_LID)).await;
+        assert_eq!(repeated.fallback_name, "+559900000001");
+        assert_eq!(
+            pairs.reads.load(Ordering::Relaxed),
+            2,
+            "the stale lookup did not repopulate the invalidated miss"
+        );
+    }
+
+    #[test]
+    fn a_blank_or_masked_push_name_is_not_a_name() {
+        assert!(!usable_name("   ", false));
+        assert!(!usable_name("", true));
+        assert!(!usable_name("+55 ·· ···· ··43", true));
+        // Nothing better is known, so the mask is all there is.
+        assert!(usable_name("+55 ·· ···· ··43", false));
+        assert!(usable_name("Ana", true));
+    }
+
+    #[test]
+    fn generated_group_labels_are_not_taken_from_history_as_self_chosen() {
+        let group = jid(GROUP);
+
+        assert!(!usable_offered_name(&group, "Unnamed group", false));
+        assert!(!usable_offered_name(
+            &group,
+            "Group name unavailable",
+            false
+        ));
+        assert!(usable_offered_name(&group, "Trip planning", false));
+        // The same text is still a valid custom label for a direct chat; the
+        // placeholder rule is scoped to group conversations.
+        assert!(usable_offered_name(
+            &jid(PEER),
+            "Group name unavailable",
+            false
+        ));
+        assert!(
+            !usable_offered_name(&jid(PEER_LID), "Unknown contact", false),
+            "a generated LID fallback is not a durable contact name"
+        );
+        assert!(usable_offered_name(&jid(PEER_LID), "Ana", false));
+    }
+
+    #[test]
+    fn a_masked_label_is_recognised_by_its_dots() {
+        assert!(is_masked_phone_label("+55 ·· ···· ··43"));
+        assert!(is_masked_phone_label("+1 •• ••••"));
+        assert!(is_masked_phone_label("+55\u{2219}\u{2219}\u{2219}00"));
+        assert!(!is_masked_phone_label("+12025550143"));
+        assert!(!is_masked_phone_label("Ana"));
+        // One dot is a separator somebody typed, not a mask.
+        assert!(!is_masked_phone_label("+55 ·11"));
+    }
+}

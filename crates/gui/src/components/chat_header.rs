@@ -1,0 +1,727 @@
+//! The bar above a conversation: who it is, and what can be done with them.
+
+use std::sync::Arc;
+
+use gpui::{
+    App, Entity, InteractiveElement as _, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _,
+};
+use gpui_component::ActiveTheme as _;
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::{Icon, IconName};
+
+use crate::app::WhatsAppApp;
+use crate::components::avatar::Presence;
+use crate::responsive::ResponsiveLayout;
+use crate::theme::Metrics;
+use velo_core::{Availability, Chat, GroupRoster, TypingSummary};
+
+use super::{Avatar, ProductIcon, parts};
+
+/// Only plain PN/LID user JIDs can receive a call (not groups, broadcast
+/// lists, status or newsletters).
+fn is_callable_user(jid: &str) -> bool {
+    jid.parse::<wacore_binary::jid::Jid>()
+        .map(|j| j.is_pn() || j.is_lid())
+        .unwrap_or(false)
+}
+
+/// How many names a group's line carries before it starts counting instead.
+///
+/// A line that named everybody would be a paragraph in a bar one line tall,
+/// and the names past the first few are drawn outside the window in any case.
+/// What the reader gets instead is the handful the header has room for and a
+/// true total, which is the fact the rest of them were standing in for.
+const NAMES_IN_A_GROUP_LINE: usize = 6;
+
+/// What the header says under a group's name: who is in it.
+///
+/// Named members first — this account as "You", so the reader finds
+/// themselves without counting — then a tally of everyone left. Members
+/// nobody has a name for are never spelled out: a LID-addressed group answers
+/// with an address and no contact behind it, so naming them would repeat
+/// "Unknown contact" down the line, and each one is already counted in the
+/// total.
+///
+/// The count is the roster's own, so it can be trusted in a way
+/// `Chat::participants` never could: that map fills as senders are *seen*,
+/// and counting it told a fifty-person group it had one member. This is the
+/// membership list the connection holds.
+fn members_line(roster: &GroupRoster) -> Option<String> {
+    let total = roster.size();
+    if total == 0 {
+        return None;
+    }
+    // "You" first rather than last, which is where WhatsApp puts it: the line
+    // is cut short by design, and the one name the reader always recognises
+    // is the one that must not be what falls off the end.
+    let named: Vec<&str> = roster
+        .members
+        .iter()
+        .filter(|member| member.is_self)
+        .map(|_| crate::tr!(You))
+        .chain(
+            roster
+                .members
+                .iter()
+                .filter_map(|member| member.name.as_deref().filter(|_| !member.is_self)),
+        )
+        .take(NAMES_IN_A_GROUP_LINE)
+        .collect();
+
+    if named.is_empty() {
+        return Some(count_of("member", total));
+    }
+    let line = named.join(", ");
+    match total - named.len() {
+        0 => Some(line),
+        rest => Some(crate::tr!(others, line, count_of("other", rest))),
+    }
+}
+
+/// `n` of something, pluralised.
+fn count_of(thing: &str, n: usize) -> String {
+    if crate::i18n::Language::current() == crate::i18n::Language::Portuguese {
+        let noun = match (thing, n == 1) {
+            ("member", true) => "membro",
+            ("member", false) => "membros",
+            ("other", true) => "outro",
+            ("other", false) => "outros",
+            _ => thing,
+        };
+        return format!("{n} {noun}");
+    }
+    if n == 1 {
+        format!("{n} {thing}")
+    } else {
+        format!("{n} {thing}s")
+    }
+}
+
+/// What the header says under the name.
+///
+/// Ordered by which fact is most current: someone typing now beats a presence
+/// reading, which beats who is in the group — the roster changes when
+/// somebody joins, and the other two change while you watch.
+///
+/// A group whose members this window has not been told yet has no subtitle at
+/// all: see below.
+fn subtitle(
+    chat: &Chat,
+    typing: Option<&TypingSummary>,
+    availability: Option<&Availability>,
+    members: Option<&GroupRoster>,
+) -> Option<(String, bool)> {
+    if let Some(summary) = typing {
+        return Some((
+            crate::i18n::Language::current().typing(summary, chat.is_group, true),
+            true,
+        ));
+    }
+    if chat.is_group {
+        // Only from the roster. `chat.participants` is not one — it is filled
+        // when a live message supplies that sender's name, so a fifty-person
+        // group with one recently observed sender reported "1 members" — and
+        // until the daemon answers, saying nothing beats saying something
+        // false.
+        return members.and_then(members_line).map(|line| (line, false));
+    }
+    match availability {
+        Some(Availability::Online) => Some((crate::tr!(Online).to_string(), false)),
+        Some(Availability::LastSeen(at)) => Some((
+            crate::tr!(last_seen, crate::utils::format_list_time(at)),
+            false,
+        )),
+        Some(Availability::Unknown) | None => None,
+    }
+}
+
+// Ten, and each one is a fact about this header that the app does not hand
+// over as a unit: what the conversation is, what it is doing, who is in it,
+// and what this window may do to it. A struct here would be a struct with ten
+// fields and one construction site.
+#[expect(clippy::too_many_arguments, reason = "ten facts, none of them a group")]
+pub fn render_chat_header(
+    chat: &Chat,
+    typing: Option<&TypingSummary>,
+    availability: Option<&Availability>,
+    // Who is in this group, once the daemon has said. `None` for a chat that
+    // is not one, and for a group nobody has been told about yet.
+    members: Option<&GroupRoster>,
+    // Whether this conversation is with the account's own number, which is
+    // the one case where the name alone does not identify it.
+    is_own_number: bool,
+    // Whether this window can reach the network at all. Offline, a call
+    // button that still looked live would place a call into nothing.
+    can_send: bool,
+    entity: Entity<WhatsAppApp>,
+    // What plugins want in this bar, already rendered. Elements rather than
+    // the trees they came from: this component knows where a plugin's button
+    // goes and nothing about what a plugin is.
+    plugin_actions: Vec<gpui::AnyElement>,
+    layout: ResponsiveLayout,
+    media: Option<Arc<dyn crate::session::MediaCache>>,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let metrics = *layout.metrics();
+    // One definition of the marker, shared with the list row. Two copies had
+    // already drifted — that one collapses whitespace in the name first, this
+    // one did not — and a user-visible label with two implementations drifts
+    // again.
+    let name: SharedString = crate::app::chat_row::display_name(&chat.name, is_own_number).into();
+    let subtitle = subtitle(chat, typing, availability, members);
+    // No badge until presence actually arrives. A contact who has told us
+    // nothing is not "away": most contacts are in that state before the first
+    // presence event, and a dot claiming otherwise is a made-up fact.
+    let presence = if chat.is_group {
+        None
+    } else {
+        match availability {
+            Some(Availability::Online) => Some(Presence::Online),
+            Some(Availability::LastSeen(_)) => Some(Presence::Away),
+            // `Unknown` is "offline and not saying when", which the subtitle
+            // already declines to describe — a dot with no line under it
+            // explaining it asserts more than the app knows.
+            Some(Availability::Unknown) | None => None,
+        }
+    };
+
+    div()
+        .h(layout.header_height())
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(metrics.space_lg())
+        .pl(layout.padding())
+        .pr(metrics.space_lg())
+        .bg(cx.theme().sidebar)
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .child(render_identity(
+            chat, name, subtitle, presence, &entity, layout, metrics, media, cx,
+        ))
+        .child(render_actions(
+            chat,
+            can_send,
+            plugin_actions,
+            entity,
+            layout,
+            metrics,
+            cx,
+        ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_identity(
+    chat: &Chat,
+    name: SharedString,
+    subtitle: Option<(String, bool)>,
+    presence: Option<Presence>,
+    entity: &Entity<WhatsAppApp>,
+    layout: ResponsiveLayout,
+    metrics: Metrics,
+    media: Option<Arc<dyn crate::session::MediaCache>>,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let back_entity = entity.clone();
+
+    div()
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .items_center()
+        .gap(metrics.space_lg())
+        .overflow_hidden()
+        .when(layout.show_back_button(), |el| {
+            // Back is a command, so it is a Button: that is what carries
+            // focus, keyboard activation and the theme's button states,
+            // none of which a styled div gets.
+            el.child(
+                Button::new("back")
+                    .icon(IconName::ArrowLeft)
+                    .ghost()
+                    .tooltip(crate::tr!(BackToChats))
+                    .cursor_pointer()
+                    .on_click(move |_, _window, cx| {
+                        back_entity.update(cx, |app, cx| app.navigate_back(cx));
+                    }),
+            )
+        })
+        .child({
+            // The picture and the name open Contact info, as in WhatsApp.
+            let info_entity = entity.clone();
+            div()
+                .id("chat-identity")
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap(metrics.space_lg())
+                .cursor_pointer()
+                .tooltip(|window, cx| {
+                    gpui_component::tooltip::Tooltip::new("Contact info").build(window, cx)
+                })
+                .on_click(move |_, _, cx| {
+                    info_entity.update(cx, |app, cx| app.toggle_contact_info(cx))
+                })
+                .child(
+                    Avatar::new(chat.jid.clone(), &chat.name, metrics.avatar_header())
+                        .group(chat.is_group)
+                        .picture(chat.avatar_cache_key.clone(), media)
+                        .presence(presence)
+                        .on(cx.theme().sidebar),
+                )
+                .child(
+                    parts::detail_stack()
+                        .gap(metrics.space_xxs())
+                        .child(
+                            parts::one_line()
+                                .text_size(metrics.text_strong())
+                                .text_color(cx.theme().foreground)
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child(name),
+                        )
+                        .children(subtitle.map(|(text, is_typing)| {
+                            parts::one_line()
+                                .text_size(metrics.text_small())
+                                .text_color(if is_typing {
+                                    cx.theme().primary
+                                } else {
+                                    cx.theme().muted_foreground
+                                })
+                                .child(text)
+                        })),
+                )
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_actions(
+    chat: &Chat,
+    can_send: bool,
+    plugin_actions: Vec<gpui::AnyElement>,
+    entity: Entity<WhatsAppApp>,
+    layout: ResponsiveLayout,
+    metrics: Metrics,
+    _cx: &App,
+) -> impl IntoElement + use<> {
+    // Calls are 1:1 only: gate on a parsed PN/LID user JID, since !is_group
+    // alone would still offer calls to status/broadcast and newsletter rows.
+    // Offline is as much a reason a call cannot be placed as the JID being a
+    // group: both mean the button would do nothing.
+    let callable = is_callable_user(&chat.jid) && can_send;
+    let call_jid = chat.jid.clone();
+    let video_jid = chat.jid.clone();
+    let overflow_jid = chat.jid.clone();
+    let call_entity = entity.clone();
+    let video_entity = entity.clone();
+    let overflow_entity = entity.clone();
+    let search_entity = entity;
+
+    // Every native control, and none of them shrinks: the row around them
+    // does, so that what gives way on a narrow header is the plugins' region
+    // rather than Call or the overflow menu.
+    let action = |id: &'static str, icon: Icon, tip: &'static str| {
+        parts::icon_button(id, icon, tip, layout.icon_button_size()).flex_shrink_0()
+    };
+
+    div()
+        .flex()
+        .min_w_0()
+        .items_center()
+        .gap(metrics.space_xxs())
+        // Plugin controls come first so they read as belonging to the
+        // conversation rather than to the window's chrome — but in a region
+        // that may *shrink*, while the native buttons after it may not.
+        // Ordering alone would not protect them: a row that cannot shrink
+        // simply grows, taking its `min_w_0` child's bound with it, and Call
+        // and the overflow menu go off the edge of a narrow header. So the
+        // row yields, every native control refuses to, and the plugins'
+        // region is the only thing here that gives way.
+        .child(
+            div()
+                .flex()
+                .min_w_0()
+                .items_center()
+                .gap(metrics.space_xxs())
+                .overflow_hidden()
+                .children(plugin_actions),
+        )
+        .when(layout.show_call_buttons(), |el| {
+            el.child(
+                action(
+                    "search-in-chat",
+                    Icon::new(IconName::Search),
+                    crate::tr!(SearchInConversation),
+                )
+                .cursor_pointer()
+                .on_click(move |_, window, cx| {
+                    search_entity.update(cx, |app, cx| app.toggle_conversation_search(window, cx));
+                }),
+            )
+        })
+        .when(callable && layout.show_call_buttons(), |el| {
+            el.child(
+                action(
+                    "voice-call",
+                    ProductIcon::Phone.into(),
+                    crate::tr!(VoiceCall),
+                )
+                .cursor_pointer()
+                .on_click(move |_, _window, cx| {
+                    call_entity.update(cx, |app, cx| app.start_call(call_jid.clone(), false, cx));
+                }),
+            )
+            .child(
+                action(
+                    "video-call",
+                    ProductIcon::Video.into(),
+                    crate::tr!(VideoCall),
+                )
+                .cursor_pointer()
+                .on_click(move |_, _window, cx| {
+                    video_entity.update(cx, |app, cx| app.start_call(video_jid.clone(), true, cx));
+                }),
+            )
+        })
+        .child(render_overflow_menu(
+            callable,
+            overflow_jid,
+            overflow_entity,
+            HeaderChatState {
+                is_group: chat.is_group,
+                pinned: chat.pinned_at.is_some(),
+                muted: chat
+                    .muted_until
+                    .is_some_and(|until| until > wacore::time::now_utc()),
+                archived: chat.archived,
+            },
+            layout,
+        ))
+}
+
+/// Everything the header can do, whether or not it has room to show it.
+///
+/// The menu is not a leftovers drawer: it carries every action the toolbar
+/// does, so narrowing the window changes where a command lives and never
+/// whether it exists. Below the breakpoint this is the only route to them,
+/// which is exactly why it cannot be a subset.
+/// What the menu needs to know to name each toggle the right way round.
+#[derive(Clone, Copy)]
+struct HeaderChatState {
+    is_group: bool,
+    pinned: bool,
+    muted: bool,
+    archived: bool,
+}
+
+fn render_overflow_menu(
+    callable: bool,
+    jid: String,
+    entity: Entity<WhatsAppApp>,
+    state: HeaderChatState,
+    layout: ResponsiveLayout,
+) -> impl IntoElement + use<> {
+    let info_entity = entity.clone();
+    let search_entity = entity.clone();
+    let video_entity = entity.clone();
+    let call_entity = entity;
+
+    parts::icon_button(
+        "chat-menu",
+        Icon::new(IconName::EllipsisVertical),
+        crate::tr!(More),
+        layout.icon_button_size(),
+    )
+    .cursor_pointer()
+    .dropdown_menu(move |menu, _window, _cx| {
+        let search_entity = search_entity.clone();
+        let call_entity = call_entity.clone();
+        let video_entity = video_entity.clone();
+        let video_jid = jid.clone();
+        let jid = jid.clone();
+
+        let info_entity = info_entity.clone();
+        let menu = menu
+            .item(
+                PopupMenuItem::new(if state.is_group {
+                    "Group info"
+                } else {
+                    "Contact info"
+                })
+                .icon(IconName::Info)
+                .on_click(move |_, _window, cx| {
+                    info_entity.update(cx, |app, cx| app.toggle_contact_info(cx));
+                }),
+            )
+            .item(
+                PopupMenuItem::new(crate::tr!(SearchInConversation))
+                    .icon(IconName::Search)
+                    .on_click(move |_, window, cx| {
+                        search_entity
+                            .update(cx, |app, cx| app.toggle_conversation_search(window, cx));
+                    }),
+            );
+        let menu = chat_action_items(menu, &jid, state);
+
+        if !callable {
+            return menu;
+        }
+        menu.separator()
+            .item(
+                PopupMenuItem::new(crate::tr!(VoiceCall))
+                    .icon(Icon::from(ProductIcon::Phone))
+                    .on_click(move |_, _window, cx| {
+                        call_entity.update(cx, |app, cx| app.start_call(jid.clone(), false, cx));
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(crate::tr!(VideoCall))
+                    .icon(Icon::from(ProductIcon::Video))
+                    .on_click(move |_, _window, cx| {
+                        video_entity
+                            .update(cx, |app, cx| app.start_call(video_jid.clone(), true, cx));
+                    }),
+            )
+    })
+}
+
+/// The row menu's commands, in the header too: WhatsApp offers both, and
+/// the open chat is the one most likely to be muted or cleared.
+fn chat_action_items(
+    menu: gpui_component::menu::PopupMenu,
+    jid: &str,
+    state: HeaderChatState,
+) -> gpui_component::menu::PopupMenu {
+    use crate::app::chat_actions::{
+        ArchiveChat, ClearChat, DeleteChat, MUTE_EIGHT_HOURS, MUTE_ONE_WEEK, MuteChat, PinChat,
+    };
+    let jid: SharedString = jid.to_owned().into();
+    let menu = menu.separator();
+    let menu = if state.muted {
+        menu.menu(
+            "Unmute notifications",
+            Box::new(MuteChat {
+                jid: jid.clone(),
+                seconds: Some(0),
+            }),
+        )
+    } else {
+        menu.menu(
+            "Mute for 8 hours",
+            Box::new(MuteChat {
+                jid: jid.clone(),
+                seconds: Some(MUTE_EIGHT_HOURS),
+            }),
+        )
+        .menu(
+            "Mute for 1 week",
+            Box::new(MuteChat {
+                jid: jid.clone(),
+                seconds: Some(MUTE_ONE_WEEK),
+            }),
+        )
+        .menu(
+            "Mute always",
+            Box::new(MuteChat {
+                jid: jid.clone(),
+                seconds: None,
+            }),
+        )
+    };
+    menu.menu(
+        if state.pinned {
+            "Unpin chat"
+        } else {
+            "Pin chat"
+        },
+        Box::new(PinChat {
+            jid: jid.clone(),
+            pin: !state.pinned,
+        }),
+    )
+    .menu(
+        if state.archived {
+            "Unarchive chat"
+        } else {
+            "Archive chat"
+        },
+        Box::new(ArchiveChat {
+            jid: jid.clone(),
+            archive: !state.archived,
+        }),
+    )
+    .separator()
+    .menu("Clear chat", Box::new(ClearChat { jid: jid.clone() }))
+    .menu("Delete chat", Box::new(DeleteChat { jid }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use velo_core::{ComposingKind, GroupMember, Typist};
+
+    /// A roster as the daemon answers one: `named` people with names, the
+    /// rest addresses nobody has ever put a name to.
+    fn roster(named: &[&str], unnamed: usize, includes_me: bool) -> GroupRoster {
+        let mut members: Vec<GroupMember> = named
+            .iter()
+            .enumerate()
+            .map(|(i, name)| GroupMember {
+                jid: format!("{i}@s.whatsapp.net"),
+                name: Some((*name).to_string()),
+                is_self: false,
+            })
+            .collect();
+        members.extend((0..unnamed).map(|i| GroupMember {
+            jid: format!("{i}@lid"),
+            name: None,
+            is_self: false,
+        }));
+        if includes_me {
+            members.push(GroupMember {
+                jid: "me@s.whatsapp.net".to_string(),
+                name: None,
+                is_self: true,
+            });
+        }
+        GroupRoster {
+            jid: "group@g.us".to_string(),
+            members,
+        }
+    }
+
+    fn group_with(members: usize) -> Chat {
+        let mut chat = Chat::new("group@g.us".to_string());
+        for i in 0..members {
+            chat.participants
+                .insert(format!("{i}@s.whatsapp.net"), format!("Member {i}"));
+        }
+        chat
+    }
+
+    fn direct() -> Chat {
+        Chat::new("5521999999999@s.whatsapp.net".to_string())
+    }
+
+    fn typing(name: &str) -> TypingSummary {
+        TypingSummary {
+            typists: vec![Typist {
+                jid: format!("{name}@s.whatsapp.net"),
+                name: name.to_string(),
+            }],
+            total: 1,
+            kind: ComposingKind::Text,
+        }
+    }
+
+    #[test]
+    fn typing_outranks_every_other_subtitle() {
+        let summary = typing("Ana");
+        let members = roster(&["Ana", "Bruno"], 0, true);
+        let (text, is_typing) =
+            subtitle(&group_with(4), Some(&summary), None, Some(&members)).unwrap();
+        assert_eq!(text, "Ana typing…");
+        assert!(is_typing);
+
+        let (text, is_typing) =
+            subtitle(&direct(), Some(&summary), Some(&Availability::Online), None).unwrap();
+        assert_eq!(text, "typing…", "a direct chat needs no name");
+        assert!(is_typing);
+    }
+
+    /// `participants` collects the senders that have been *seen*, so its
+    /// length is not the group's size and must never be presented as one.
+    #[test]
+    fn a_group_does_not_pass_its_known_senders_off_as_a_member_count() {
+        assert!(subtitle(&group_with(4), None, None, None).is_none());
+        assert!(subtitle(&group_with(0), None, None, None).is_none());
+    }
+
+    /// The line the issue asked for: who is in the group, under its name.
+    #[test]
+    fn a_group_names_its_members_once_the_roster_arrives() {
+        let members = roster(&["Ana", "Bruno"], 0, true);
+        let (text, is_typing) = subtitle(&group_with(1), None, None, Some(&members)).unwrap();
+        assert_eq!(text, "You, Ana, Bruno");
+        assert!(!is_typing, "a roster is not somebody typing");
+    }
+
+    /// A group larger than the line names as many as fit and counts the rest,
+    /// with this account's own entry among the ones that fit.
+    #[test]
+    fn a_large_group_counts_whoever_the_line_has_no_room_for() {
+        let named = ["Ana", "Bruno", "Carla", "Davi", "Elena", "Fabio", "Gil"];
+        let members = roster(&named, 40, true);
+        assert_eq!(
+            members_line(&members).unwrap(),
+            "You, Ana, Bruno, Carla, Davi, Elena and 42 others"
+        );
+    }
+
+    /// Nobody named, everybody counted — which is the honest answer for a
+    /// LID-addressed group nothing has resolved a contact in, and the one
+    /// `participants` could never give.
+    #[test]
+    fn a_group_of_strangers_is_counted_rather_than_listed() {
+        assert_eq!(members_line(&roster(&[], 50, false)).unwrap(), "50 members");
+        assert_eq!(members_line(&roster(&[], 1, false)).unwrap(), "1 member");
+        assert_eq!(
+            members_line(&roster(&["Ana"], 1, false)).unwrap(),
+            "Ana and 1 other"
+        );
+    }
+
+    /// An empty roster is not a group with nobody in it; it is an answer that
+    /// says nothing, and a header says nothing back.
+    #[test]
+    fn an_empty_roster_draws_no_line() {
+        assert!(members_line(&roster(&[], 0, false)).is_none());
+        assert!(subtitle(&group_with(3), None, None, Some(&roster(&[], 0, false))).is_none());
+    }
+
+    /// What a group *does* say is who is typing, which is a fact about now
+    /// and true whatever the roster is.
+    #[test]
+    fn a_group_still_reports_who_is_typing() {
+        let summary = TypingSummary {
+            typists: vec![Typist {
+                jid: "a@s.whatsapp.net".to_string(),
+                name: "Ana".to_string(),
+            }],
+            total: 1,
+            kind: ComposingKind::Text,
+        };
+        assert_eq!(
+            subtitle(&group_with(4), Some(&summary), None, None)
+                .unwrap()
+                .0,
+            "Ana typing…"
+        );
+    }
+
+    #[test]
+    fn a_contact_reports_presence_only_when_it_is_shared() {
+        assert_eq!(
+            subtitle(&direct(), None, Some(&Availability::Online), None)
+                .unwrap()
+                .0,
+            "online"
+        );
+        assert!(
+            subtitle(&direct(), None, Some(&Availability::Unknown), None).is_none(),
+            "a contact who hides last-seen gets no subtitle, not a guess"
+        );
+        assert!(subtitle(&direct(), None, None, None).is_none());
+    }
+
+    #[test]
+    fn only_a_real_user_jid_can_be_called() {
+        assert!(is_callable_user("5521999999999@s.whatsapp.net"));
+        assert!(!is_callable_user("group@g.us"));
+        assert!(!is_callable_user("status@broadcast"));
+        assert!(!is_callable_user("not a jid"));
+    }
+}

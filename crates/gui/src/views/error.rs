@@ -1,0 +1,200 @@
+//! Connection failure.
+//!
+//! An error screen has two readers: the person who wants to know whether to
+//! wait, and the person who is going to report it. The first gets a plain
+//! sentence and a retry; the second gets the technical detail, folded away so
+//! it does not shout at the first.
+
+use gpui::{
+    App, Entity, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
+    Styled, div, prelude::FluentBuilder as _,
+};
+use gpui_component::ActiveTheme as _;
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::{Icon, IconName};
+
+use velo_core::{Fault, Recovery};
+
+use super::centered_view;
+use crate::app::WhatsAppApp;
+use crate::components::{ProductIcon, parts};
+use crate::theme::{ActiveProductTheme as _, Metrics};
+
+pub fn render_error_view(
+    fault: &Fault,
+    retry_in: Option<u64>,
+    show_detail: bool,
+    entity: Entity<WhatsAppApp>,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let metrics = cx.product().metrics;
+    let retry_entity = entity.clone();
+    let detail_entity = entity;
+    let detail = fault.detail.clone();
+    let (headline, body) = crate::i18n::Language::current().fault_labels(fault);
+
+    centered_view("error-screen", metrics.space_xxl())
+        .child(parts::hero_icon(
+            Icon::new(ProductIcon::WifiOff),
+            metrics.avatar_call(),
+            metrics.icon(),
+            cx.theme().warning,
+            cx,
+        ))
+        // What it means and what happens next, in the order a reader needs
+        // them. Not the raw transport error, which is folded away below.
+        .child(parts::screen_message(headline, body, cx))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(metrics.space_lg())
+                // Only where reconnecting is the way out. A version
+                // mismatch fails identically for ever, and the body says so
+                // two lines up: offering the button there is the screen
+                // contradicting itself.
+                .children((fault.recovery != Recovery::Nothing).then(|| {
+                    Button::new("retry")
+                        .label(match retry_in {
+                            // A countdown answers "is it stuck?" without the
+                            // user having to guess.
+                            Some(secs) if secs > 0 => crate::tr!(retry_in, secs),
+                            _ => crate::tr!(RetryNow).to_string(),
+                        })
+                        .primary()
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            retry_entity.update(cx, |this, cx| this.retry_connection(cx));
+                        })
+                }))
+                .child(
+                    // The app is usable offline — history is local. Saying so
+                    // is what stops this screen from being a dead end.
+                    Button::new("work-offline")
+                        .label(crate::tr!(WorkOffline))
+                        .outline()
+                        .cursor_pointer()
+                        .on_click({
+                            let entity = detail_entity.clone();
+                            move |_, _, cx| {
+                                entity.update(cx, |this, cx| this.work_offline(cx));
+                            }
+                        }),
+                ),
+        )
+        .child(render_detail(
+            detail,
+            show_detail,
+            detail_entity,
+            metrics,
+            cx,
+        ))
+}
+
+/// The technical cause, folded away.
+fn render_detail(
+    detail: String,
+    is_open: bool,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let subtle = parts::subtle(cx);
+
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(metrics.space_lg())
+        .max_w(metrics.call_card_width_wide())
+        .child(
+            div()
+                .id("error-detail-toggle")
+                .flex()
+                .items_center()
+                .gap(metrics.space_sm())
+                .cursor_pointer()
+                .text_size(metrics.text_small())
+                .text_color(subtle)
+                .child(
+                    Icon::new(if is_open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(metrics.icon_small()),
+                )
+                .child(if is_open {
+                    crate::tr!(HideTechnicalDetail)
+                } else {
+                    crate::tr!(TechnicalDetail)
+                })
+                .cursor_pointer()
+                .on_click(move |_, _window, cx| {
+                    entity.update(cx, |app, cx| app.toggle_error_detail(cx));
+                }),
+        )
+        .when(is_open, |el| {
+            el.child(
+                div()
+                    .w_full()
+                    .p(metrics.space_lg())
+                    .rounded(metrics.radius_md())
+                    .bg(cx.theme().secondary)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(metrics.text_meta())
+                    .text_color(cx.theme().muted_foreground)
+                    .child(detail),
+            )
+        })
+}
+
+/// A refusal, which is an answer rather than an outage.
+///
+/// Everything here differs from [`render_error_view`] for the same reason:
+/// nothing is being attempted. There is no countdown, because no timer is
+/// armed; the sentence is the reason itself rather than "can't reach
+/// WhatsApp", because WhatsApp was never the problem; and there is no *Work
+/// offline*, because that reads the local history and this window is the one
+/// that could not open the database — the other tab has it. What is left is
+/// the one action that can actually change the answer, once the person has
+/// done the thing the sentence asks of them.
+pub fn render_refused_view(
+    reason: &str,
+    show_detail: bool,
+    entity: Entity<WhatsAppApp>,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let metrics = cx.product().metrics;
+    let retry_entity = entity.clone();
+    let detail = reason.to_string();
+
+    centered_view("refused-screen", metrics.space_xxl())
+        .child(parts::hero_icon(
+            Icon::new(IconName::Info),
+            metrics.avatar_call(),
+            metrics.icon(),
+            cx.theme().muted_foreground,
+            cx,
+        ))
+        // The body is the reason itself. It is written for a person — that is
+        // the whole reason it travels as a sentence rather than a code — so
+        // the headline above it says only where the reason applies.
+        .child(parts::screen_message(
+            crate::tr!(ThisWindowWonTOpenTheAccount),
+            detail.clone(),
+            cx,
+        ))
+        .child(
+            Button::new("retry")
+                .label(crate::tr!(TryAgain))
+                .primary()
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    retry_entity.update(cx, |this, cx| this.retry_connection(cx));
+                }),
+        )
+        .child(render_detail(detail, show_detail, entity, metrics, cx))
+}

@@ -1,0 +1,627 @@
+//! The store and the wire, read as what a front end draws — and back.
+//!
+//! One-way translations with no state between them: a stored row into a
+//! bubble, the store's durable delivery state into the ticks the UI draws, a
+//! quote the front end composed into the context info that threads the reply,
+//! and the device store into who this device is linked as.
+//! [`stored_with_unread_tail`] is here because it is the correction the first of them
+//! owes every caller that hydrates a page.
+
+use std::sync::Arc;
+
+use velo_core::{ChatMessage, MessageStatus, PollContent, UiEvent};
+use whatsapp_rust::client::Client;
+use whatsapp_rust::waproto::whatsapp as wa;
+
+use super::media;
+use crate::quoting::quoted_from;
+
+/// Hydrate an oldest-first page, assigning unread slots only to incoming
+/// rows that contributed to the durable counter. Local revoke placeholders
+/// stay read and cannot displace a real unread message or its receipt.
+pub(super) fn stored_with_unread_tail(
+    rows: Vec<velo_chat_store::StoredMessage>,
+    unread: u32,
+) -> Vec<ChatMessage> {
+    let mut remaining = unread;
+    let mut messages: Vec<_> = rows
+        .into_iter()
+        .rev()
+        .map(|row| {
+            let eligible = !row.from_me
+                && !row.local_revoke_placeholder
+                && !row.received_as_shared_history
+                && row.kind != velo_chat_store::MessageKind::HistoryNotice
+                && row.kind != velo_chat_store::MessageKind::GroupMembership;
+            let mut message = stored_to_chat_message(row);
+            if eligible && remaining > 0 {
+                message.is_read = false;
+                remaining -= 1;
+            }
+            message
+        })
+        .collect();
+    messages.reverse();
+    messages
+}
+
+/// Convert a durable store row into the UI message model. Media stays
+/// download-on-demand (the encoded proto lives in the store if needed later).
+pub(super) fn stored_to_chat_message(stored: velo_chat_store::StoredMessage) -> ChatMessage {
+    // The stored proto still carries the media envelope: hydrate thumbnails +
+    // download info so historical media renders and stays fetchable, instead
+    // of degrading to a [kind] text row until a live redelivery.
+    let base_message = (!stored.revoked)
+        .then_some(stored.message.as_deref())
+        .flatten()
+        .map(velo_chat_store::normalized_message);
+    let media = base_message.and_then(|message| media::media_of(message, None));
+    let poll = base_message.and_then(poll_of);
+    let business = base_message.and_then(velo_chat_store::business_content);
+    let contacts = base_message.and_then(velo_chat_store::shared_contacts_text);
+    let pack = base_message.and_then(velo_chat_store::sticker_pack_text);
+    let content = match (&stored.text, stored.revoked) {
+        (_, true) => "[Message deleted]".to_string(),
+        (_, _) if business.is_some() => business
+            .as_ref()
+            .map(|b| b.body.clone())
+            .unwrap_or_default(),
+        (_, _) if pack.is_some() => pack.unwrap_or_default(),
+        (Some(text), _) => text.clone(),
+        (None, _) if contacts.is_some() => contacts.unwrap_or_default(),
+        (None, _) if poll.is_some() => poll
+            .as_ref()
+            .map(|p| p.question.clone())
+            .unwrap_or_default(),
+        (None, _) if media.is_some() => String::new(),
+        (None, _) => velo_chat_store::message_fallback(&stored.kind).to_owned(),
+    };
+    // Outgoing ticks come from the stored delivery status; incoming default
+    // to read and load_history un-reads the chat's unread tail (per-incoming
+    // read state lives on the chat cursor, not the row).
+    let is_read = if stored.from_me {
+        matches!(
+            stored.status,
+            velo_chat_store::MessageStatus::Read | velo_chat_store::MessageStatus::Played
+        )
+    } else {
+        true
+    };
+    let quoted = base_message.and_then(quoted_from);
+    let system = stored
+        .group_membership
+        .map(|event| velo_core::SystemNotice::GroupMembership(Box::new(event)))
+        .or_else(|| match stored.kind {
+            velo_chat_store::MessageKind::HistoryNotice => {
+                Some(velo_core::SystemNotice::GroupChanged(content.clone()))
+            }
+            velo_chat_store::MessageKind::GroupMembership => Some(
+                velo_core::SystemNotice::GroupChanged("Group membership changed".to_owned()),
+            ),
+            _ => None,
+        });
+    let content = match &system {
+        Some(velo_core::SystemNotice::GroupMembership(event)) => event.summary(),
+        Some(velo_core::SystemNotice::GroupChanged(text)) => text.clone(),
+        _ => content,
+    };
+    ChatMessage {
+        id: stored.id,
+        sender: stored.sender_jid.to_string(),
+        sender_name: None,
+        content,
+        is_text: stored.kind == velo_chat_store::MessageKind::Text,
+        timestamp: stored.timestamp,
+        is_from_me: stored.from_me,
+        is_read: is_read || system.is_some(),
+        media,
+        reactions: std::collections::HashMap::new(),
+        // The store has tracked the real delivery state all along; the UI used
+        // to flatten it to a bool and lose the delivered/read distinction that
+        // the second tick exists to show.
+        status: if stored.from_me || stored.status == velo_chat_store::MessageStatus::Played {
+            store_status(stored.status)
+        } else {
+            MessageStatus::default()
+        },
+        quoted,
+        revoked: stored.revoked,
+        edited: stored.edited_at.is_some(),
+        system,
+        poll,
+        business,
+    }
+}
+
+/// A stored poll creation as the bubble's votable content.
+///
+/// Reads the same creation variants the vote resolves, so the bubble and
+/// the ballot never disagree about which options exist.
+pub(super) fn poll_of(message: &wa::Message) -> Option<PollContent> {
+    let creation = poll_creation_of(message)?;
+    Some(PollContent {
+        question: creation.name.clone().unwrap_or_default(),
+        // One entry per raw option, unnamed ones kept as empty
+        // placeholders: filtering them out would shift every later option's
+        // index, and the bubble votes by index into this list while the
+        // session votes by index into the raw one. An empty slot stays
+        // non-votable through `vote_poll`'s missing-name validation, and
+        // the bubble draws nothing to tap for it.
+        options: creation
+            .options
+            .iter()
+            .map(|o| o.option_name.clone().unwrap_or_default())
+            .collect(),
+        selectable_count: creation.selectable_options_count.unwrap_or(1).max(1),
+    })
+}
+
+/// The poll creation a message carries, in any version the store files as
+/// a poll.
+///
+/// One spelling shared by the bubble and the ballot: `poll_of` draws from
+/// it and `vote_poll` votes against it, so a variant added here reaches
+/// both and a variant missing here misleads neither. v3 first, then v2,
+/// then v1 — all three are the same struct, and v3 is what current clients
+/// send. v4 is a future-proof wrapper around the same creation, unwrapped
+/// for the reason `materialize` peels it: `get_base_message` does not open
+/// it, so without this a v4 poll is a creation no lookup below can see.
+/// v5/v6 stay out: the classifier files them as unknown rather than polls,
+/// and teaching the bubble to draw one while the vote refuses it would be
+/// the disagreement this sharing exists to prevent.
+pub(super) fn poll_creation_of(message: &wa::Message) -> Option<&wa::message::PollCreationMessage> {
+    velo_chat_store::supported_poll_creation_message(message)
+}
+
+/// Map the store's durable delivery state onto the one the UI draws.
+fn store_status(status: velo_chat_store::MessageStatus) -> MessageStatus {
+    use velo_chat_store::MessageStatus as Stored;
+    match status {
+        // Error is terminal for from_me rows (a nack or a local send failure),
+        // so hydration restores the failure indicator rather than grey ticks.
+        Stored::Error => MessageStatus::Failed,
+        Stored::Pending => MessageStatus::Pending,
+        Stored::ServerAck => MessageStatus::Sent,
+        Stored::Delivered => MessageStatus::Delivered,
+        Stored::Read => MessageStatus::Read,
+        Stored::Played => MessageStatus::Played,
+    }
+}
+
+/// The reply context for a quote the front end composed.
+///
+/// The quoted copy is rebuilt from the preview rather than kept: nothing
+/// stores the original protobuf, and the preview is what the quote bar shows
+/// on both sides. Its id and its author are what actually thread the reply,
+/// and those are exact.
+pub(super) fn quote_context(quoted: &velo_core::QuotedMessage) -> wa::ContextInfo {
+    use velo_core::QuotedKind;
+    use whatsapp_rust::buffa::MessageField;
+
+    let caption = (!quoted.preview.is_empty()).then(|| quoted.preview.clone());
+    // The body's *kind*, not a sentence about it. Rebuilding every quote as
+    // plain text sent the recipient the word "Photo" where their client would
+    // have drawn a photo — and `QuotedKind` exists precisely to carry that
+    // distinction across a preview that cannot.
+    let original = match quoted.kind {
+        Some(QuotedKind::Image) => {
+            let mut constructed: wa::Message = Default::default();
+            constructed.image_message = MessageField::some({
+                let mut constructed: wa::message::ImageMessage = Default::default();
+                constructed.caption = caption;
+                constructed
+            });
+            constructed
+        }
+        Some(QuotedKind::Video) => {
+            let mut constructed: wa::Message = Default::default();
+            constructed.video_message = MessageField::some({
+                let mut constructed: wa::message::VideoMessage = Default::default();
+                constructed.caption = caption;
+                constructed
+            });
+            constructed
+        }
+        Some(QuotedKind::Audio) => {
+            let mut constructed: wa::Message = Default::default();
+            constructed.audio_message = MessageField::some(wa::message::AudioMessage::default());
+            constructed
+        }
+        Some(QuotedKind::Document) => {
+            let mut constructed: wa::Message = Default::default();
+            constructed.document_message = MessageField::some({
+                let mut constructed: wa::message::DocumentMessage = Default::default();
+                constructed.caption = caption;
+                constructed
+            });
+            constructed
+        }
+        Some(QuotedKind::Sticker) => {
+            let mut constructed: wa::Message = Default::default();
+            constructed.sticker_message =
+                MessageField::some(wa::message::StickerMessage::default());
+            constructed
+        }
+        None => {
+            let mut constructed: wa::Message = Default::default();
+            constructed.conversation = Some(quoted.preview.clone());
+            constructed
+        }
+    };
+    whatsapp_rust::wacore::proto_helpers::build_quote_context(
+        quoted.message_id.clone(),
+        quoted.sender.clone(),
+        &original,
+    )
+}
+
+/// Who this device is linked as, off the device store.
+///
+/// Both fields are optional because both can genuinely be unknown: a device
+/// that has paired but never synced its profile has no push name, and the
+/// account row says so rather than inventing one.
+pub(super) fn account_event(client: &Arc<Client>) -> UiEvent {
+    let device = client.persistence_manager().get_device_snapshot();
+    UiEvent::AccountUpdated {
+        name: Some(device.push_name.clone()).filter(|name| !name.is_empty()),
+        jid: device.pn.as_ref().map(ToString::to_string),
+        lid: device.lid.as_ref().map(ToString::to_string),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use whatsapp_rust::buffa::MessageField;
+
+    #[test]
+    fn channel_pack_live_projection_and_legacy_reload_agree_and_revocation_erases_it() {
+        let mut pack = wa::message::StickerPackMessage::default();
+        pack.name = Some("Example animals".into());
+        pack.caption = Some("Example caption".into());
+        let mut context = wa::ContextInfo::default();
+        context.stanza_id = Some("ORIGINAL".into());
+        pack.context_info = MessageField::some(context);
+        let mut proto = wa::Message::default();
+        proto.sticker_pack_message = MessageField::some(pack);
+        let expected = super::super::live_content_fallback(&proto, false);
+        let mut row = stored_poll_creation();
+        row.chat_jid = "120363000000000001@newsletter".parse().unwrap();
+        row.kind = velo_chat_store::MessageKind::Unknown;
+        row.text = None;
+        row.message = Some(Box::new(proto));
+        let rendered = stored_to_chat_message(row.clone());
+        assert_eq!(rendered.content, expected);
+        assert!(rendered.content.contains("Example caption"));
+        assert_eq!(rendered.quoted.unwrap().message_id, "ORIGINAL");
+        row.revoked = true;
+        let revoked = stored_to_chat_message(row);
+        assert_eq!(revoked.content, "[Message deleted]");
+        assert!(revoked.quoted.is_none());
+    }
+
+    #[test]
+    fn future_channel_payload_has_same_safe_fallback_live_and_after_reload() {
+        let mut row = stored_poll_creation();
+        row.chat_jid = "120363000000000001@newsletter".parse().unwrap();
+        row.kind = velo_chat_store::MessageKind::Other("future-internal-label".into());
+        row.text = None;
+        row.message = None;
+        assert_eq!(
+            stored_to_chat_message(row).content,
+            velo_chat_store::message_fallback(&velo_chat_store::MessageKind::Unknown)
+        );
+    }
+
+    pub(super) fn stored_poll_creation() -> velo_chat_store::StoredMessage {
+        let proto = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.poll_creation_message_v3 = MessageField::some({
+                let mut constructed: wa::message::PollCreationMessage = Default::default();
+                constructed.name = Some("Onde jantamos?".into());
+                constructed.options = ["Centro", "Praia"]
+                    .iter()
+                    .map(|name| {
+                        let mut constructed: wa::message::poll_creation_message::Option =
+                            Default::default();
+                        constructed.option_name = Some((*name).to_owned());
+                        constructed
+                    })
+                    .collect();
+                constructed.selectable_options_count = Some(1);
+                constructed
+            });
+            constructed
+        };
+        velo_chat_store::StoredMessage {
+            group_membership: None,
+            chat_jid: "559900000001-1620000000@g.us".parse().unwrap(),
+            id: "3EB0C".to_string(),
+            sender_jid: "559900000001@s.whatsapp.net".parse().unwrap(),
+            from_me: false,
+            timestamp: wacore::time::now_utc(),
+            kind: velo_chat_store::MessageKind::Poll,
+            text: None,
+            message: Some(Box::new(proto)),
+            status: velo_chat_store::MessageStatus::Delivered,
+            starred: false,
+            edited_at: None,
+            revoked: false,
+            local_revoke_placeholder: false,
+            received_as_shared_history: false,
+            seq: 1,
+        }
+    }
+
+    #[test]
+    fn shared_history_is_read_and_not_an_unknown_system_bubble() {
+        let mut historical = stored_poll_creation();
+        historical.received_as_shared_history = true;
+        let mut live = stored_poll_creation();
+        live.id = "LIVE".into();
+        let messages = stored_with_unread_tail(vec![live, historical], 1);
+        assert!(!messages[0].is_read);
+        assert!(messages[1].is_read);
+        let mut notice = stored_poll_creation();
+        notice.kind = velo_chat_store::MessageKind::HistoryNotice;
+        notice.text = Some("Shared earlier messages with group members".into());
+        notice.message = None;
+        let rendered = stored_to_chat_message(notice);
+        assert!(matches!(
+            rendered.system,
+            Some(velo_core::SystemNotice::GroupChanged(_))
+        ));
+        assert!(!rendered.content.contains("unknown"));
+    }
+
+    #[test]
+    fn local_placeholder_does_not_consume_the_hydrated_unread_tail() {
+        let mut incoming = stored_poll_creation();
+        incoming.id = "REAL-UNREAD".into();
+        let mut placeholder = stored_poll_creation();
+        placeholder.id = "LOCAL-REVOKE".into();
+        placeholder.local_revoke_placeholder = true;
+        placeholder.revoked = true;
+        let messages = stored_with_unread_tail(vec![incoming, placeholder], 1);
+        assert!(!messages[0].is_read);
+        assert!(messages[1].is_read);
+        assert!(!messages[1].is_from_me);
+    }
+
+    #[test]
+    fn legacy_contact_rows_project_the_proto_without_a_stored_text_column() {
+        let mut stored = stored_poll_creation();
+        stored.kind = velo_chat_store::MessageKind::Contact;
+        stored.message = Some(Box::new({
+            let mut constructed: wa::Message = Default::default();
+            constructed.contact_message = MessageField::some({
+                let mut constructed: wa::message::ContactMessage = Default::default();
+                constructed.display_name = Some("Example Alpha".into());
+                constructed.vcard = Some("FN:Example Alpha\nTEL:+55 99 0000-0001".into());
+                constructed
+            });
+            constructed
+        }));
+        assert_eq!(
+            stored_to_chat_message(stored.clone()).content,
+            "Example Alpha\n+55 99 0000-0001"
+        );
+        stored.revoked = true;
+        assert_eq!(stored_to_chat_message(stored).content, "[Message deleted]");
+    }
+
+    /// A stored poll creation hydrates as a votable poll, with the question
+    /// as its content so previews and search read what the bubble draws.
+    #[test]
+    fn a_stored_poll_creation_hydrates_as_a_votable_poll() {
+        let message = stored_to_chat_message(stored_poll_creation());
+        let poll = message.poll.expect("a poll creation hydrates a poll");
+        assert_eq!(poll.question, "Onde jantamos?");
+        assert_eq!(
+            poll.options,
+            vec!["Centro".to_string(), "Praia".to_string()]
+        );
+        assert_eq!(poll.selectable_count, 1);
+        assert_eq!(message.content, "Onde jantamos?");
+    }
+
+    /// A revoked poll is a tombstone, not a ballot: no options to draw and
+    /// nothing to vote on.
+    #[test]
+    fn a_revoked_poll_hydrates_without_poll_content() {
+        let mut stored = stored_poll_creation();
+        stored.revoked = true;
+        let message = stored_to_chat_message(stored);
+        assert!(message.poll.is_none());
+        assert_eq!(message.content, "[Message deleted]");
+    }
+
+    /// An unnamed raw option keeps its slot as an empty placeholder: the
+    /// bubble votes by index into this list while the session votes by
+    /// index into the raw one, so filtering it out would silently move
+    /// every later option onto the wrong ballot line.
+    #[test]
+    fn an_unnamed_option_keeps_its_index_as_a_placeholder() {
+        let mut stored = stored_poll_creation();
+        let proto = stored.message.as_mut().expect("proto");
+        let creation = proto
+            .poll_creation_message_v3
+            .as_option_mut()
+            .expect("v3 creation");
+        creation.options[0].option_name = None;
+        let message = stored_to_chat_message(stored);
+        let poll = message.poll.expect("a poll creation hydrates a poll");
+        assert_eq!(poll.options.len(), 2);
+        assert_eq!(poll.options[0], String::new());
+        assert_eq!(poll.options[1], "Praia");
+    }
+
+    fn stored_poll_v2() -> velo_chat_store::StoredMessage {
+        let mut stored = stored_poll_creation();
+        let proto = stored.message.as_mut().expect("proto");
+        let creation = proto.poll_creation_message_v3.take().expect("v3 creation");
+        proto.poll_creation_message_v2 = MessageField::some(creation);
+        stored.kind = velo_chat_store::MessageKind::Poll;
+        stored
+    }
+
+    /// v2 creations hydrate like v3 ones: same struct, same ballot, and the
+    /// vote resolves the same variant.
+    #[test]
+    fn a_v2_creation_hydrates_as_a_votable_poll() {
+        let message = stored_to_chat_message(stored_poll_v2());
+        let poll = message.poll.expect("a v2 creation hydrates a poll");
+        assert_eq!(poll.question, "Onde jantamos?");
+        assert_eq!(poll.options.len(), 2);
+    }
+
+    /// A v4 future-proof wrapper opens onto the creation inside:
+    /// `get_base_message` does not peel it, so without this the poll
+    /// renders with no options despite being stored as one.
+    #[test]
+    fn a_v4_wrapped_creation_hydrates_as_a_votable_poll() {
+        let mut stored = stored_poll_v2();
+        let proto = stored.message.take().expect("proto");
+        stored.message = Some(Box::new({
+            let mut constructed: wa::Message = Default::default();
+            constructed.poll_creation_message_v4 = MessageField::some({
+                let mut constructed: wa::message::FutureProofMessage = Default::default();
+                constructed.message = MessageField::some(*proto);
+                constructed
+            });
+            constructed
+        }));
+        let message = stored_to_chat_message(stored);
+        let poll = message.poll.expect("a v4 creation hydrates a poll");
+        assert_eq!(poll.question, "Onde jantamos?");
+        assert_eq!(poll.options.len(), 2);
+    }
+
+    #[test]
+    fn nested_wrappers_hydrate_media_and_quote_from_the_inner_message() {
+        let image = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.image_message = MessageField::some({
+                let mut constructed: wa::message::ImageMessage = Default::default();
+                constructed.jpeg_thumbnail = Some(vec![1, 2, 3]);
+                constructed.context_info = MessageField::some({
+                    let mut constructed: wa::ContextInfo = Default::default();
+                    constructed.stanza_id = Some("quoted-message".to_string());
+                    constructed
+                });
+                constructed
+            });
+            constructed
+        };
+        let associated = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.associated_child_message = MessageField::some({
+                let mut constructed: wa::message::FutureProofMessage = Default::default();
+                constructed.message = MessageField::some(image);
+                constructed
+            });
+            constructed
+        };
+        let mut stored = stored_poll_creation();
+        stored.kind = velo_chat_store::MessageKind::Image;
+        stored.text = None;
+        stored.message = Some(Box::new({
+            let mut constructed: wa::Message = Default::default();
+            constructed.group_mentioned_message = MessageField::some({
+                let mut constructed: wa::message::FutureProofMessage = Default::default();
+                constructed.message = MessageField::some(associated);
+                constructed
+            });
+            constructed
+        }));
+
+        let message = stored_to_chat_message(stored);
+        assert!(
+            message.media.is_some(),
+            "wrapped image media should hydrate"
+        );
+        assert_eq!(
+            message.quoted.expect("wrapped reply quote").message_id,
+            "quoted-message"
+        );
+    }
+    #[test]
+    fn outgoing_delivery_evidence_survives_hydration_without_promoting_server_ack() {
+        use velo_chat_store::MessageStatus as Stored;
+        let mut row = stored_poll_creation();
+        row.from_me = true;
+        for (stored, ui) in [
+            (Stored::ServerAck, MessageStatus::Sent),
+            (Stored::Delivered, MessageStatus::Delivered),
+            (Stored::Read, MessageStatus::Read),
+            (Stored::Played, MessageStatus::Played),
+        ] {
+            row.status = stored;
+            assert_eq!(stored_to_chat_message(row.clone()).delivery(), Some(ui));
+        }
+    }
+
+    #[test]
+    fn incoming_played_survives_hydration_without_turning_read_into_played() {
+        let mut stored = stored_poll_creation();
+        stored.kind = velo_chat_store::MessageKind::Audio;
+        for from_me in [false, true] {
+            stored.from_me = from_me;
+            stored.status = velo_chat_store::MessageStatus::Played;
+            assert_eq!(
+                stored_to_chat_message(stored.clone()).status,
+                MessageStatus::Played
+            );
+        }
+        stored.from_me = false;
+        stored.status = velo_chat_store::MessageStatus::Read;
+        assert_ne!(stored_to_chat_message(stored).status, MessageStatus::Played);
+    }
+}
+
+#[cfg(test)]
+mod business_tests {
+    use super::*;
+    use whatsapp_rust::buffa::MessageField;
+    #[test]
+    fn older_template_rows_without_denormalized_text_reload_from_the_proto() {
+        let mut body = wa::message::interactive_message::Body::default();
+        body.text = Some("*Delivery* is ready".into());
+        let mut interactive = wa::message::InteractiveMessage::default();
+        interactive.body = MessageField::some(body);
+        let mut template = wa::message::TemplateMessage::default();
+        template.format = Some(
+            wa::message::template_message::Format::InteractiveMessageTemplate(interactive.into()),
+        );
+        let mut proto = wa::Message::default();
+        proto.template_message = MessageField::some(template);
+        let mut stored = tests::stored_poll_creation();
+        stored.kind = velo_chat_store::MessageKind::Template;
+        stored.message = Some(Box::new(proto));
+        stored.text = None;
+        let projected = stored_to_chat_message(stored.clone());
+        assert_eq!(projected.content, "*Delivery* is ready");
+        assert_eq!(
+            projected.business,
+            stored
+                .message
+                .as_deref()
+                .and_then(velo_chat_store::business_content)
+        );
+        stored.revoked = true;
+        let revoked = stored_to_chat_message(stored);
+        assert!(revoked.business.is_none());
+        assert!(revoked.media.is_none());
+        assert_eq!(revoked.content, "[Message deleted]");
+    }
+    #[test]
+    fn a_membership_row_with_missing_facts_has_an_honest_read_notice() {
+        let mut row = tests::stored_poll_creation();
+        row.kind = velo_chat_store::MessageKind::GroupMembership;
+        row.message = None;
+        let messages = stored_with_unread_tail(vec![row], 1);
+        assert_eq!(messages[0].content, "Group membership changed");
+        assert!(messages[0].is_read);
+        assert!(messages[0].system.is_some());
+    }
+}

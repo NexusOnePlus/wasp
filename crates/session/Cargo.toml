@@ -1,0 +1,172 @@
+[package]
+name = "velo-session"
+description = "Headless WhatsApp session: connection, event stream, sends, store hydration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+test-support = ["whatsapp-rust/test-support"]
+
+[dependencies]
+async-channel = "2.5.0"
+async-trait = { workspace = true }
+# What an outgoing picture says about itself: its dimensions, and the small
+# JPEG that rides on the message so the other side draws something before it
+# has downloaded anything. The formats a file picker actually hands over — the
+# defaults add a dozen decoders nothing here can be pointed at, and every one
+# of them is bytes in the page's bundle.
+image = { version = "0.25.10", default-features = false, features = [
+    "gif",
+    "jpeg",
+    "png",
+    "webp",
+] }
+log = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+# The same, for a video: an ISO-MP4 knows its own dimensions and duration, and
+# a message that states them is one the recipient can lay out before the file
+# arrives. Demuxing only — nothing here decodes a frame.
+mp4 = "0.14.0"
+
+# The clock, for the cold-start stopwatch in `whatsapp::run_client`. Already
+# in this graph through `whatsapp-rust`; named here because `clippy.toml`
+# disallows `std::time::Instant::now`, and rightly — it does not exist on the
+# target that measurement is about.
+wacore = { workspace = true }
+
+velo-audio = { workspace = true }
+velo-chat-store = { workspace = true, features = ["search"] }
+velo-core = { workspace = true }
+# Where a task runs and how it waits, for both targets. `exec` is still the
+# module the session asks; what it asks is one crate down, because the plugin
+# host sits beside the session and cannot ask it — which is how the browser
+# timer came to exist three times.
+velo-platform = { workspace = true }
+# Both targets now. The camera and the encoder are a platform each — nokhwa is
+# V4L2, AVFoundation and Media Foundation, and OpenH264 is C — and a browser has
+# both too, through `getUserMedia` and `VideoEncoder`. That split lives inside
+# the crate, which is where the platform actually is, so the session names one
+# dependency and its video plane is written once.
+velo-video = { workspace = true }
+# A 64-bit counter, through portable-atomic rather than std (see /clippy.toml).
+portable-atomic = { workspace = true }
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
+
+# The library, twice, because the two targets need different halves of it.
+#
+# Same git source and same branch as every other library crate — that rule is
+# about revisions moving together, and these do, because the source is said
+# once in the workspace and inherited here. What differs is the feature set,
+# which inheritance can only add to: the defaults pull the Tokio transport,
+# the ureq client and `tokio/net`, and `tokio/net` is `mio`, which says
+# outright that it does not build for this target. So the browser build
+# takes none of them and supplies its own through the library's own plugin
+# traits.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# Native store paths validate account ids; the browser store has no paths.
+velo-wire = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+# The workspace names no defaults, so the host half lists the full set it
+# used to get implicitly: the six upstream defaults plus `voip`.
+whatsapp-rust = { workspace = true, features = [
+    "voip",
+    "sqlite-storage",
+    "tokio-transport",
+    "tokio-runtime",
+    "ureq-client",
+    "tokio-native",
+    "signal",
+] }
+
+# A MOV is converted in a private temporary directory before being uploaded
+# as an MP4 video. Only the macOS implementation uses the system converter.
+[target.'cfg(target_os = "macos")'.dependencies]
+tempfile = "3.27.0"
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+# `voip-mlow` and not `voip`: the library's VoIP runtime is portable, and what
+# is not is the half that owns a UDP socket (`voip-relay-native`) and the half
+# that is C (`voip-libopus`). MLow is pure Rust and is the codec WhatsApp's own
+# clients negotiate, so a page has a codec -- which is the sentence this file
+# used to get wrong, and the reason a browser was told it had none. What it
+# supplies instead of the socket is a `RelayTransportProvider`; see
+# `src/relay/`.
+whatsapp-rust = { workspace = true, default-features = false, features = [
+    "voip-mlow",
+] }
+# Directly, because the library no longer re-exports it: `sqlite-storage` is
+# one of the defaults dropped above. Same crate the chat store opens, and
+# without the `bundled-sqlite` that wants a C toolchain — diesel supplies
+# SQLite itself on this target.
+whatsapp-rust-sqlite-storage = { workspace = true, default-features = false }
+# The browser, bound from Rust: the WebSocket, `fetch` and `setTimeout` that
+# stand in for the transport, the HTTP client and the runtime the defaults
+# would have supplied.
+anyhow = { workspace = true }
+bytes = "1.12.1"
+futures-channel = "0.3.34"
+# `or`, for racing a future against its own cancellation.
+futures-lite = "2.6.1"
+getrandom = { workspace = true }
+getrandom_02 = { workspace = true }
+js-sys = "0.3.106"
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+web-sys = { version = "0.3.106", features = [
+    "BinaryType",
+    "CloseEvent",
+    "Event",
+    "Headers",
+    "MessageChannel",
+    "MessageEvent",
+    "MessagePort",
+    "Navigator",
+    "Request",
+    "RequestInit",
+    "Response",
+    # The relay media channel: an `RTCPeerConnection` is the DTLS, SCTP and
+    # DataChannel stack the native transport builds by hand, and the only one a
+    # page can reach. See `src/relay/`.
+    "RtcConfiguration",
+    "RtcDataChannel",
+    "RtcDataChannelEvent",
+    "RtcDataChannelInit",
+    "RtcDataChannelState",
+    "RtcDataChannelType",
+    "RtcPeerConnection",
+    "RtcSdpType",
+    "RtcSessionDescriptionInit",
+    "StorageEstimate",
+    "StorageManager",
+    "WebSocket",
+    "Window",
+    "WorkerGlobalScope",
+] }
+# SQLite's own answer to "what is a file", which is the only answer a browser
+# can give: there is no path, there is a VFS. `sqlite-wasm-rs` is what diesel
+# already links against on this target — naming it here adds no second copy —
+# and `sqlite-wasm-vfs` is where the durable one lives. See `src/store/`.
+# VFS 0.3 removes relaxed_idb, which holds existing browser databases.
+# Keep its matching callback ABI until IndexedDB data has a migration path.
+sqlite-wasm-rs = { version = "0.5.5", default-features = false }
+sqlite-wasm-vfs = "0.2.0"
+
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+wasm-bindgen-test = "0.3.79"
+
+# The cancellation semantics `net::abort_requested` decides are the same on
+# both targets — a `oneshot` and nothing else — so the test that pins them
+# runs on the host, where `cargo test` already is. Only the test needs these
+# here; the page's build gets them from the wasm section above.
+[dev-dependencies]
+anyhow = { workspace = true }
+diesel = { workspace = true }
+futures-channel = "0.3.34"
+futures-lite = "2.6.1"
+
+[lints]
+workspace = true

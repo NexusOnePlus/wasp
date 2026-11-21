@@ -1,0 +1,1133 @@
+//! What one request becomes: an action for the session, and one answer back.
+//!
+//! Every request gets exactly one answer, including the ones that fail — a
+//! client waiting on a reply that was never going to arrive is worse than a
+//! client told no. Two shapes of answer live here and the difference is worth
+//! keeping straight: most requests are acknowledged on the spot, while a
+//! download, a page of history and a storage query are answered *later*, by
+//! the task that does the work, under the id the client chose. See
+//! [`addressed`] and [`out_of_band`], which are where that second shape is
+//! written down once.
+
+use std::sync::Arc;
+
+use velo_ipc::{CallAction, ClientRequest, DaemonMessage, ProtocolError, Request, RequestId};
+
+use super::{always, error_frame};
+use crate::session_bridge::{Action, CommandOutcome, Commands, Outbox, SessionCommand};
+use crate::state::StateHub;
+
+/// What the connection does with one request.
+pub(super) struct Answer {
+    /// The frame to send back, if there is one. Every request has one today;
+    /// the option is what keeps a future fire-and-forget request from having
+    /// to invent an acknowledgement.
+    pub(super) frame: Option<String>,
+    /// Whether to stop the daemon once that frame is on the wire.
+    pub(super) shutdown: bool,
+}
+
+impl Answer {
+    fn frame(frame: Option<String>) -> Self {
+        Self {
+            frame,
+            shutdown: false,
+        }
+    }
+}
+
+/// The id an answer that arrives later has to be addressed to.
+///
+/// Most requests are acknowledged where they are read, so an id is a
+/// convenience and doing without one costs the client nothing. For the few
+/// whose answer is the thing asked for — a download's bytes, a page of rows,
+/// the storage numbers — it is the address itself: the answer arrives among
+/// every other answer this connection is owed, and one with no id on it is a
+/// frame no waiter can claim. Refusing is the only honest answer, and
+/// `needs` is what says which request was refused.
+fn addressed(id: Option<RequestId>, needs: &'static str) -> Result<RequestId, Answer> {
+    id.ok_or_else(|| {
+        Answer::frame(always(
+            None,
+            error_frame(
+                None,
+                ProtocolError::Malformed {
+                    detail: needs.into(),
+                },
+            ),
+        ))
+    })
+}
+
+/// Hand over an action whose real answer arrives later, under `id`.
+///
+/// Nothing is acknowledged: the bytes or the rows *are* the answer, and they
+/// come back from the task the action spawns — so a second frame under the
+/// same id now would be taken for it by a
+/// client that has already retired its waiter. Only a refusal is answered
+/// here, because then nothing else will be.
+async fn out_of_band(hub: &StateHub, commands: &Commands, id: RequestId, action: Action) -> Answer {
+    match dispatch(hub, commands, action).await {
+        Ok(()) => Answer::frame(None),
+        Err(error) => Answer::frame(always(Some(id), error_frame(Some(id), error))),
+    }
+}
+
+/// Handle one request.
+///
+/// Every request gets exactly one answer, including the ones that fail: a
+/// client waiting on a reply that was never going to arrive is worse than a
+/// client told no.
+pub(super) async fn handle_request(
+    Request { id, request }: Request,
+    hub: &StateHub,
+    plugins: &Arc<velo_plugin_host::Plugins>,
+    commands: &Commands,
+    outbox: &Outbox,
+) -> Answer {
+    // Every arm below answers under `id`, which is what lets a client match
+    // an answer to the thing it asked — and why nothing here has to invent a
+    // way to report a failure against the message a client happened to draw.
+    let acted = |result| Answer::frame(answer(id, result));
+
+    match request {
+        ClientRequest::Snapshot => {
+            Answer::frame(always(id, hub.hello_frame().map_err(anyhow::Error::from)))
+        }
+        // A second hello is harmless but says nothing; acknowledging keeps the
+        // rule that every request gets exactly one answer.
+        ClientRequest::Hello { .. } => acted(Ok(())),
+        // The payload moves rather than being unpacked and rebuilt: the
+        // request and the action carry the same struct, so there is nothing
+        // here for a field to be dropped from.
+        ClientRequest::SendText(request) => {
+            acted(dispatch(hub, commands, Action::SendText(*request)).await)
+        }
+        ClientRequest::EditMessage(request) => {
+            let id = match addressed(id, "an edit needs an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::EditMessage {
+                    id,
+                    request,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        ClientRequest::RevokeMessage(request) => {
+            let id = match addressed(id, "a delete needs an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::RevokeMessage {
+                    id,
+                    request,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        ClientRequest::SendAudio(request) => {
+            acted(dispatch(hub, commands, Action::SendAudio(*request)).await)
+        }
+        ClientRequest::SendMedia(request) => {
+            acted(dispatch(hub, commands, Action::SendMedia(*request)).await)
+        }
+        ClientRequest::SendReaction(request) => {
+            acted(dispatch(hub, commands, Action::SendReaction(*request)).await)
+        }
+        ClientRequest::Typing(request) => {
+            acted(dispatch(hub, commands, Action::Typing(request)).await)
+        }
+        ClientRequest::VotePoll(request) => {
+            acted(dispatch(hub, commands, Action::VotePoll(request)).await)
+        }
+        ClientRequest::LoadCallHistory { refresh } => {
+            let id = match addressed(id, "a call history request needs an id") {
+                Ok(id) => id,
+                Err(answer) => return answer,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::LoadCallHistory {
+                    id,
+                    refresh,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        ClientRequest::ForwardMessage {
+            source_jid,
+            message_id,
+            target_jid,
+        } => {
+            let id = match addressed(id, "a forward needs an id") {
+                Ok(id) => id,
+                Err(answer) => return answer,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::ForwardMessage {
+                    id,
+                    source_jid,
+                    message_id,
+                    target_jid,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        ClientRequest::ListContacts { query, limit } => {
+            let id = match addressed(id, "a contact list needs an id") {
+                Ok(id) => id,
+                Err(answer) => return answer,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::ListContacts {
+                    id,
+                    query,
+                    limit,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        ClientRequest::SaveContact { jid, full_name } => {
+            let id = match addressed(id, "saving a contact needs an id") {
+                Ok(id) => id,
+                Err(answer) => return answer,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::SaveContact {
+                    id,
+                    jid,
+                    full_name,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        ClientRequest::SearchFiles { query, limit } => {
+            let id = match addressed(id, "a file search needs an id") {
+                Ok(id) => id,
+                Err(answer) => return answer,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::SearchFiles {
+                    id,
+                    query,
+                    limit,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        ClientRequest::ChatAction { jid, action } => {
+            let id = match addressed(id, "a chat action needs an id") {
+                Ok(id) => id,
+                Err(answer) => return answer,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::ChatAction {
+                    id,
+                    jid,
+                    action,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        ClientRequest::SearchEverywhere { query, limit } => {
+            let id = match addressed(id, "a search request needs an id") {
+                Ok(id) => id,
+                Err(answer) => return answer,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::SearchEverywhere {
+                    id,
+                    query,
+                    limit,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        ClientRequest::CallDevices(request) => {
+            let id = match addressed(id, "a device request needs an id") {
+                Ok(id) => id,
+                Err(answer) => return answer,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::CallDevices {
+                    id,
+                    request: *request,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        ClientRequest::Call(action) => acted(dispatch(hub, commands, Action::Call(action)).await),
+        // The bytes come back as `Downloaded` under this id, seconds later,
+        // from the task the action spawns.
+        ClientRequest::Download(request) => {
+            let id = match addressed(id, "a download needs an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::Download {
+                    id,
+                    request,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        ClientRequest::ReloadHistory => acted(dispatch(hub, commands, Action::ReloadHistory).await),
+        ClientRequest::ReconnectSession => {
+            acted(dispatch(hub, commands, Action::ReconnectSession).await)
+        }
+        // Answered with the page under this id, like a download and for the
+        // same reason.
+        ClientRequest::LoadMessages(request) => {
+            let id = match addressed(id, "a page needs an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::LoadMessages {
+                    id,
+                    request,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        ClientRequest::LoadChats(request) => {
+            let id = match addressed(id, "a page needs an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::LoadChats {
+                    id,
+                    request,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        // Answered under this id like a page, and asked for at the same
+        // moment one is: opening a group is what needs the line under its
+        // name.
+        ClientRequest::GroupMembers(request) => {
+            let id = match addressed(id, "a group's members need an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::GroupMembers {
+                    id,
+                    request,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        ClientRequest::ForgetSession => acted(
+            dispatch(
+                hub,
+                commands,
+                Action::ForgetSession(crate::session_bridge::AccountDisposition::Reset),
+            )
+            .await,
+        ),
+        ClientRequest::MarkRead(request) => {
+            acted(dispatch(hub, commands, Action::MarkRead(request)).await)
+        }
+        ClientRequest::MarkAudioPlayed(request) => {
+            acted(dispatch(hub, commands, Action::MarkAudioPlayed(request)).await)
+        }
+        ClientRequest::MarkStatusWatched(request) => {
+            acted(dispatch(hub, commands, Action::MarkStatusWatched(request)).await)
+        }
+        // Measured here rather than by the client: the daemon is the only
+        // process that opens the store or writes the media cache, so a front
+        // end asking the filesystem would be guessing at paths it does not
+        // own. No session needed — this is two directory reads.
+        ClientRequest::StorageUsage => {
+            // Answered under an id like a download, because the numbers are
+            // the answer rather than an acknowledgement of it — though this
+            // one is measured here rather than by a task, so the frame goes
+            // back on the connection's own writer.
+            let id = match addressed(id, "a storage query needs an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            // Two directory walks, off the runtime for the same reason the
+            // clear is. Account-scoped: the media directory is shared by every
+            // local account, and billing this one for the whole walk reported
+            // every other account's photos as this account's storage.
+            let account_media = crate::media::AccountMedia::new(hub.account_id());
+            let measured = velo_session::unblock(move || {
+                let (media_bytes, media_files) = account_media.usage();
+                (database_bytes(), media_bytes, media_files)
+            })
+            .await;
+            let (database_bytes, media_bytes, media_files) = measured.unwrap_or((0, 0, 0));
+            Answer::frame(always(
+                Some(id),
+                serde_json::to_string(&DaemonMessage::Storage {
+                    id,
+                    database_bytes,
+                    media_bytes,
+                    media_files,
+                })
+                .map_err(anyhow::Error::from),
+            ))
+        }
+        // The store stays; every message keeps its `downloadable`, so what
+        // this costs is a re-download of whatever is looked at again.
+        ClientRequest::ClearMediaCache => {
+            // Off the runtime, for the reason the plugin approval is: this
+            // reads a directory of up to half a gigabyte and deletes it file
+            // by file, holding a lock that the session's own publish thread
+            // takes for every photo it caches. Done here it stopped event
+            // delivery for as long as a slow disk took. Awaited rather than
+            // spawned loose, so the acknowledgement still means the cache is
+            // clear.
+            // This account's cache only: the directory is shared, and a global
+            // clear would delete every other local account's downloads — and,
+            // before the account prefix existed, failed to match this
+            // account's own namespaced keys at all, so "clear" removed neither
+            // correctly nor its own. Cached downloads only: a staged upload
+            // belongs to a send that has not run yet. See `media::Wipe`.
+            let account_media = crate::media::AccountMedia::new(hub.account_id());
+            let cleared = velo_session::unblock(move || {
+                account_media
+                    .wipe(crate::media::Wipe::Cache)
+                    .map_err(|e| e.to_string())
+            })
+            .await;
+            acted(match cleared {
+                Ok(Ok(())) => {
+                    // The bytes are gone, so every cache key a descriptor
+                    // named is now a miss. Ask the session to forget what it
+                    // resolved and fetch the metadata again; the bytes are
+                    // refetched only for the pictures that still exist.
+                    if hub.connection().is_connected()
+                        && let Err(error) = dispatch(hub, commands, Action::RefreshAvatars).await
+                    {
+                        log::warn!(
+                            "media cache cleared but avatar refresh was not queued: {error}"
+                        );
+                    }
+                    Ok(())
+                }
+                Ok(Err(e)) => Err(ProtocolError::Malformed {
+                    detail: format!("could not clear the media cache: {e}"),
+                }),
+                Err(_) => Err(ProtocolError::Malformed {
+                    detail: "the media cache was not cleared".to_string(),
+                }),
+            })
+        }
+        // Applied here and now, and written down for the next start. Both,
+        // because they answer different questions: a person raising the
+        // level is asking about the session that is running, and the file is
+        // what keeps them from having to ask again after every restart.
+        //
+        // The write is off the runtime for the reason the plugin approval's
+        // is — it is a file created, flushed and renamed, which on a
+        // single-worker runtime stalls the session bridge and every other
+        // connection for as long as the disk takes. Awaited rather than
+        // spawned loose, so the acknowledgement means the choice is on disk.
+        ClientRequest::SetLogLevel { level } => {
+            velo_logging::apply(level);
+            log::info!("logging at {level}, asked for by a front end");
+            // `remember` writes the level in force rather than this
+            // request's, and serializes the writes: two front ends can ask in
+            // the same moment and each is written on a thread of its own, so
+            // a write carrying its own level could land after a later one and
+            // leave the next start at the earlier answer.
+            let recorded = velo_session::unblock(velo_logging::remember).await;
+            match recorded {
+                Ok(Ok(())) => acted(Ok(())),
+                // The level *did* change; only the memory of it failed. Said
+                // in the log rather than refused, because answering `Refused`
+                // to a request that was carried out is the worse lie of the
+                // two.
+                //
+                // At `error` rather than `warn`, which the plugin approval's
+                // failed record is written at for the same reason: this line
+                // is written *after* the level it reports on has taken
+                // effect, so somebody quieting the daemon to `error` would
+                // otherwise have the one thing worth telling them dropped by
+                // the level they just chose. At `off` it is dropped, and that
+                // is what `off` means.
+                Ok(Err(e)) => {
+                    log::error!("the log level was changed but not stored: {e}");
+                    acted(Ok(()))
+                }
+                Err(_) => {
+                    log::error!("the log level was changed but the store was not reached");
+                    acted(Ok(()))
+                }
+            }
+        }
+        // The daemon has no window of its own, so this is relayed rather than
+        // acted on: whoever owns a window is the only one that can raise it.
+        // Published to every client, including the one that asked, because a
+        // front end that sent this on a user's behalf wants the window up
+        // regardless of which process is holding it. Through the same door as
+        // the tray's Open, so that "there should be a window" means the same
+        // thing however it was asked — including when there is none to raise.
+        ClientRequest::ShowWindow => {
+            crate::window::show(hub);
+            acted(Ok(()))
+        }
+        // Not dispatched to the session: a plugin action touches the account
+        // only if the plugin decides it should, and what it decides is its
+        // own business. Handing it over is the whole of the daemon's part,
+        // which is why this answers `Accepted` rather than waiting — the
+        // plugin's own answer reaches it inside the sandbox, where a socket
+        // front end's never could.
+        ClientRequest::PluginAction { action } => {
+            plugins.act(&action);
+            acted(Ok(()))
+        }
+        // The one thing about a plugin that a plugin has no say in. Answered
+        // rather than dispatched, like the action above: what the plugin does
+        // with its new permissions is its own business and arrives as a
+        // republished surface.
+        ClientRequest::PluginApproval { plugin, approved } => {
+            // Where it is recorded is `plugins::approve`, which is a platform
+            // split: a desktop writes and renames a file and so must leave the
+            // runtime's thread, and a page writes `localStorage` and has no
+            // blocking pool to leave for — `spawn_blocking` here panicked
+            // outright in a browser, so approving a plugin there never worked.
+            // Awaited either way, so the acknowledgement still means the
+            // answer is recorded.
+            let recorded = crate::plugins::approve(plugins, plugin, approved).await;
+            if recorded {
+                acted(Ok(()))
+            } else {
+                acted(Err(ProtocolError::Refused {
+                    detail: "the approval could not be recorded".to_string(),
+                }))
+            }
+        }
+        // Taken, and answered now rather than when it finishes. Awaiting it
+        // here was wrong for one reason and it is not a small one: this is the
+        // connection's own loop, so a reload of a folder that takes seconds
+        // is seconds in which *that window* is served nothing — no state, no
+        // session events, no call video, which is eight frames deep and
+        // overflows almost at once. And nothing was waiting for the answer
+        // anyway: the set that comes back is state, and every window learns
+        // of it in the same frame, because a plugin's interface was always
+        // the daemon's rather than the asking window's.
+        ClientRequest::ReloadPlugins => {
+            crate::plugins::reload_in_background(plugins, hub.account_id());
+            acted(Ok(()))
+        }
+        // The module travels through the media cache, exactly as a file being
+        // sent does and for the same reason: a `.wasm` is megabytes and a
+        // request frame is capped at one. So the frame names a staged payload
+        // and this is where it is opened.
+        //
+        // Not dispatched to the session either — a plugin folder is the
+        // daemon's own, and installing one touches no account. And not awaited
+        // here: this is the connection's own loop, and the work is a
+        // thirty-two megabyte read, a directory listing, a write and two
+        // flushes — seconds of a slow disk in which *this* window would be
+        // served no state, no session events and no call video, which is eight
+        // frames deep and overflows almost at once. The same reason
+        // `ReloadPlugins` is detached, and the answer comes back the way a
+        // download's does: on the connection's outbox, under this id.
+        ClientRequest::InstallPlugin(request) => {
+            // Answered with the id it claimed, so the id is the answer and
+            // this needs an address like a download does.
+            let id = match addressed(id, "an install needs an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            let answer_to = outbox.clone();
+            velo_session::spawn(async move {
+                let frame = match install(&request).await {
+                    Ok(plugin) => always(
+                        Some(id),
+                        serde_json::to_string(&DaemonMessage::PluginInstalled { id, plugin })
+                            .map_err(anyhow::Error::from),
+                    ),
+                    Err(error) => always(Some(id), error_frame(Some(id), error)),
+                };
+                answer_later(&answer_to, frame);
+            });
+            Answer::frame(None)
+        }
+        // Acknowledged when the file is gone, not when the request was read:
+        // the front end asks for the folder again straight afterwards, and an
+        // acknowledgement that ran ahead of the removal would answer that with
+        // the plugin still in it. Off this loop for the reason the install is,
+        // which is why the acknowledgement can mean that at all.
+        //
+        // What is *running* does not change here. The next reload retires the
+        // generation whole, which is the rule an id being the key of an
+        // approval and a settings document imposes.
+        ClientRequest::RemovePlugin { plugin } => {
+            let answer_to = outbox.clone();
+            velo_session::spawn(async move {
+                let removed = crate::plugins::uninstall(&plugin)
+                    .await
+                    .map_err(|detail| ProtocolError::Refused { detail });
+                answer_later(&answer_to, answer(id, removed));
+            });
+            Answer::frame(None)
+        }
+        ClientRequest::ListInstalledPlugins => {
+            let id = match addressed(id, "a plugin listing needs an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            let answer_to = outbox.clone();
+            velo_session::spawn(async move {
+                let frame = match crate::plugins::names().await {
+                    Ok(plugins) => always(
+                        Some(id),
+                        serde_json::to_string(&DaemonMessage::InstalledPlugins { id, plugins })
+                            .map_err(anyhow::Error::from),
+                    ),
+                    // A folder that could not be read is not an empty folder,
+                    // and the client draws the difference: an empty list takes
+                    // away every Remove button, so this has to arrive as the
+                    // refusal it is.
+                    Err(detail) => always(
+                        Some(id),
+                        error_frame(Some(id), ProtocolError::Refused { detail }),
+                    ),
+                };
+                answer_later(&answer_to, frame);
+            });
+            Answer::frame(None)
+        }
+        // The acknowledgement goes out first; see the caller.
+        ClientRequest::ListAccounts
+        | ClientRequest::CreateAccount
+        | ClientRequest::RelinkAccount { .. }
+        | ClientRequest::ResetAccount { .. }
+        | ClientRequest::RemoveAccount { .. } => acted(Err(ProtocolError::Refused {
+            detail: "control requests require a control-scoped connection".to_string(),
+        })),
+        ClientRequest::Shutdown => Answer {
+            frame: answer(id, Ok(())),
+            shutdown: true,
+        },
+        ClientRequest::EnsureAvatars(request) => {
+            if !hub.connection().is_connected() {
+                for item in &request.items {
+                    answer_later(
+                        outbox,
+                        serde_json::to_string(&DaemonMessage::AvatarFailed {
+                            jid: item.jid.clone(),
+                            retryable: false,
+                        })
+                        .ok(),
+                    );
+                }
+            }
+            acted(dispatch(hub, commands, Action::EnsureAvatars(request.items)).await)
+        }
+    }
+}
+
+/// Put an answer that was worked out later on the connection's outbox.
+///
+/// A `try_send` first, and only a task when the outbox is full: this is
+/// exactly what the session's own out-of-band answers do, and for the same
+/// reason — the caller is not the connection, so it must not park on a client
+/// that is not reading.
+pub(super) fn answer_later(answer_to: &Outbox, frame: Option<String>) {
+    use tokio::sync::mpsc::error::TrySendError;
+
+    let Some(frame) = frame else {
+        return;
+    };
+    if let Err(TrySendError::Full(frame)) = answer_to.try_send(frame) {
+        let answer_to = answer_to.clone();
+        velo_session::spawn(async move {
+            let _ = answer_to.send(frame).await;
+        });
+    }
+}
+
+/// Open the payload a client staged and put it in the plugin folder.
+///
+/// The staged key and nothing else. A key is a name a client chose, and the
+/// cache holds this account's downloaded photos under keys derived from
+/// content it has already published: without this, a frame could name one of
+/// those and have the daemon move it into the folder it loads code from. `u-`
+/// is the one key space a front end writes, which is the same rule the web
+/// bridge's own write endpoint keeps.
+///
+/// Taken rather than read, and taken before anything can refuse the install:
+/// this is the only copy of the payload, nothing else is ever going to read
+/// it, and a refusal that left it staged would keep a module in the cache
+/// until the account was wiped.
+pub(super) async fn install(request: &velo_ipc::InstallPlugin) -> Result<String, ProtocolError> {
+    // Global staged payloads only. A plugin module is the daemon's and lives
+    // in the shared catalog, read by every account; a payload staged under an
+    // account's own send namespace (`a<id>-u-...`) is that account's data, and
+    // moving it into the catalog would let one account install a module for
+    // all of them from a key it staged to send.
+    if !velo_ipc::is_global_staged_key(&request.upload) {
+        return Err(ProtocolError::Refused {
+            detail: format!(
+                "{} does not name a global staged payload a plugin may be installed from",
+                request.upload
+            ),
+        });
+    }
+    let key = request.upload.clone();
+    // Off the runtime, for the reason the storage query is: on a desktop this
+    // reads a file of up to thirty-two megabytes off a disk, and a page has
+    // no pool to leave for and does not need one.
+    let staged = velo_session::unblock(move || crate::media::take(&key)).await;
+    let bytes = match staged {
+        Ok(Some(bytes)) => bytes,
+        // Nothing under that key: a client whose upload failed, or one naming
+        // a payload the cache has already swept.
+        Ok(None) => {
+            return Err(ProtocolError::Refused {
+                detail: format!("nothing is staged under {}", request.upload),
+            });
+        }
+        Err(_) => {
+            return Err(ProtocolError::Refused {
+                detail: "the staged module could not be read".to_string(),
+            });
+        }
+    };
+    crate::plugins::install(&request.file_name, bytes)
+        .await
+        .map_err(|detail| ProtocolError::Refused { detail })
+}
+
+/// Hand a command to the session and wait for what became of it.
+///
+/// Waiting, rather than answering on admission to the queue, is what makes
+/// `Accepted` mean something: the account can drop between the check here and
+/// the moment the bridge picks the command up, and a client told yes on
+/// admission would never learn its message went nowhere. It is also the
+/// backpressure — a connection has one command outstanding at a time, so the
+/// client cap is also the cap on queued work.
+pub(super) async fn dispatch(
+    hub: &StateHub,
+    commands: &Commands,
+    action: Action,
+) -> Result<(), ProtocolError> {
+    // Refused early as well as late: a client that is watching the connection
+    // state should get the answer it can already predict, without the round
+    // trip. Only for what actually needs the network — see
+    // [`Action::needs_network`].
+    let connection = hub.connection();
+    if action.needs_network() && !connection.is_connected() {
+        // A call the asking window already drew has to be un-drawn. It
+        // passed its own connection check before this one moved, the refusal
+        // rides no request id, and nothing on that side connects the error
+        // back to the stage it is holding — so the stage would sit there
+        // until the next snapshot dropped it, and disappearing is what a
+        // front end writes down as an attempt that was never answered. The
+        // bridge's busy refusal says the same thing one layer down.
+        if let Action::Call(CallAction::Start { placeholder_id, .. }) = &action {
+            hub.calls(|calls| calls.mark_unrecorded(placeholder_id));
+            hub.republish_calls();
+        }
+        return Err(no_session(format!("not connected: {connection:?}")));
+    }
+
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    if commands
+        .send(SessionCommand { action, reply })
+        .await
+        .is_err()
+    {
+        // The bridge is gone: the daemon is on its way down.
+        return Err(no_session("the session is shutting down"));
+    }
+
+    match answer.await {
+        Ok(CommandOutcome::Accepted) => Ok(()),
+        Ok(CommandOutcome::NoSession(detail)) => Err(no_session(detail)),
+        Ok(CommandOutcome::Refused(detail)) => Err(ProtocolError::Refused { detail }),
+        // Not a refusal on the wire either: `Refused` promises that its
+        // detail names what the client would have to change, and there is
+        // nothing to change — the answer is the same request, shortly.
+        Ok(CommandOutcome::Busy(detail)) => Err(ProtocolError::Failed {
+            detail,
+            retryable: true,
+        }),
+        // The bridge took the command and died before answering.
+        Err(_) => Err(no_session("the session stopped before it answered")),
+    }
+}
+
+/// The frame that answers a command, whichever way it went.
+///
+/// One place, because with an id on every answer there is nothing left to
+/// special-case: a refusal is an error naming its request, exactly like a
+/// refused download or a malformed frame.
+pub(super) fn answer(id: Option<RequestId>, result: Result<(), ProtocolError>) -> Option<String> {
+    match result {
+        Ok(()) => always(
+            id,
+            serde_json::to_string(&DaemonMessage::Accepted { id }).map_err(anyhow::Error::from),
+        ),
+        Err(error) => always(id, error_frame(id, error)),
+    }
+}
+
+/// The store's footprint: the database plus the journal files SQLite would
+/// replay into it. All three are the same data, so all three are counted.
+///
+/// # Zero on a page, deliberately
+///
+/// A browser's database is in a VFS rather than on a filesystem, so every
+/// `metadata` here fails and the sum is 0 — which Settings shows as `0 B`.
+/// Wrong, and it is the least bad of the three answers available. The size is
+/// `page_count * page_size`, which needs a query, and this handler is
+/// synchronous by the shape of the protocol; the VFS's own `export_db` would
+/// answer by copying the whole database into memory, which is precisely what
+/// everything else on this side goes out of its way not to do. Fixing it
+/// properly means an async usage query through `session/store/`, and that is
+/// a wider change than a number in a settings pane is worth today. Recorded
+/// in `docs/roadmap.md`.
+fn database_bytes() -> u64 {
+    let base = velo_session::resolve_database_path();
+    ["", "-wal", "-shm"]
+        .iter()
+        .filter_map(|suffix| std::fs::metadata(format!("{base}{suffix}")).ok())
+        .map(|meta| meta.len())
+        .sum()
+}
+
+fn no_session(detail: impl Into<String>) -> ProtocolError {
+    ProtocolError::NoSession {
+        detail: detail.into(),
+    }
+}
+
+fn wire_ok(id: u64, payload: velo_wire::response::DaemonResponse) -> Answer {
+    let env = velo_wire::envelope::ResponseEnvelope {
+        id: Some(id),
+        result: velo_wire::envelope::ResponseResult::Ok {
+            payload: Box::new(payload),
+        },
+    };
+    Answer::frame(serde_json::to_string(&env).ok())
+}
+
+fn wire_err(id: u64, error: velo_wire::error::ApiError) -> Answer {
+    let env = velo_wire::envelope::ResponseEnvelope {
+        id: Some(id),
+        result: velo_wire::envelope::ResponseResult::Error { error },
+    };
+    Answer::frame(serde_json::to_string(&env).ok())
+}
+
+async fn out_of_band_wire(
+    hub: &StateHub,
+    commands: &Commands,
+    outbox: &Outbox,
+    id: u64,
+    request: velo_wire::request::ClientRequest,
+) -> Answer {
+    let action = Action::Wire {
+        id,
+        request,
+        answer_to: outbox.clone(),
+    };
+    match dispatch(hub, commands, action).await {
+        Ok(()) => Answer::frame(None),
+        Err(err) => {
+            let api_err = match err {
+                ProtocolError::NoSession { detail } => {
+                    velo_wire::error::ApiError::not_connected(detail)
+                }
+                ProtocolError::Refused { detail } => {
+                    velo_wire::error::ApiError::permission_denied(detail)
+                }
+                other => velo_wire::error::ApiError::internal(other.to_string()),
+            };
+            wire_err(id, api_err)
+        }
+    }
+}
+
+pub(super) async fn handle_wire_request(
+    velo_wire::envelope::RequestEnvelope { id, request }: velo_wire::envelope::RequestEnvelope,
+    hub: &StateHub,
+    _plugins: &Arc<velo_plugin_host::Plugins>,
+    commands: &Commands,
+    outbox: &Outbox,
+) -> Answer {
+    use velo_wire::dto::{DoctorDto, StorageDto};
+    use velo_wire::request::ClientRequest as WireRequest;
+    use velo_wire::response::DaemonResponse as WireResponse;
+
+    match request {
+        WireRequest::Hello { .. } => wire_ok(id, WireResponse::Ack),
+        WireRequest::GetStatus => {
+            // One constructor for polls and events, so the two never
+            // disagree about what a state is called.
+            let snap = hub.snapshot();
+            let status = crate::session_bridge::connection_status_of(&snap.connection, hub);
+            wire_ok(id, WireResponse::Status(status))
+        }
+        WireRequest::DoctorCheck => {
+            let endpoint_path = velo_ipc::endpoint_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let db_bytes = database_bytes();
+            let (media_bytes, _) = crate::media::cache_usage();
+            let media_dir_str = velo_ipc::media_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let snap = hub.snapshot();
+            let doctor = DoctorDto {
+                daemon_running: true,
+                socket_path: endpoint_path,
+                connection_state: format!("{:?}", snap.connection),
+                database_ok: true,
+                database_bytes: db_bytes,
+                media_cache_dir: media_dir_str,
+                media_cache_bytes: media_bytes,
+            };
+            wire_ok(id, WireResponse::Doctor(doctor))
+        }
+        WireRequest::GetStorageUsage => {
+            // Account-scoped, like the legacy storage query: the media cache is
+            // one shared directory, so the whole walk would bill this account
+            // for every other local account's downloads. The database is the
+            // one shared store, which is what `database_bytes` reports.
+            let account_media = crate::media::AccountMedia::new(hub.account_id());
+            let (media_bytes, media_files) = account_media.usage();
+            let db_bytes = database_bytes();
+            let storage = StorageDto {
+                database_bytes: db_bytes,
+                media_bytes,
+                media_files,
+            };
+            wire_ok(id, WireResponse::Storage(storage))
+        }
+        WireRequest::ClearMediaCache => {
+            // The wipe's own answer is the client's answer. Discarding it and
+            // replying `Ack` unconditionally told a script the cache was clean
+            // when the filesystem had refused, which is exactly the failure
+            // the structured-error contract exists to surface.
+            //
+            // Account-scoped: a global wipe both deleted other accounts' cached
+            // downloads and failed to match this account's own namespaced keys.
+            let account_media = crate::media::AccountMedia::new(hub.account_id());
+            match velo_session::unblock(move || {
+                account_media
+                    .wipe(crate::media::Wipe::Cache)
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            {
+                Ok(Ok(())) => wire_ok(id, WireResponse::Ack),
+                Ok(Err(e)) => wire_err(id, velo_wire::error::ApiError::internal(e)),
+                Err(_) => wire_err(
+                    id,
+                    velo_wire::error::ApiError::internal("the cache wipe did not finish"),
+                ),
+            }
+        }
+        WireRequest::Shutdown => Answer {
+            frame: serde_json::to_string(&velo_wire::envelope::ResponseEnvelope {
+                id: Some(id),
+                result: velo_wire::envelope::ResponseResult::Ok {
+                    payload: Box::new(WireResponse::Ack),
+                },
+            })
+            .ok(),
+            shutdown: true,
+        },
+        WireRequest::ListMessages { .. }
+        | WireRequest::GetMessage { .. }
+        | WireRequest::GetMessageContext { .. }
+        | WireRequest::SearchMessages { .. }
+        | WireRequest::ListContacts { .. }
+        | WireRequest::GetContact { .. }
+        | WireRequest::RefreshContacts { .. }
+        | WireRequest::SetContactAlias { .. }
+        | WireRequest::TagContact { .. }
+        | WireRequest::UntagContact { .. }
+        | WireRequest::ListChats { .. }
+        | WireRequest::GetChat { .. }
+        | WireRequest::SendText { .. }
+        | WireRequest::SendMedia { .. }
+        | WireRequest::SendAudio { .. }
+        | WireRequest::SendReaction { .. }
+        | WireRequest::EditMessage { .. }
+        | WireRequest::RevokeMessage { .. }
+        | WireRequest::ForwardMessage { .. }
+        | WireRequest::SendPoll { .. }
+        | WireRequest::VotePoll { .. }
+        | WireRequest::ListPolls { .. }
+        | WireRequest::GetPoll { .. }
+        | WireRequest::SendLocation { .. }
+        | WireRequest::SendStatus { .. }
+        | WireRequest::SendSticker { .. }
+        | WireRequest::SendListResponse { .. }
+        | WireRequest::ListStarredMessages { .. }
+        | WireRequest::ListGroups
+        | WireRequest::GetGroupInfo { .. }
+        | WireRequest::CreateGroup { .. }
+        | WireRequest::SetGroupTopic { .. }
+        | WireRequest::SetGroupDescription { .. }
+        | WireRequest::ManageGroupParticipant { .. }
+        | WireRequest::GetGroupInviteLink { .. }
+        | WireRequest::JoinGroup { .. }
+        | WireRequest::LeaveGroup { .. }
+        | WireRequest::SetGroupPermissions { .. }
+        | WireRequest::ListGroupJoinRequests { .. }
+        | WireRequest::ManageGroupJoinRequest { .. }
+        | WireRequest::ListChannels
+        | WireRequest::GetChannelInfo { .. }
+        | WireRequest::JoinChannel { .. }
+        | WireRequest::LeaveChannel { .. }
+        | WireRequest::GetProfile { .. }
+        | WireRequest::GetBusinessProfile { .. }
+        | WireRequest::SetProfileAbout { .. }
+        | WireRequest::SetProfileName { .. }
+        | WireRequest::SetProfilePicture { .. }
+        | WireRequest::RemoveProfilePicture
+        | WireRequest::CheckContact { .. }
+        | WireRequest::DownloadMedia { .. }
+        | WireRequest::RetryMedia { .. }
+        | WireRequest::HistoryCoverage { .. }
+        | WireRequest::BackfillMedia { .. }
+        | WireRequest::CleanupChats
+        | WireRequest::PurgeMessages { .. }
+        | WireRequest::MarkRead { .. }
+        | WireRequest::MarkUnread { .. }
+        | WireRequest::PinChat { .. }
+        | WireRequest::MuteChat { .. }
+        | WireRequest::ArchiveChat { .. }
+        | WireRequest::SetPresence { .. }
+        | WireRequest::RequestPairCode { .. }
+        | WireRequest::ListCalls { .. } => {
+            out_of_band_wire(hub, commands, outbox, id, request).await
+        }
+        WireRequest::HistoryBackfill { .. } => {
+            // The reload republish lands where the backfill reads: the lane
+            // re-reads the store, and the backfill warms the page after it.
+            // Best effort — a refused reload still leaves a local backfill.
+            let _ = dispatch(hub, commands, Action::ReloadHistory).await;
+            out_of_band_wire(hub, commands, outbox, id, request).await
+        }
+        WireRequest::ForgetSession => {
+            // The bridge owns the forget flag, so this rides the legacy
+            // action rather than the wire out-of-band path. The wire's own
+            // `ForgetSession` is the self-service "clear data and pair again":
+            // it keeps the account id and expects a re-pair.
+            match dispatch(
+                hub,
+                commands,
+                Action::ForgetSession(crate::session_bridge::AccountDisposition::Reset),
+            )
+            .await
+            {
+                Ok(()) => wire_ok(id, WireResponse::Ack),
+                Err(ProtocolError::NoSession { detail }) => {
+                    wire_err(id, velo_wire::error::ApiError::not_connected(detail))
+                }
+                Err(ProtocolError::Refused { detail }) => {
+                    wire_err(id, velo_wire::error::ApiError::permission_denied(detail))
+                }
+                Err(other) => wire_err(id, velo_wire::error::ApiError::internal(other.to_string())),
+            }
+        }
+        WireRequest::ListAccounts => match velo_session::unblock(list_account_profiles).await {
+            Ok(accounts) => wire_ok(id, WireResponse::Accounts { accounts }),
+            Err(e) => wire_err(id, velo_wire::error::ApiError::internal(e.to_string())),
+        },
+    }
+}
+
+/// Every account socket the state directory holds, with a liveness probe.
+///
+/// Blocking by nature — directory scan plus connects — so it runs on the
+/// blocking pool, like the media reads it joins.
+fn list_account_profiles() -> Vec<velo_wire::dto::AccountDto> {
+    velo_ipc::account_sockets()
+        .into_iter()
+        .map(|(id, path)| {
+            let active = is_daemon_socket_live(&path);
+            velo_wire::dto::AccountDto {
+                id,
+                socket_path: path.to_string_lossy().into_owned(),
+                active,
+            }
+        })
+        .collect()
+}
+
+/// A connect probe: a live daemon accepts, a stale socket file refuses.
+fn is_daemon_socket_live(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}

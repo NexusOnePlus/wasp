@@ -1,0 +1,575 @@
+//! Full-text message search via SQLite FTS5 (feature `search`).
+//!
+//! External-content index over `messages.text_content`, kept in sync by
+//! triggers so the writer never has to think about it. Created lazily and
+//! idempotently at open instead of in a migration, so builds without the
+//! feature leave no FTS objects behind.
+//!
+//! The index maps by the stable `messages.id` (`content_rowid='id'`), so a
+//! `VACUUM` is safe: ids are persisted content and survive the rewrite with
+//! the mapping intact. The one case that still needs a rebuild is a migration
+//! that rewrites `messages` with `DROP TABLE` rather than altering it — that
+//! fires no trigger and takes the FTS triggers with the table, so the index
+//! is left describing rows no trigger maintains. Such a migration drops the
+//! FTS objects itself and `ensure_fts` rebuilds at the next open.
+
+use diesel::prelude::*;
+use wacore_binary::Jid;
+
+use crate::error::{ChatStoreError, Result, db_err};
+use crate::queries::MessageRow;
+use crate::schema;
+use crate::store::ChatStore;
+use crate::types::StoredMessage;
+
+pub(crate) fn ensure_fts(conn: &mut SqliteConnection) -> QueryResult<()> {
+    // One transaction for existence-check + DDL + backfill: a partially
+    // created index (table committed, rebuild lost) would pass the existence
+    // gate forever after, leaving pre-existing rows permanently unindexed.
+    conn.transaction(ensure_fts_inner)
+}
+
+fn ensure_fts_inner(conn: &mut SqliteConnection) -> QueryResult<()> {
+    #[derive(QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        n: i32,
+    }
+    // Both halves, because either can be missing on its own. A migration that
+    // rewrites `messages` the way this crate's own migrations do — `_new`,
+    // `INSERT SELECT`, `DROP`, `RENAME` — takes the triggers with it (a
+    // `DROP TABLE` fires none of them), so the table surviving is no evidence
+    // the index still describes it. (Ids survive the rewrite — the mapping
+    // stays valid — but with no triggers nothing maintains it.) Whoever
+    // writes such a migration owes the index a rebuild; this is what notices
+    // when they did not.
+    let indexed: i32 = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM sqlite_master \
+         WHERE (type = 'table' AND name = 'messages_fts') \
+            OR (type = 'trigger' AND name IN \
+                ('messages_fts_ai', 'messages_fts_ad', 'messages_fts_au'))",
+    )
+    .get_result::<CountRow>(conn)?
+    .n;
+    let already_exists = indexed == 4;
+
+    // Canonical FTS5 external-content recipe: EVERY content row gets exactly
+    // one index entry (NULL indexes as empty), and the update trigger pairs
+    // delete-then-insert in one body. Anything cuter (WHEN guards, split
+    // triggers) breaks the symmetry FTS5's shadow bookkeeping relies on and
+    // corrupts rank queries.
+    for statement in [
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+             text_content, content='messages', content_rowid='id')",
+        "CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+             INSERT INTO messages_fts(rowid, text_content) VALUES (new.id, new.text_content);
+             END",
+        "CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+             INSERT INTO messages_fts(messages_fts, rowid, text_content)
+             VALUES ('delete', old.id, old.text_content);
+             END",
+        "CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE OF text_content ON messages BEGIN
+             INSERT INTO messages_fts(messages_fts, rowid, text_content)
+             VALUES ('delete', old.id, old.text_content);
+             INSERT INTO messages_fts(rowid, text_content) VALUES (new.id, new.text_content);
+             END",
+    ] {
+        diesel::sql_query(statement).execute(conn)?;
+    }
+    // First enablement on a database that already has messages, or an index
+    // whose triggers went out from under it: either way the rows on disk are
+    // not the rows the index describes, and only a rebuild says so.
+    if !already_exists {
+        diesel::sql_query("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+            .execute(conn)?;
+    }
+    Ok(())
+}
+
+/// Turn free text into an FTS5 query: each whitespace token that carries a
+/// term becomes a quoted prefix term (`"tok"*`), AND-combined. Sidesteps FTS5
+/// operator syntax so user input can't produce a syntax error, and answers
+/// `None` when nothing in the input is a term at all.
+fn build_match_query(input: &str) -> Option<String> {
+    let mut query = String::with_capacity(input.len() + 8);
+    for token in input.split_whitespace() {
+        // A token the tokenizer throws away leaves a phrase with no terms in
+        // it, which FTS5 answers with a syntax error: the caller then sees a
+        // storage failure where the API promises an invalid query, and the
+        // search box reports a database problem on every such keystroke.
+        if !token.chars().any(char::is_alphanumeric) {
+            continue;
+        }
+        if !query.is_empty() {
+            query.push(' ');
+        }
+        query.push('"');
+        for ch in token.chars() {
+            if ch == '"' {
+                query.push('"');
+            }
+            query.push(ch);
+        }
+        query.push_str("\"*");
+    }
+    (!query.is_empty()).then_some(query)
+}
+
+/// Shortest token that still earns relevance ranking.
+///
+/// `ORDER BY rank` has to score every row a term matches before `LIMIT` can
+/// discard any, so its cost tracks the size of the match set rather than the
+/// page the caller asked for. A one- or two-character prefix matches a large
+/// fraction of a real store, which is how a single keystroke turned into a
+/// multi-second query. Below this length the search orders by arrival instead:
+/// FTS5 walks its index in id order and stops at `LIMIT`, and "the newest
+/// things that start with this" is a defensible answer for a term that short.
+const MIN_RANKED_TERM_LEN: usize = 3;
+
+/// Max ids per hydration statement, under SQLite's default 999
+/// host-parameter limit.
+const ID_PARAM_CHUNK: usize = 900;
+
+#[derive(QueryableByName)]
+struct FtsHit {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    id: i64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    rank: f64,
+}
+
+impl ChatStore {
+    /// Full-text search over message text/captions, best match first. The
+    /// query is plain words (prefix-matched); FTS5 operators are neutralized.
+    ///
+    /// A term shorter than three characters is ordered newest-first instead of
+    /// by relevance: ranking has to score every row such a prefix matches
+    /// before `limit` can discard any, which on a real store means most of it.
+    pub async fn search_messages(&self, query: &str, limit: i64) -> Result<Vec<StoredMessage>> {
+        self.search(query, None, false, limit).await
+    }
+
+    /// The same search restricted to one chat.
+    ///
+    /// Scoping happens inside the FTS join, so a chat that ranks sparsely still
+    /// yields its hits — over-fetching globally and filtering afterwards both
+    /// costs more and silently drops them.
+    ///
+    /// A 1:1 chat may be addressed by either of the peer's identities; both
+    /// find the thread.
+    pub async fn search_messages_in_chat(
+        &self,
+        chat: &Jid,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        self.search(query, Some(chat.to_string()), false, limit)
+            .await
+    }
+
+    /// The same search, keeping only rows carrying an attachment.
+    ///
+    /// `has_media` filters in the query rather than over the page: a caller
+    /// that asked for ten media hits wants ten, and filtering a page of ten
+    /// already-chosen rows would return however few of them happened to be
+    /// media — a limit applied in the wrong direction.
+    pub async fn search_media_messages(
+        &self,
+        query: &str,
+        chat: Option<Jid>,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        self.search(query, chat.map(|c| c.to_string()), true, limit)
+            .await
+    }
+
+    async fn search(
+        &self,
+        query: &str,
+        chat: Option<String>,
+        has_media: bool,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        let Some(match_query) = build_match_query(query) else {
+            return Err(ChatStoreError::InvalidSearchQuery);
+        };
+        let ranked = query
+            .split_whitespace()
+            .all(|token| token.chars().count() >= MIN_RANKED_TERM_LEN);
+        // A negative LIMIT means "unbounded" to SQLite; never let that happen.
+        let limit = limit.max(0);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let device_id = self.device_id();
+        let messages: Vec<StoredMessage> =
+            self.db()
+                .read(move |conn| {
+                    let keys = match &chat {
+                        Some(chat) => crate::lid::chat_key_candidates(conn, device_id, chat)
+                            .map_err(db_err)?,
+                        None => Vec::new(),
+                    };
+                    let hits = if keys.len() <= 2 {
+                        fts_hits(
+                            conn,
+                            device_id,
+                            &match_query,
+                            &keys,
+                            ranked,
+                            has_media,
+                            limit,
+                        )?
+                    } else {
+                        let mut hits = Vec::new();
+                        for key_chunk in keys.chunks(2) {
+                            hits.extend(fts_hits(
+                                conn,
+                                device_id,
+                                &match_query,
+                                key_chunk,
+                                ranked,
+                                has_media,
+                                limit,
+                            )?);
+                        }
+                        if ranked {
+                            hits.sort_by(|left, right| {
+                                left.rank
+                                    .total_cmp(&right.rank)
+                                    .then_with(|| right.id.cmp(&left.id))
+                            });
+                        } else {
+                            hits.sort_by_key(|hit| std::cmp::Reverse(hit.id));
+                        }
+                        hits.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+                        hits
+                    };
+                    if hits.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    // One statement per chunk of hits, instead of a point query
+                    // per hit (each of which used to re-resolve the chat's
+                    // identity keys first, so N hits cost ~2N serialized round
+                    // trips). `limit` is the caller's, so the id list is chunked
+                    // rather than trusted to stay under SQLite's host-parameter
+                    // ceiling.
+                    let ids: Vec<i64> = hits.iter().map(|hit| hit.id).collect();
+                    let mut rows: Vec<MessageRow> = Vec::with_capacity(ids.len());
+                    for chunk in ids.chunks(ID_PARAM_CHUNK) {
+                        rows.extend(
+                            schema::messages::dsl::messages
+                                .filter(schema::messages::dsl::id.eq_any(chunk))
+                                .load::<MessageRow>(conn)
+                                .map_err(db_err)?,
+                        );
+                    }
+                    // `eq_any` returns table order, and chunking splits it
+                    // further; restore the order the ranking (or the recency
+                    // scan) put them in.
+                    let rank_of: std::collections::HashMap<i64, usize> =
+                        ids.iter().enumerate().map(|(at, id)| (*id, at)).collect();
+                    rows.sort_by_key(|row| rank_of.get(&row.id).copied().unwrap_or(usize::MAX));
+                    crate::queries::finalize_messages(conn, device_id, rows)
+                })
+                .await?;
+        Ok(messages)
+    }
+}
+
+/// Matching message ids, best first. `keys` scopes the search to one chat's
+/// storage identities; empty searches every chat.
+///
+/// When `has_media` is set the content class is filtered *in the statement*,
+/// before `limit` is applied: filtering a page of already-chosen rows would
+/// return however few of them happened to be media, so a caller asking for
+/// ten media hits could get one.
+fn fts_hits(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    match_query: &str,
+    keys: &[String],
+    ranked: bool,
+    has_media: bool,
+    limit: i64,
+) -> wacore::store::error::Result<Vec<FtsHit>> {
+    use diesel::sql_types::{BigInt, Integer, Text};
+
+    let sql = fts_hit_sql(!keys.is_empty(), ranked, has_media);
+    let Some(first_key) = keys.first() else {
+        return diesel::sql_query(sql)
+            .bind::<Text, _>(match_query)
+            .bind::<Integer, _>(device_id)
+            .bind::<BigInt, _>(limit)
+            .load(conn)
+            .map_err(db_err);
+    };
+    // Each bounded key chunk has at most two storage identities. Padding the
+    // single-key case to two placeholders keeps one statically bound statement
+    // instead of a variadic one; `IN (x, x)` is `IN (x)`.
+    let second_key = keys.get(1).unwrap_or(first_key);
+    diesel::sql_query(sql)
+        .bind::<Text, _>(match_query)
+        .bind::<Integer, _>(device_id)
+        .bind::<Text, _>(first_key)
+        .bind::<Text, _>(second_key)
+        .bind::<BigInt, _>(limit)
+        .load(conn)
+        .map_err(db_err)
+}
+
+/// Keep the FTS cursor outside the content-table lookup even on SQLite versions
+/// that otherwise prefer scanning every message in an unanalyzed store.
+fn fts_hit_sql(scoped: bool, ranked: bool, has_media: bool) -> String {
+    // Constant fragments, never caller input. `rank` is qualified because it is
+    // only unambiguous today by accident — `messages` has no such column, and
+    // an unqualified reference would silently start resolving to it if one were
+    // ever added.
+    //
+    // The FTS side is still `rowid` (an external-content table's own rowid
+    // keeps that name; `content_rowid='id'` only says which content column it
+    // maps to), so the join crosses `m.id = f.rowid`.
+    let order = if ranked {
+        "f.rank, f.rowid DESC"
+    } else {
+        "f.rowid DESC"
+    };
+    // Built from the class's own label list, so the filter and `as_str` move
+    // together. Every label is a fixed identifier, so the literal is safe.
+    let media_filter = if has_media {
+        let labels: Vec<String> = crate::types::MessageKind::MEDIA_LABELS
+            .iter()
+            .map(|label| format!("'{label}'"))
+            .collect();
+        format!(" AND m.kind IN ({})", labels.join(", "))
+    } else {
+        String::new()
+    };
+    let scope = if scoped {
+        " AND m.chat_jid IN (?, ?)"
+    } else {
+        ""
+    };
+    // SQLite never reorders CROSS JOIN operands. ON still filters the same
+    // inner-join pairs, so each FTS hit looks up its content row by primary key.
+    format!(
+        "SELECT f.rowid AS id, f.rank AS rank
+         FROM messages_fts f CROSS JOIN messages m ON m.id = f.rowid
+         WHERE messages_fts MATCH ? AND m.device_id = ?{scope}{media_filter}
+         ORDER BY {order} LIMIT ?"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
+
+    #[test]
+    fn match_query_neutralizes_operators_and_quotes() {
+        assert_eq!(build_match_query("hello"), Some("\"hello\"*".into()));
+        assert_eq!(
+            build_match_query("hello world"),
+            Some("\"hello\"* \"world\"*".into())
+        );
+        assert_eq!(build_match_query("a\"b"), Some("\"a\"\"b\"*".into()));
+        assert_eq!(
+            build_match_query("NOT OR AND"),
+            Some("\"NOT\"* \"OR\"* \"AND\"*".into())
+        );
+        assert_eq!(build_match_query("   "), None);
+        // Nothing the tokenizer keeps: a phrase with no terms in it is a
+        // syntax error rather than a search.
+        assert_eq!(build_match_query("-"), None);
+        assert_eq!(build_match_query("... ;"), None);
+        assert_eq!(build_match_query("- ok"), Some("\"ok\"*".into()));
+    }
+
+    const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+
+    #[derive(QueryableByName)]
+    struct Hits {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        n: i32,
+    }
+
+    fn hits(conn: &mut SqliteConnection, term: &str) -> i32 {
+        diesel::sql_query(format!(
+            "SELECT COUNT(*) AS n FROM messages_fts WHERE messages_fts MATCH '{term}'"
+        ))
+        .get_result::<Hits>(conn)
+        .expect("match")
+        .n
+    }
+
+    fn migrated_connection() -> SqliteConnection {
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        // This connection's SQLite is built with foreign keys enabled by
+        // default (see the account/device cascade migration), so the account
+        // rows this migration set now writes need a parent `device` row to
+        // reference. The real parent table belongs to `whatsapp-rust`'s own
+        // migrations; this test only exercises chat-store's own set, so a
+        // minimal stand-in with the one row the fixture below uses is enough.
+        diesel::sql_query("CREATE TABLE device (id INTEGER PRIMARY KEY)")
+            .execute(&mut conn)
+            .expect("seed a device parent for the account cascade migration");
+        diesel::sql_query("INSERT INTO device (id) VALUES (1)")
+            .execute(&mut conn)
+            .expect("seed the device row the fixture below references");
+        diesel::sql_query("CREATE TABLE lid_pn_mapping (device_id INTEGER NOT NULL)")
+            .execute(&mut conn)
+            .expect("mapping parent for the repair-generation triggers");
+        conn.run_pending_migrations(MIGRATIONS).expect("migrate");
+        conn
+    }
+
+    #[derive(QueryableByName, Debug)]
+    struct PlanStep {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        detail: String,
+    }
+
+    /// Search must scan FTS before looking up content rows, while preserving
+    /// ranked and recency pages across account, chat and attachment filters.
+    #[test]
+    fn search_drives_from_fts_and_preserves_filtered_pages() {
+        use diesel::sql_types::{BigInt, Integer, Text};
+
+        let mut conn = migrated_connection();
+        ensure_fts(&mut conn).expect("create index");
+        diesel::sql_query("INSERT INTO device (id) VALUES (2)")
+            .execute(&mut conn)
+            .expect("second account");
+        // Deliberately no ANALYZE or optimize. Interleave accounts, chats,
+        // content classes and relevance, with many hits outside each scope.
+        diesel::sql_query(
+            "WITH RECURSIVE rows(n) AS (
+                 SELECT 1 UNION ALL SELECT n + 1 FROM rows WHERE n < 1200
+             ) INSERT INTO messages
+                 (device_id, chat_jid, msg_id, sender_jid, timestamp_ms, kind, text_content)
+             SELECT 1 + n % 2, CASE WHEN n % 3 = 0 THEN 'a' ELSE 'b' END,
+                    printf('fixture-%d', n), 'sender', n,
+                    CASE WHEN n % 5 = 0 THEN 'image' ELSE 'text' END,
+                    CASE WHEN n % 7 = 0 THEN 'synthetic synthetic' ELSE 'synthetic filler' END
+             FROM rows",
+        )
+        .execute(&mut conn)
+        .expect("seed messages");
+        for keys in [
+            vec![],
+            vec!["a".to_owned()],
+            vec!["a".to_owned(), "b".to_owned()],
+        ] {
+            for ranked in [false, true] {
+                for has_media in [false, true] {
+                    let term = if ranked { "\"synthetic\"*" } else { "\"s\"*" };
+                    let sql = fts_hit_sql(!keys.is_empty(), ranked, has_media);
+                    let mut plan = diesel::sql_query(format!("EXPLAIN QUERY PLAN {sql}"))
+                        .into_boxed::<diesel::sqlite::Sqlite>()
+                        .bind::<Text, _>(term)
+                        .bind::<Integer, _>(1);
+                    if let Some(first) = keys.first() {
+                        plan = plan
+                            .bind::<Text, _>(first)
+                            .bind::<Text, _>(keys.get(1).unwrap_or(first));
+                    }
+                    let plan = plan
+                        .bind::<BigInt, _>(20)
+                        .load::<PlanStep>(&mut conn)
+                        .expect("explain production search");
+                    // Assert loop order and point lookup, not the full unstable
+                    // EXPLAIN text or virtual-index numbers.
+                    assert!(
+                        plan[0].detail.starts_with("SCAN f VIRTUAL TABLE"),
+                        "{plan:?}"
+                    );
+                    assert!(
+                        plan[1]
+                            .detail
+                            .starts_with("SEARCH m USING INTEGER PRIMARY KEY"),
+                        "{plan:?}"
+                    );
+                    let scope = if keys.is_empty() {
+                        ""
+                    } else {
+                        " AND chat_jid IN (?, ?)"
+                    };
+                    let media = if has_media { " AND kind = 'image'" } else { "" };
+                    let order = if ranked {
+                        "rank, rowid DESC"
+                    } else {
+                        "rowid DESC"
+                    };
+                    // Independent FTS-only reference. Filter eligible ids before
+                    // LIMIT; FTS still ranks against the same complete corpus.
+                    let mut reference = diesel::sql_query(format!(
+                        "SELECT rowid AS id, rank FROM messages_fts
+                         WHERE messages_fts MATCH ? AND rowid IN
+                             (SELECT id FROM messages WHERE device_id = ?{scope}{media})
+                         ORDER BY {order} LIMIT ?"
+                    ))
+                    .into_boxed::<diesel::sqlite::Sqlite>()
+                    .bind::<Text, _>(term)
+                    .bind::<Integer, _>(1);
+                    if let Some(first) = keys.first() {
+                        reference = reference
+                            .bind::<Text, _>(first)
+                            .bind::<Text, _>(keys.get(1).unwrap_or(first));
+                    }
+                    let expected = reference
+                        .bind::<BigInt, _>(20)
+                        .load::<FtsHit>(&mut conn)
+                        .expect("reference page");
+                    let actual = fts_hits(&mut conn, 1, term, &keys, ranked, has_media, 20)
+                        .expect("production page");
+                    assert_eq!(actual.len(), 20);
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .map(|hit| (hit.id, hit.rank))
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(|hit| (hit.id, hit.rank))
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A migration that rewrites `messages` — the `_new`/`INSERT SELECT`/
+    /// `DROP`/`RENAME` shape this crate's own migrations use — takes the
+    /// triggers with it (the stable ids survive, but nothing maintains the
+    /// index). The table surviving used to be the whole test, so the next
+    /// open skipped the rebuild and the index went on describing rows that
+    /// were no longer there.
+    #[test]
+    fn an_index_whose_triggers_went_out_from_under_it_is_rebuilt() {
+        let mut conn = migrated_connection();
+        ensure_fts(&mut conn).expect("create the index");
+
+        for statement in [
+            "INSERT INTO messages (device_id, chat_jid, msg_id, sender_jid, from_me, \
+             timestamp_ms, kind, text_content, status, starred, revoked) \
+             VALUES (1, 'c', 'm1', 's', 0, 1, 'text', 'reunião', 0, 0, 0)",
+            // What such a migration leaves behind.
+            "DROP TRIGGER messages_fts_ai",
+            "DROP TRIGGER messages_fts_ad",
+            "DROP TRIGGER messages_fts_au",
+            "INSERT INTO messages_fts(messages_fts) VALUES('delete-all')",
+        ] {
+            diesel::sql_query(statement)
+                .execute(&mut conn)
+                .expect("statement");
+        }
+        assert_eq!(hits(&mut conn, "reunião"), 0, "the index is empty now");
+
+        ensure_fts(&mut conn).expect("reopen");
+        assert_eq!(
+            hits(&mut conn, "reunião"),
+            1,
+            "the rows on disk are what the index has to describe"
+        );
+    }
+}

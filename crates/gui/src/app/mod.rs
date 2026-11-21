@@ -1,0 +1,6504 @@
+//! Main WhatsApp application state and logic
+//!
+//! This module is being refactored into submodules for better organization:
+//! - `chats`: Chat list management, selection, search, keyboard navigation
+//! - `media`: Media handling (PTT recording state)
+//! - `messages`: Message list caching and height calculation
+//! - `calls`: Call state management (incoming/outgoing)
+
+mod attaching;
+mod body;
+mod call_devices;
+mod calls;
+mod calls_ctl;
+pub(crate) mod chat_actions;
+pub mod chat_row;
+mod chats;
+mod commands;
+pub(crate) mod editing;
+mod events;
+pub(crate) mod forward;
+pub use editing::EditMessage;
+#[cfg(test)]
+mod frame_cost;
+pub(crate) mod global_search;
+mod media;
+mod media_ctl;
+mod media_materialization;
+mod message_actions;
+mod messages;
+pub mod notices;
+mod paging;
+mod plugins_ctl;
+mod recording;
+mod recovery;
+mod search;
+pub(crate) mod settings;
+mod status;
+mod timeline_ctl;
+mod viewer;
+
+pub use calls::CallCard;
+#[cfg(all(test, unix))]
+pub(crate) use calls_ctl::exercise_call_frame_adoption;
+pub use chat_row::{ChatRow, Preview, PreviewGlyph, Unread};
+pub use chats::{
+    ChatFilter, ChatListCache, Survival, survives_archived_scan, survives_complete_load,
+};
+pub use media::RecordingState;
+pub(crate) use message_actions::can_delete_sent;
+pub use messages::{BubbleIds, MessageListCache, TimelineItem};
+pub use paging::nearing_end;
+
+/// What the conversation list was last told about.
+/// What the audio sink is holding, and where it came from.
+///
+/// A voice note keeps its encoded bytes: re-timing for a speed change, and
+/// replaying after the clip has run out, both prepare the samples again from
+/// the source rather than asking for the download twice. A video's
+/// soundtrack has no source to keep — it is fed from the decoder — which is
+/// exactly why the two cannot be one `Option<String>` with a loose
+/// `Option<bytes>` beside it.
+#[derive(Default)]
+enum AudioHolder {
+    #[default]
+    None,
+    Note {
+        message_id: String,
+        source: Arc<Vec<u8>>,
+    },
+    VideoTrack {
+        message_id: String,
+    },
+}
+
+impl AudioHolder {
+    /// Whose sound this is, whatever kind it is.
+    fn message_id(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Note { message_id, .. } | Self::VideoTrack { message_id } => Some(message_id),
+        }
+    }
+
+    /// The bytes to prepare again, if this is `message_id`'s voice note.
+    ///
+    /// `None` for a video's track on purpose: there is nothing to re-time,
+    /// and asking would be asking to play a soundtrack as a voice note.
+    fn note_source(&self, message_id: &str) -> Option<Arc<Vec<u8>>> {
+        match self {
+            Self::Note {
+                message_id: id,
+                source,
+            } if id == message_id => Some(Arc::clone(source)),
+            _ => None,
+        }
+    }
+}
+
+/// What a recording in progress will be sent as.
+///
+/// Bound when the microphone opens, not read when it closes: the user can
+/// switch chats or pick a different message to answer while it runs, and both
+/// would otherwise be resolved against whatever the window looks like at the
+/// end. One value rather than two fields, because the destination and the
+/// reply are one answer to "where is this note going" and drifting apart is
+/// exactly how a note reaches chat A quoting chat B.
+struct RecordingTarget {
+    jid: String,
+    reply: Option<ReplyDraft>,
+}
+
+/// Which surface the keyboard belongs to.
+///
+/// A transient surface that takes focus has to give it back, and to exactly
+/// one place: a blurred handle leaves the window with no keyboard target at
+/// all, which reads as a window that has stopped listening. Naming the owner
+/// is what makes "give it back" a single rule rather than something every
+/// teardown path has to remember.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum KeyboardOwner {
+    /// Where typing goes, when there is somewhere to type.
+    Composer,
+    /// The conversation list, which owns the arrow keys that move between
+    /// chats. The resting owner of a window with no conversation open.
+    ChatList,
+    /// The window itself: the one surface that is always on screen, and so
+    /// the only honest answer when nothing more specific is drawn. Its
+    /// actions are the window-level ones — search, settings, escape — which
+    /// were unreachable for exactly as long as nobody had focus at all,
+    /// because a focus handle that is not in the frame sends dispatch to
+    /// gpui's own root and never reaches ours. On a machine with a pointer
+    /// the first click hid it; on one without, the window never listened.
+    Root,
+    /// A call that is ringing — not one that has been answered, which is a
+    /// call people type through.
+    RingingCall(String),
+    /// A sent message's replacement text, in its own modal field.
+    MessageEdit,
+    /// An addressed sent-message deletion awaiting final confirmation.
+    MessageDelete,
+    /// Files pasted or dropped into the composer, waiting for explicit
+    /// confirmation before anything is uploaded.
+    PastePreview,
+    /// The fullscreen viewer, which owns the arrow keys while it is up.
+    Viewer,
+    /// A screen with its own controls — Settings. It is handed the window's
+    /// own handle rather than any control of its own: the way *out* of
+    /// Settings is Escape, which is a window-level action, and the first
+    /// control the user clicks takes the keyboard from there without a fight,
+    /// because the sync only acts when the owner changes. Naming it
+    /// separately is what makes *leaving* Settings a change — otherwise the
+    /// owner still read `Composer` throughout, the next sync saw nothing to
+    /// do, and the window was left with its keyboard on a control that had
+    /// stopped being rendered.
+    Screen,
+}
+
+/// Which keyboard surfaces a frame drew.
+///
+/// Answered by the view that draws them and read by `sync_overlay_focus`,
+/// which may only hand the keyboard to something in the frame.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyboardSurfaces {
+    /// The conversation list.
+    pub chat_list: bool,
+    /// The composer — which the offline strip replaces, and which a phone
+    /// showing its list is not drawing at all.
+    pub composer: bool,
+    /// The fullscreen viewer. Held open across a dropped connection —
+    /// `leave_connected_view` does not close it — while the error screen that
+    /// replaces the conversation draws nothing of it.
+    pub viewer: bool,
+    /// The modal preview for files waiting to be sent.
+    pub paste_preview: bool,
+    pub message_edit: bool,
+    pub message_delete: bool,
+    /// The call card, which only the connected screens float.
+    pub call_card: bool,
+}
+
+/// Files waiting in the send-confirmation modal: pasted from the clipboard
+/// or dropped onto the conversation, previewed with an optional caption
+/// before anything is uploaded.
+struct PendingPastePreview {
+    jid: String,
+    reply: Option<ReplyDraft>,
+    files: Vec<crate::components::PreviewFile>,
+    /// The caption box. `None` where no window was available to build one
+    /// in — the modal still confirms, it just sends without a caption.
+    caption: Option<Entity<gpui_component::input::InputState>>,
+    /// The file list's scroll position, so a batch taller than the modal
+    /// scrolls instead of painting into the caption and the controls.
+    list_scroll: gpui::ScrollHandle,
+    /// Whether the captured destination was the conversation on screen before
+    /// this modal deliberately hid it from read/paging accounting.
+    chat_was_visible: bool,
+}
+
+/// The layout a set of row heights was measured against.
+///
+/// The list keeps one measured height per index and nothing about a row says
+/// how wide or how large it was drawn — so a window that resizes leaves every
+/// one of those heights describing a bubble that no longer exists at that
+/// size. Both halves move on their own: the fit changes the rem at a step
+/// boundary without the pane changing width, and dragging an edge changes the
+/// width without crossing a step.
+#[derive(Clone, Copy, PartialEq)]
+struct MeasuredAgainst {
+    /// Translated labels can wrap differently at the same width and font size.
+    language: crate::i18n::Language,
+    /// The base font in force, which every dimension in a bubble resolves
+    /// from.
+    rem: f32,
+    /// How wide the timeline had to lay text out in, which is what decides
+    /// how many lines a message takes.
+    width: f32,
+}
+
+struct TimelineAnchor {
+    jid: String,
+    /// The layout the rows were measured against.
+    measured: MeasuredAgainst,
+    /// The rows themselves, as the list measured them.
+    ///
+    /// Kept rather than described: what the list holds is a height per row,
+    /// so the only honest question is which of *these* rows the next frame
+    /// still draws, and where. Cheap to keep — the rows and the messages
+    /// behind them are both `Arc`s — and cheap to ask, because the `build`
+    /// number says when they cannot have changed at all.
+    rows: MessageListCache,
+}
+
+/// What one frame's rows mean for the measurements the list is keeping.
+///
+/// The decision `sync_timeline` makes, apart from the list it makes it about,
+/// so it can be reasoned about — and tested — without a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimelineSync {
+    /// One stretch of rows replaced by another, and every measurement outside
+    /// it still describes the row it measured.
+    ///
+    /// Every ordinary change is this: an arrival replaces nothing at the end,
+    /// a page of older history replaces nothing *after the encryption notice*
+    /// — which is why the front is not index 0 — and a revoke or a run break
+    /// replaces a row with itself. One frame can carry several of those; the
+    /// answer is the stretch that covers them all.
+    Spliced {
+        at: usize,
+        removed: usize,
+        added: usize,
+    },
+    /// The same rows, against a layout that has moved under them.
+    Remeasure,
+    /// A different conversation. Nothing measured describes anything drawn.
+    Reset,
+    /// Nothing changed that the list has to hear about.
+    Nothing,
+}
+
+/// What to do with the measurements the list is keeping.
+///
+/// `previous` is the anchor from the last frame and `rows` the ones this
+/// frame will draw. The two questions are whether the rows the list measured
+/// are still those rows, and if not, whether what changed is something a
+/// splice can express.
+fn timeline_sync(
+    previous: Option<&TimelineAnchor>,
+    jid: &str,
+    rows: &MessageListCache,
+    measured: MeasuredAgainst,
+) -> TimelineSync {
+    let Some(anchor) = previous.filter(|anchor| anchor.jid == jid) else {
+        return TimelineSync::Reset;
+    };
+    let moved = anchor.measured != measured;
+
+    // The rows were never rebuilt, so they are the same rows: only the layout
+    // can have moved under them. This is the common frame, and it is what
+    // keeps the diff below off the hot path.
+    if anchor.rows.build == rows.build {
+        return if moved {
+            TimelineSync::Remeasure
+        } else {
+            TimelineSync::Nothing
+        };
+    }
+
+    // What the two have in common at either end, and therefore what changed
+    // between them. Asked of the rows rather than of their number, because a
+    // count cannot tell an arrival from a page from a removal — and because
+    // neither end is where a naive answer would put it: the encryption notice
+    // holds index 0 whatever arrives in front of the messages, and the typing
+    // indicator holds the last index whatever arrives behind them.
+    let at = anchor.rows.common_prefix(rows);
+    let kept = anchor.rows.common_suffix(rows, at);
+    let removed = anchor.rows.items.len() - at - kept;
+    let added = rows.items.len() - at - kept;
+
+    if removed + added > 0 {
+        return TimelineSync::Spliced { at, removed, added };
+    }
+    // The same rows, rebuilt: an image arrived, a reaction landed, a message
+    // was revoked or a send grew a retry button. Nothing moved and every
+    // height is suspect, which is what a rebuild means — `Nothing` here left
+    // the list drawing a bubble at the size it used to be.
+    TimelineSync::Remeasure
+}
+pub use notices::what_went_wrong;
+pub use search::ConversationSearch;
+pub use settings::{SettingsSection, SettingsState};
+pub use status::{Destination, StatusPane};
+pub use viewer::MediaViewer;
+
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+
+use indexmap::IndexMap;
+
+use gpui::{
+    App, Context, Entity, FocusHandle, Focusable, Image, KeyBinding, ListState, ScrollStrategy,
+    SystemNotification, Task, WeakEntity, Window, actions, div, prelude::*,
+};
+use gpui_component::VirtualListScrollHandle;
+use gpui_component::input::InputState;
+
+// Define our own actions since gpui-component's actions module is private
+actions!(chat_list, [SelectUp, SelectDown, ToggleSelectedCommunity]);
+actions!(
+    velo,
+    [
+        /// Move focus to the conversation search field.
+        FocusSearch,
+        /// Open the next conversation in the list, wherever focus is.
+        NextChat,
+        /// Open the previous conversation in the list, wherever focus is.
+        PreviousChat,
+        /// Open the next conversation with unread messages.
+        NextUnreadChat,
+        /// Show or hide Contact info / Group info for the open chat.
+        ToggleContactInfo,
+        /// Show or hide the open chat's shared files.
+        ToggleSharedFiles,
+        /// Open or close the search for messages in the open conversation.
+        ToggleConversationSearch,
+        /// Move one page through the open conversation.
+        PageChatHistoryUp,
+        /// Move one page through the open conversation.
+        PageChatHistoryDown,
+        /// Open the Settings screen.
+        OpenSettings,
+        /// Dismiss the topmost overlay: Settings, the media viewer, a reply.
+        CloseOverlay,
+        /// Mute or unmute the microphone of the live call.
+        ToggleMute,
+        /// Bring a minimised call card back to full size.
+        ReturnToCall,
+        /// The previous picture in the fullscreen viewer.
+        ViewerPrev,
+        /// The next picture in the fullscreen viewer.
+        ViewerNext,
+    ]
+);
+
+/// Reply to one message, named by its id.
+///
+/// Carries its subject rather than acting on "the selected message": a
+/// timeline has no selection, and a context menu is opened on a specific
+/// bubble. `no_json` because these are never bound in a keymap file — there is
+/// no message id to write into one.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct ReplyToMessage {
+    pub id: gpui::SharedString,
+}
+
+/// Put one message's text on the clipboard.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct CopyMessage {
+    pub text: gpui::SharedString,
+}
+
+/// Open one of a message's links.
+///
+/// Carries its subject like [`CopyMessage`]: a timeline has no selection,
+/// and the menu listing the links is opened on a specific bubble.
+/// `no_json` for the same reason — there is no URL to write into a keymap.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct OpenMessageLink {
+    pub url: gpui::SharedString,
+}
+
+/// Send a message that failed again.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct RetryMessage {
+    pub id: gpui::SharedString,
+}
+
+/// React to one message with one emoji, or un-react when it names the
+/// reaction already drawn as ours.
+///
+/// Carries its subject like [`ReplyToMessage`]: a timeline has no selection,
+/// and both the quick-react strip and the context menu are opened on a
+/// specific bubble. `no_json` for the same reason — there is no emoji to
+/// write into a keymap.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct ReactToMessage {
+    pub id: gpui::SharedString,
+    pub emoji: gpui::SharedString,
+}
+
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct DeleteSentMessage {
+    pub jid: gpui::SharedString,
+    pub id: gpui::SharedString,
+    pub for_everyone: bool,
+}
+
+use crate::components::{
+    AccountSummary, InputAreaEvent, InputAreaView, PastePreviewProps, ReplyDraft,
+    new_timeline_state, render_paste_preview,
+};
+use crate::retained_image::RetainedImage;
+use log::{debug, error, info, warn};
+use wacore_binary::jid::{Jid, JidExt, observe_str};
+
+use crate::responsive::{MobilePanel, ResponsiveLayout};
+use crate::session::{Failure, FromDaemon, Session};
+use crate::theme::ActiveProductTheme as _;
+use crate::utils::{contains_ignore_case, mime_to_image_format};
+use crate::video::{VideoPlayer, VideoPlayerState};
+use crate::views::pairing::generate_qr_png;
+use crate::views::{
+    render_call_overlay, render_connected_view, render_connecting_view, render_error_view,
+    render_loading_view, render_logged_out_view, render_pairing_view, render_refused_view,
+    render_settings_view, render_syncing_view,
+};
+use velo_audio::{AudioPlayer, AudioRecorder, encode_to_opus_ogg};
+use velo_core::{
+    AppState, Availability, CachedQrCode, CallOutcome, CallRecord, CallState, Chat, ChatMessage,
+    ComposingKind, DownloadableMedia, Ending, Issued, MediaContent, MessageStatus, OutgoingCall,
+    PresenceRegistry, QuotedMessage, ReceiptType, Resend, Stage, SystemNotice, TypingSummary,
+    UiEvent,
+};
+
+// ChatListCache is now in chats.rs and re-exported above
+// RecordingState is now in media/mod.rs and re-exported above
+// MessageListCache is now in messages.rs and re-exported above
+
+/// Key context for chat list keyboard navigation
+const CHAT_LIST_CONTEXT: &str = "ChatList";
+
+/// Key context for the call card. Scoped rather than global so Enter/Escape
+/// keep their meaning in the composer while no call is up.
+pub const CALL_CONTEXT: &str = "Call";
+
+/// Key context for the fullscreen viewer, so the arrow keys walk pictures
+/// there and still move the caret in the composer everywhere else.
+pub const VIEWER_CONTEXT: &str = "MediaViewer";
+
+/// Maximum number of video players to keep cached (each holds decoded frames)
+const MAX_VIDEO_PLAYERS: usize = 10;
+
+/// How many bytes of decoded images to keep cached.
+///
+/// Bytes *and* [`MAX_DECODED_IMAGES`], because neither bounds this on its own.
+/// Fifty is a number about a list, and fifty pictures off a phone are two
+/// hundred megabytes of encoded bytes before `gpui` has decoded any of them —
+/// in a linear memory with a one-gigabyte ceiling that never shrinks.
+///
+/// [`velo_core::DECODED_IMAGE_BUDGET_BYTES`] is where the share comes
+/// from, because the page's budgets are ceilings on one heap.
+const DECODED_IMAGE_BUDGET: usize = velo_core::DECODED_IMAGE_BUDGET_BYTES as usize;
+
+/// The fewest decoded images the byte budget may leave in the cache.
+///
+/// A floor under [`DECODED_IMAGE_BUDGET`], and the thing that keeps a byte
+/// budget from being worse than the entry count it joined. Eviction is
+/// least-recently-used, so a *working set* larger than the budget does not
+/// degrade — it thrashes: every row on screen misses, evicts the row drawn
+/// before it, and pays `Image::from_bytes` to copy its encoded bytes again,
+/// on every frame. The entry ceiling could only reach that at fifty visible
+/// pictures; twelve megabytes is four of them if they are large.
+///
+/// So the bytes give way. A viewport that will not fit is kept anyway and the
+/// budget is exceeded, because the alternative spends the same memory
+/// transiently *and* the decode, sixty times a second, forever. Above the
+/// floor the budget binds normally, which is where the long tail is.
+///
+/// Sized as a viewport rather than a guess: a conversation draws on the order
+/// of twenty rows, and images are a minority of them even in an album.
+const MIN_DECODED_IMAGES: usize = 16;
+
+/// The floor is a floor, not a second cap: it has to leave room under the
+/// entry ceiling for the byte budget to bind on anything at all. Asserted at
+/// compile time rather than in a test, because it is a property of the two
+/// literals and a test of it can only ever restate them.
+const _: () = assert!(MIN_DECODED_IMAGES < MAX_DECODED_IMAGES);
+
+/// How many decoded images to keep cached, whatever they weigh.
+///
+/// The second half of [`DECODED_IMAGE_BUDGET`], and not redundant with it:
+/// what this cache measures is the *encoded* payload, and what it keeps alive
+/// is the decoded one. `RetainedImage` owns GPUI's asset and its atlas lifetime,
+/// and nothing here can see how large the decoded image is
+/// without decoding the picture to find out. A sticker, a screenshot or a
+/// flat-colour PNG is a few kilobytes encoded and megabytes of RGBA, so a byte
+/// budget alone admits hundreds of them — which is the bound the count was
+/// quietly providing before it was removed.
+const MAX_DECODED_IMAGES: usize = 50;
+
+/// How many conversations keep their built timeline.
+///
+/// Each entry holds the rows *and* a second full copy of the history they
+/// index into, so this map grew by a whole conversation for every one opened
+/// — walking fifty long chats left fifty histories resident, with nothing
+/// but an account reset to clear them. The other two caches beside it are
+/// bounded for the same reason; this one was not.
+const MAX_CACHED_TIMELINES: usize = 8;
+
+/// Download timeout in seconds (for audio/video downloads)
+/// How long a download somebody asked for is allowed to take.
+///
+/// Public because the web front end has to fetch the bytes over HTTP before
+/// it can answer the request, and doing that under a shorter deadline than
+/// this one would make the allowance a fiction — see `session::web::prefetch`.
+pub(crate) const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
+
+/// Download media with timeout - returns Ok(data) or Err(error message)
+async fn download_with_timeout(
+    download_rx: tokio::sync::oneshot::Receiver<Result<std::sync::Arc<Vec<u8>>, Failure>>,
+) -> Result<std::sync::Arc<Vec<u8>>, Failure> {
+    let download = async {
+        download_rx.await.unwrap_or_else(|_| {
+            // The sender went with the connection, which comes back.
+            Err(Failure::worth_retrying("the download was cancelled"))
+        })
+    };
+
+    // Race between download and timeout
+    crate::platform::with_timeout(
+        download,
+        std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS),
+    )
+    .await
+    // A minute is long enough that the answer is "the network is not
+    // working", which is a thing that stops being true.
+    .ok_or_else(|| Failure::worth_retrying("the download timed out"))?
+}
+
+/// A name for media the sender never named.
+///
+/// The message id keeps two photos from the same conversation out of each
+/// other's way, and the extension is what lets the file open at all.
+fn default_media_name(message_id: &str, mime_type: &str) -> String {
+    let extension = match mime_type.split(';').next().unwrap_or("").trim() {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "audio/ogg" | "audio/opus" => "ogg",
+        "audio/mpeg" => "mp3",
+        "audio/mp4" => "m4a",
+        "audio/wav" => "wav",
+        "application/pdf" => "pdf",
+        _ => "bin",
+    };
+    // Ids are opaque and long; the tail is enough to tell two apart and short
+    // enough to stay a file name.
+    let suffix: String = message_id
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .iter()
+        .rev()
+        .collect();
+    format!("velo-{suffix}.{extension}")
+}
+
+/// Currently active media playback (mutual exclusion: only one media at a time)
+/// Animated stickers are excluded from this - they can play alongside audio/video.
+#[derive(Clone, Debug, Default)]
+enum ActiveMedia {
+    /// No media currently playing
+    #[default]
+    None,
+    /// Audio message playing (voice message, PTT)
+    Audio { message_id: String },
+    /// Video message playing (includes video's audio track)
+    Video { message_id: String },
+}
+
+impl ActiveMedia {
+    /// Check if this is an audio message
+    fn is_audio(&self) -> bool {
+        matches!(self, Self::Audio { .. })
+    }
+
+    /// Get the message ID if any media is playing
+    fn message_id(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Audio { message_id } | Self::Video { message_id } => Some(message_id),
+        }
+    }
+
+    /// Check if the given message ID is currently playing
+    fn is_playing(&self, id: &str) -> bool {
+        self.message_id() == Some(id)
+    }
+}
+
+// Answering a call must not require a pointer.
+actions!(calls, [AcceptCall, DeclineCall]);
+
+/// Initialize chat list and call popup key bindings
+pub fn init_app_bindings(cx: &mut gpui::App) {
+    crate::components::InputAreaView::init_bindings(cx);
+    // `secondary` is Command on macOS and Control elsewhere, which is what
+    // makes one binding table correct on every platform.
+    // GPUI's static constructor no longer resolves the OS-dependent alias.
+    fn window_binding<A: gpui::Action>(
+        keys: &'static str,
+        action: A,
+        cx: &gpui::App,
+    ) -> KeyBinding {
+        KeyBinding::load(keys, Box::new(action), None, false, None, cx)
+            .expect("valid application shortcut")
+    }
+    let bindings = [
+        KeyBinding::new("up", SelectUp, Some(CHAT_LIST_CONTEXT)),
+        KeyBinding::new("down", SelectDown, Some(CHAT_LIST_CONTEXT)),
+        // Exclude the Input context so matched Space remains available to the editor.
+        KeyBinding::new("space", ToggleSelectedCommunity, Some("ChatList && !Input")),
+        // Window-wide: reachable whatever owns focus, because both are ways
+        // *out* of wherever the user currently is.
+        window_binding("secondary-k", FocusSearch, cx),
+        // WhatsApp Desktop's own shortcut for a new chat.
+        window_binding("secondary-n", forward::NewChat, cx),
+        window_binding(
+            crate::platform::keyboard::conversation_search_key(),
+            ToggleConversationSearch,
+            cx,
+        ),
+        KeyBinding::new(
+            crate::platform::keyboard::chat_history_page_keys().0,
+            PageChatHistoryUp,
+            None,
+        ),
+        KeyBinding::new(
+            crate::platform::keyboard::chat_history_page_keys().1,
+            PageChatHistoryDown,
+            None,
+        ),
+        window_binding("secondary-,", OpenSettings, cx),
+        // Moving between conversations without the mouse, the way Signal
+        // Desktop does: Alt and the arrows walk the list from anywhere, the
+        // composer included, because Alt-arrow means nothing to a text field.
+        KeyBinding::new("alt-down", NextChat, None),
+        KeyBinding::new("alt-up", PreviousChat, None),
+        KeyBinding::new("alt-shift-down", NextUnreadChat, None),
+        window_binding("secondary-shift-i", ToggleContactInfo, cx),
+        window_binding("secondary-shift-d", ToggleSharedFiles, cx),
+        // Scoped to the call so Enter and Escape keep their composer meaning
+        // while nothing is ringing.
+        KeyBinding::new("enter", AcceptCall, Some(CALL_CONTEXT)),
+        KeyBinding::new("escape", DeclineCall, Some(CALL_CONTEXT)),
+        // Window-wide, unlike the two above: only a ringing call takes the
+        // keyboard (see `sync_call_focus`), and muting is something you do
+        // *during* a call, with the caret back in the composer where someone
+        // on a call is likely typing. A modifier chord has nothing to
+        // collide with there, and it does nothing when no call is up.
+        window_binding("secondary-shift-m", ToggleMute, cx),
+        window_binding("secondary-shift-c", ReturnToCall, cx),
+        // Walking pictures, scoped to the viewer for the same reason: the
+        // arrow keys belong to the composer's caret everywhere else.
+        KeyBinding::new("left", ViewerPrev, Some(VIEWER_CONTEXT)),
+        KeyBinding::new("right", ViewerNext, Some(VIEWER_CONTEXT)),
+        // Dismissing the topmost surface is a window-level command; each
+        // overlay decides in turn whether it is the one that closes.
+        KeyBinding::new("escape", CloseOverlay, None),
+    ];
+    cx.bind_keys(bindings);
+}
+
+// Action to navigate back to chat list on mobile
+actions!(mobile_nav, [NavigateBack]);
+
+/// Why a chat is being opened, which decides where keyboard focus lands.
+///
+/// Clicking a chat means "I want to talk to this person", so the composer
+/// takes focus and typing just works. Arrow-key navigation means "show me
+/// this one" — moving focus to the composer there would take the arrow keys
+/// away from the list the user is still walking through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatOpen {
+    ToCompose,
+    ToPreview,
+    /// Restore a remembered selection without showing or reading its timeline.
+    Restore,
+}
+
+#[derive(Clone, Copy)]
+pub enum OfflineRecovery {
+    Reconnect,
+    PairAgain,
+}
+
+/// Main application struct
+pub struct WhatsAppApp {
+    pub(crate) calls_open: bool,
+    pub(crate) call_history_view: Option<Entity<crate::components::call_history::CallHistory>>,
+    pub(crate) shared_files_open: bool,
+    /// Contact info / Group info, opened from the chat header's name.
+    pub(crate) contact_info_open: bool,
+    pub(crate) sidebar_preference_rem: Option<f32>,
+    pub(crate) shared_files_filter: crate::views::shared_files::Filter,
+    pub(crate) shared_files_sort: crate::views::shared_files::Sort,
+    /// Message hits from every chat for the sidebar's search.
+    pub(crate) global_search: global_search::GlobalSearch,
+    /// The Shared files panel's search box. Made on the first frame that has
+    /// a window, like the Files view's.
+    pub(crate) shared_files_search: Option<Entity<InputState>>,
+    pub(crate) files_open: bool,
+    pub(crate) files_view: Option<Entity<crate::components::files_view::FilesView>>,
+    body: Option<Entity<body::Body>>,
+    #[cfg(test)]
+    body_renders: usize,
+    /// Current application state
+    app_state: AppState,
+    /// List of chats
+    /// The conversations this window holds, newest first.
+    ///
+    /// Behind an `Arc` because the conversation pane reads one of them out of
+    /// here on every frame and then needs `self` mutably to build the
+    /// timeline — so what it took had to be a clone, and a `Chat` is its
+    /// messages: five hundred rows of four `String`s each, a reaction map, a
+    /// quote and a media handle, rebuilt sixty times a second to be read
+    /// through and dropped. A refcount says the same thing.
+    ///
+    /// The write side pays nothing for it either. Every mutation here goes
+    /// through `Arc::make_mut`, and the only clone that ever hands out is one
+    /// taken by a frame still being drawn — which is a frame that is about to
+    /// end.
+    chats: Vec<Arc<Chat>>,
+    /// A chat this window made up so there was somewhere to type to someone
+    /// — New chat, a sender's name, a group member — and nothing has been
+    /// written in yet. Leaving it empty takes it out of the list again.
+    unwritten_chat: Option<String>,
+    /// Currently selected chat JID
+    selected_chat: Option<String>,
+    /// WhatsApp client wrapper
+    client: Option<Session>,
+    account_selection: recovery::AccountSelection,
+    /// The daemon's control plane, beside the account connection.
+    ///
+    /// A second connection carrying the requests that belong to the process
+    /// rather than to an account: the log level, a window, the shared plugin
+    /// catalogue and the account lifecycle. The account plane refuses those,
+    /// so a window that sent them there was answered "this request belongs to
+    /// the control plane" — see `session::attach::begin_control`.
+    control: Option<Session>,
+    /// Bumped on account departure; async file drops and web pastes capture
+    /// it before reading so an old account cannot offer files in a new one.
+    incoming_file_epoch: u64,
+    /// One file read at a time. A web paste can hold the whole staging
+    /// budget while `File.array_buffer()` awaits; starting another before
+    /// the first returns would multiply that budget in wasm memory.
+    incoming_file_reading: bool,
+    paste_preview: Option<PendingPastePreview>,
+    /// Accepted selections that completed while another confirmation was open.
+    /// Keeping these instead of dropping a late picker/drop result guarantees
+    /// every accepted attachment gets the same explicit confirmation surface.
+    pending_attachment_previews: VecDeque<PendingPastePreview>,
+    #[cfg(test)]
+    /// What `send_attachment` was asked to send in tests: the file and the
+    /// caption that would have travelled with it, recorded before the
+    /// missing session refuses the send.
+    attachment_attempts: Vec<(crate::platform::picker::Picked, Option<String>)>,
+    /// Scroll handle for chat list
+    chat_list_scroll: VirtualListScrollHandle,
+    /// The Status sidebar's scroll position, so that list can have a
+    /// scrollbar like every other region that scrolls.
+    status_list_scroll: gpui::ScrollHandle,
+    /// Focus handle for chat list keyboard navigation
+    chat_list_focus: FocusHandle,
+    /// Focus target for the call card, so its actions are reachable from
+    /// the keyboard while it floats over the app.
+    call_focus: FocusHandle,
+    /// Focus target for the pasted-image confirmation modal.
+    paste_preview_focus: FocusHandle,
+    /// Focus target for the sent-message deletion confirmation modal.
+    message_delete_focus: FocusHandle,
+    /// Focus target for the window itself, so the actions hung off the root
+    /// are reachable whatever else is on screen — including on the screens on
+    /// the way to a conversation, which have no list and no composer to
+    /// focus.
+    root_focus: FocusHandle,
+    /// Which surface the keyboard was handed to, so it is handed over once
+    /// and given back once. `None` until the first frame hands it somewhere:
+    /// a window that starts out claiming an owner it never focused is a
+    /// window the first sync finds nothing to do in, which is how the
+    /// keyboard ended up belonging to nobody until the first click.
+    /// See `sync_overlay_focus`.
+    keyboard_owner: Option<KeyboardOwner>,
+    window_focused: bool,
+    window_activation: Option<gpui::Subscription>,
+    /// Incoming messages this process has already surfaced to the operating
+    /// system. The session may redeliver an event while reconnecting, and a
+    /// notification is a user-visible side effect rather than an idempotent
+    /// timeline merge.
+    notified_messages: IndexMap<(String, String, String), ()>,
+    /// The window handle used to finish opening a notification after its chat
+    /// arrives. A notification response can beat the first chat snapshot (or
+    /// a later archived page), so resolving only against `chats` at click time
+    /// would silently lose the action.
+    notification_window: Option<gpui::AnyWindowHandle>,
+    account_window: Option<gpui::AnyWindowHandle>,
+    /// The window the send-confirmation modal builds its caption field in.
+    /// An editor entity needs a live `Window` at construction, and the modal
+    /// opens from event continuations that only hold the app — the same
+    /// reason the notification path keeps its handle rather than a borrow.
+    modal_window: Option<gpui::AnyWindowHandle>,
+    /// Clicked notifications whose chats are not hydrated in this window yet.
+    /// Keep them in click order so a burst of responses is retried one by one;
+    /// the newest click is consequently the final selection when both arrive.
+    pending_notification_tags: VecDeque<String>,
+    /// The most recent click wins focus. Older queued tags are still retried,
+    /// but resolving one after a newer click must never navigate backward.
+    latest_notification_tag: Option<String>,
+    /// Backoff task for a chat-list page refusal. A refused page otherwise
+    /// leaves a pending click waiting forever, while retrying inline can spin
+    /// if the daemon keeps refusing it.
+    #[allow(dead_code)]
+    notification_retry_task: Option<Task<()>>,
+    notification_retry_backoff: std::time::Duration,
+    /// Whether the last gesture that touched a conversation was someone
+    /// meaning to *talk* to it or meaning to *look* at it.
+    ///
+    /// The distinction is [`ChatOpen`]'s and it already decided where focus
+    /// went at the moment of the gesture; this is the same answer kept, so
+    /// the frame after it does not undo it. Without it the composer outranked
+    /// the list whenever both were drawn, and the first arrow key selected a
+    /// chat and took the arrow keys away — the list's own bindings are scoped
+    /// to it, so walking a list with the keyboard ended after one step.
+    keyboard_intent: ChatOpen,
+    /// Which of the two keyboard surfaces the last frame actually drew.
+    ///
+    /// Focus has to land on something that is *in* the frame — an unrendered
+    /// handle sends every key to gpui's root instead — and only the view that
+    /// draws them knows: the composer exists as an entity long after the
+    /// conversation holding it left the screen, and on a phone the list and
+    /// the conversation are the same slot.
+    keyboard_surfaces: KeyboardSurfaces,
+    /// Which playback the completion still in flight belongs to. See
+    /// `stop_current_media`.
+    playback_epoch: usize,
+    /// Voice-note decode/resample/time-stretch currently running off the UI
+    /// executor. The token also carries the position and pause intent needed
+    /// when a speed change arrives before the first preparation completes.
+    audio_preparation: Option<media_ctl::PendingAudioPreparation>,
+    /// The deadline `status_tick` is waiting on, so an earlier one that
+    /// arrives later can replace it rather than queue behind it.
+    status_tick_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The conversation the last frame actually drew, if any.
+    ///
+    /// Not the same as [`Self::selected_chat`], which is *kept* while the
+    /// user reads statuses or, on a phone, walks the chat list — so that
+    /// coming back lands where they were. Treating the selection as
+    /// visibility is what made messages arriving in a hidden conversation
+    /// read themselves, receipt and all, for someone who never saw them.
+    /// Written by the render pass, because being on screen is a fact about
+    /// what was drawn.
+    visible_chat: Option<String>,
+    /// The conversation whose media this window is still holding for.
+    ///
+    /// [`Self::visible_chat`] with the gaps filled in: the frame reports no
+    /// conversation whenever Settings is up, the reader is in Status, the
+    /// fullscreen viewer is open or the window is too narrow to draw a chat
+    /// area beside the list — and none of those means the reader has left the
+    /// conversation they were in. Only *another* conversation being drawn
+    /// moves it. Read by [`Self::sweep_retained_media`], which would
+    /// otherwise empty an album the moment somebody opened one of its
+    /// pictures full screen.
+    retained_chat: Option<String>,
+    /// Store-backed chats a complete load said were gone, kept on screen only
+    /// because they are the open conversation.
+    ///
+    /// A complete load is the store's whole truth, so a store-backed chat
+    /// missing from one was archived or deleted — possibly on another device.
+    /// The selected chat is spared so the conversation being read is not
+    /// yanked out from under it, and this is the other half of sparing it:
+    /// without remembering the omission, the chat outlived its deletion until
+    /// some unrelated later reload happened to notice again.
+    departed_chats: std::collections::HashSet<String>,
+    /// Archived store rows seen since the current include-archived scan
+    /// started at the top. When its final page arrives, absence is deletion.
+    archived_scan: std::collections::HashSet<String>,
+    /// Chats opened before their messages arrived, whose reads are still owed.
+    ///
+    /// `MarkRead` is a claim about the message the requester was looking at,
+    /// and the daemon refuses one that names nothing while it knows a
+    /// boundary itself — rightly, since a read clears whole seconds. A row
+    /// painted from the snapshot has no messages to name, so opening one
+    /// straight from the first frame would clear the badge here, send no
+    /// receipt, persist nothing, and have the badge come back on the next
+    /// hydration. Held until the load that carries the messages, and spent
+    /// there. A set rather than one chat: on the frame the snapshot paints,
+    /// every row is a row without messages, so two of them can be opened
+    /// before either load lands.
+    owed_reads: std::collections::HashSet<String>,
+    /// The last option this window attempted to vote for. An attempted vote
+    /// is not a confirmed one: legacy IPC does not report async completion.
+    /// Kept only to display honest feedback and allow retry.
+    attempted_poll_votes: std::collections::HashMap<(String, String), u32>,
+    /// Where both paged lists continue, and whether either is asking. See
+    /// [`paging`].
+    pages: Entity<paging::Pages>,
+    /// Status updates watched in this window. Local by design — there is no
+    /// receipt to send — and therefore this window's job to remember across a
+    /// hydration merge, which replaces those rows from the store.
+    watched_status: std::collections::HashSet<String>,
+    /// The picture being looked at full screen, and the keyboard it takes
+    /// while it is. See [`viewer`].
+    viewer: Entity<viewer::Viewer>,
+    /// The sidebar's filter and the conversation's search, with the fields
+    /// they are typed into. See [`search`].
+    search: Entity<search::Search>,
+    /// Scroll handle for message list
+    /// The conversation's list, which measures its own rows.
+    ///
+    /// One state rather than one per chat: it holds measurements and a scroll
+    /// position, both of which belong to what is on screen. Switching chats
+    /// resets it, which is also what puts the reader at the newest message.
+    message_list: ListState,
+    /// The reader has scrolled up, away from the newest message; the
+    /// conversation shows a button back down. Set by the list's own scroll
+    /// handler, and only when it flips, so scrolling costs no extra frames.
+    pub(crate) away_from_latest: bool,
+    /// What `message_list` was last reset or spliced for, so a new message
+    /// extends it and a new conversation replaces it.
+    timeline_anchor: Option<TimelineAnchor>,
+    /// Isolated input area view (has its own render cycle for performance)
+    input_area: Option<Entity<InputAreaView>>,
+    file_drop_listener: Option<crate::platform::drop::Listener>,
+    /// Chat a composing indicator was last sent to: paused must go back to
+    /// this chat even if the user switched chats before the typing timeout
+    composing_chat: Option<String>,
+    /// Unsent input text stashed per chat on switch; the shared input view
+    /// would otherwise carry chat A's draft into chat B and send it there
+    drafts: HashMap<String, String>,
+    /// Background task for event polling (must be retained)
+    #[allow(dead_code)]
+    event_task: Option<Task<()>>,
+    /// Reconnecting to the daemon, which can mean starting one and waiting
+    /// for it to listen. Retained for the same reason: dropping the task
+    /// cancels it.
+    #[allow(dead_code)]
+    reconnect_task: Option<Task<()>>,
+    /// The control connection's event reader. Retained for the same reason as
+    /// `event_task`: dropping it ends the reader.
+    ///
+    /// Its frames are answered through the control session's own request
+    /// table, so it needs no separate handling beyond staying alive — the
+    /// `Awaiting` entries the control requests registered are what its reader
+    /// resolves.
+    #[allow(dead_code)]
+    control_event_task: Option<Task<()>>,
+    /// The microphone, what it is being held open for, and the timer that
+    /// draws the meter. See [`recording`].
+    recorder: Entity<recording::Recorder>,
+    /// Audio player for voice message and video audio playback
+    audio_player: AudioPlayer,
+    /// Playback speed for voice notes, shared across clips: someone who
+    /// listens at 1.5× means it for the next note too.
+    playback_speed: f32,
+    /// Repaints the playhead while audio plays. Only alive while it does.
+    #[allow(dead_code)]
+    playback_tick: Option<Task<()>>,
+    /// What the one audio sink is holding.
+    ///
+    /// One field, because the name and the bytes are one fact. As two, a stop
+    /// cleared the name and left the bytes behind, and the next thing to read
+    /// the pair — a speed change, a scrub past the end — took a video's
+    /// message id and a voice note's samples and played the wrong sound
+    /// against the wrong row.
+    audio: AudioHolder,
+    /// Currently active media (mutual exclusion: only one audio or video at a time)
+    active_media: ActiveMedia,
+    /// Message id of the most recent user-requested playback; download/decode
+    /// completions autoplay only if they still match it, so a stale download
+    /// can't steal playback from media the user started meanwhile.
+    pending_media_request: Option<String>,
+    /// What the error screen is waiting on, and what it is showing. See
+    /// [`recovery`].
+    recovery: Entity<recovery::Recovering>,
+    /// The transient lines drawn over whatever screen is up, and the timer
+    /// that expires them. A view of its own, hung off the root. See
+    /// [`notices`].
+    notices: Entity<notices::Notices>,
+    /// Message ids whose media is being fetched right now, so a bubble can
+    /// say so and a second tap cannot start the same download twice.
+    downloads_in_flight: std::collections::HashSet<String>,
+    media_materialization: media_materialization::Materialization,
+    #[cfg(test)]
+    materialization_cache: Option<Arc<dyn crate::session::MediaCache>>,
+    /// Automatic attempts: false while pending/failed, true after success.
+    channel_preview_attempts: std::collections::HashMap<(String, String), bool>,
+    image_downloads_in_flight: std::collections::HashSet<String>,
+    /// Native document destinations, scoped to the account, chat and message
+    /// that initiated the save. Browser handoffs never enter this map.
+    saved_documents: HashMap<(String, String, String), std::path::PathBuf>,
+    /// Document saves use the same account/chat/message identity as results.
+    document_downloads_in_flight: std::collections::HashSet<(String, String, String)>,
+    /// Invalidates detached saves when the active account/session is reset.
+    document_state_generation: u64,
+    /// What call is happening, where this window draws it, and what it has
+    /// asked the devices for that has not come back yet. See [`calls_ctl`].
+    calls: Entity<calls_ctl::Calls>,
+    /// Cache of JID -> display name mappings (from notify/pushname attribute)
+    name_cache: HashMap<String, String>,
+    /// Who is in each group this window has opened, as the daemon answered.
+    ///
+    /// Nothing here can be derived from [`Chat::participants`]: that map fills
+    /// as senders are *seen*, so it names whoever has spoken lately and says
+    /// nothing about the fifty people who have not. The membership list lives
+    /// on the connection the daemon holds, so it is asked for — once per
+    /// conversation opened, which is also what keeps it current after somebody
+    /// joins or leaves.
+    ///
+    /// Kept while a newer answer is in flight: a roster a moment out of date
+    /// is a better header than an empty one.
+    group_rosters: HashMap<String, velo_core::GroupRoster>,
+    /// The groups an ask is out for, so re-opening a conversation while its
+    /// answer is on the way does not ask again. Emptied by the answer, or by
+    /// the refusal that stands in for one.
+    rosters_in_flight: std::collections::HashSet<String>,
+    /// System notices whose conversation has not arrived yet.
+    ///
+    /// "You were added to a group" reaches this window before the group does,
+    /// every time. The store does not hold system notices, so the reload that
+    /// finally brings the chat cannot bring the row with it — dropped here,
+    /// it is gone for good.
+    pending_notices: HashMap<String, Vec<(String, chrono::DateTime<chrono::Utc>, SystemNotice)>>,
+    /// Video players for each message (message_id -> VideoPlayer)
+    video_players: HashMap<String, VideoPlayer>,
+    /// Task for video frame updates
+    #[allow(dead_code)]
+    video_update_task: Option<Task<()>>,
+    /// Cache of decoded images (message_id -> the picture and what it was
+    /// decoded from): sticker animation state and per-render decode cost both
+    /// depend on the Arc being stable, and [`Cached`] is what stops it being
+    /// stable across a *different* picture under the same id.
+    /// Uses RefCell for interior mutability since we need to cache during immutable render.
+    /// Uses IndexMap to maintain insertion order for deterministic FIFO eviction.
+    decoded_images: RefCell<IndexMap<String, (Cached, RetainedImage)>>,
+    sticker_validation: RefCell<IndexMap<String, StickerValidation>>,
+    /// Cache of message list data per chat to avoid expensive recomputation on every render.
+    /// Key is the chat JID, value is the cached data.
+    message_list_cache: RefCell<HashMap<String, MessageListCache>>,
+    /// Cache of chat list data to avoid recomputation on every render.
+    chat_list_cache: RefCell<Option<ChatListCache>>,
+    /// How many times the chat cache has been invalidated. See
+    /// [`ChatListCache::version`].
+    chat_cache_version: std::cell::Cell<u64>,
+    /// Mobile navigation state - which panel to show on mobile devices
+    mobile_panel: MobilePanel,
+    /// Which conversations the sidebar is showing.
+    chat_filter: ChatFilter,
+    /// JIDs of collapsed rows in Communities.
+    collapsed_communities: std::collections::HashSet<String>,
+    /// The message being replied to, mirrored here so the send path can
+    /// attach it and the composer can show it.
+    reply_to: Option<ReplyDraft>,
+    edit_draft: Option<editing::EditDraft>,
+    edit_revision: u64,
+    edit_generation: u64,
+    pending_edits: std::collections::HashSet<(String, String)>,
+    /// The message whose quick-react strip is open, if any. One at a time:
+    /// the strip is drawn inline under its bubble, and two open strips would
+    /// each move the timeline the other measured against.
+    reaction_picker_for: Option<String>,
+    delete_confirmation: Option<message_actions::DeleteConfirmation>,
+    /// A chat clear or delete waiting on the user's word.
+    chat_confirmation: Option<chat_actions::ChatConfirmation>,
+    /// The forward picker, while one message waits for a destination.
+    forward_picker: Option<forward::ForwardPicker>,
+    pending_message_actions: HashSet<(String, String)>,
+    #[cfg(test)]
+    delete_attempts: Vec<(String, String, bool)>,
+    /// Who is typing and who is around. Expires on its own, so it is view
+    /// state rather than anything the store carries.
+    presence: PresenceRegistry,
+    /// Display name of the linked account, for the sidebar footer.
+    account_name: Option<String>,
+    /// The account's own JID, for the number under the name.
+    account_jid: Option<String>,
+    /// The same account's LID. A chat with your own number can be keyed by
+    /// either alias, and neither string matches the other.
+    account_lid: Option<String>,
+    /// Every plugin the daemon loaded, what each wants drawn, and the boxes
+    /// this window holds for their text fields. See [`plugins_ctl`].
+    plugins: Entity<plugins_ctl::Plugins>,
+    /// The Settings screen, the totals it shows and the log level somebody
+    /// chose in it. See [`settings`].
+    settings: Entity<settings::Settings>,
+    /// Which of the sidebar's destinations is on screen.
+    destination: Destination,
+    destination_selections: HashMap<&'static str, Option<String>>,
+    /// Whose status updates are open, and which one of them.
+    status_pane: StatusPane,
+    /// The broadcast grouped by author, against the message count it was
+    /// built from.
+    status_feed_cache: RefCell<Option<(usize, velo_core::StatusFeed)>>,
+    /// Redraws the status feed when its next update lapses. A status is the
+    /// one thing that changes with nothing happening.
+    #[allow(dead_code)]
+    status_tick: Option<Task<()>>,
+    /// Polls `theme.json` for an edit, and repaints the pairing countdown.
+    /// Both are things that change with no event to carry them.
+    #[allow(dead_code)]
+    heartbeat: Option<Task<()>>,
+    /// Demand-driven avatar pipeline and cache coordinator.
+    pub(crate) avatar_manager: crate::session::avatar::AvatarManager,
+    /// Cached fingerprint of the visible row range and avatar state to avoid redundant work.
+    last_avatar_window_fingerprint: Option<u64>,
+}
+
+/// Store-backed conversation and attention facts delivered with a message.
+/// The GUI's paged chat row may not yet know any of them.
+struct IncomingMessageMetadata {
+    allowed: bool,
+    muted_until_ms: Option<i64>,
+    title: Option<String>,
+    archived: Option<bool>,
+    chat_name: Option<String>,
+}
+
+const NOTIFICATION_PAGE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+const MAX_NOTIFICATION_PAGE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn next_notification_retry_delay(current: std::time::Duration) -> std::time::Duration {
+    current
+        .checked_mul(2)
+        .unwrap_or(MAX_NOTIFICATION_PAGE_RETRY_DELAY)
+        .min(MAX_NOTIFICATION_PAGE_RETRY_DELAY)
+}
+
+/// Add a notification response once, retaining the newest occurrence at the
+/// back of the FIFO. A repeated click is a new ordering signal, not a second
+/// request for the same tag.
+fn enqueue_pending_notification(queue: &mut VecDeque<String>, tag: &str) {
+    if let Some(index) = queue.iter().position(|queued| queued == tag) {
+        queue.remove(index);
+    }
+    queue.push_back(tag.to_string());
+}
+
+fn remove_pending_notification(queue: &mut VecDeque<String>, tag: &str) -> bool {
+    let Some(index) = queue.iter().position(|queued| queued == tag) else {
+        return false;
+    };
+    queue.remove(index).is_some()
+}
+
+impl IncomingMessageMetadata {
+    fn with_mute(mut self, until: Option<i64>) -> Self {
+        self.muted_until_ms = until;
+        self
+    }
+
+    fn new(
+        allowed: bool,
+        title: Option<String>,
+        archived: Option<bool>,
+        chat_name: Option<String>,
+    ) -> Self {
+        Self {
+            allowed,
+            muted_until_ms: None,
+            title,
+            archived,
+            chat_name,
+        }
+    }
+}
+
+pub(super) fn clear_window_message_selection(window: &mut Window, cx: &mut App) {
+    gpui_base::TextSelection::clear(window, cx);
+    crate::components::rich_text_selection::forget_window_selection_registry(
+        window.window_handle().window_id(),
+        cx,
+    );
+}
+
+impl WhatsAppApp {
+    pub(crate) fn call_history_request(
+        &self,
+        refresh: bool,
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<Vec<velo_core::CallHistoryEntry>, String>>>
+    {
+        self.client
+            .as_ref()
+            .map(|client| client.call_history(refresh))
+    }
+
+    /// Ask the file-name index for shared documents matching `query`.
+    pub(crate) fn search_files_request(
+        &self,
+        query: String,
+        limit: u32,
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<Vec<velo_ipc::FileMatch>, String>>> {
+        self.client
+            .as_ref()
+            .map(|client| client.search_files(query, limit))
+    }
+
+    pub(crate) fn open_call_history(&mut self, cx: &mut Context<Self>) {
+        self.calls_open = true;
+        self.files_open = false;
+        let view = self
+            .call_history_view
+            .get_or_insert_with(|| {
+                let owner = cx.entity().downgrade();
+                cx.new(|_| crate::components::call_history::CallHistory::new(owner))
+            })
+            .clone();
+        let request = self.call_history_request(false);
+        view.update(cx, |view, cx| view.start(request, cx));
+        cx.notify();
+    }
+
+    pub fn media_cache(&self) -> Option<std::sync::Arc<dyn crate::session::MediaCache>> {
+        #[cfg(test)]
+        if let Some(cache) = &self.materialization_cache {
+            return Some(Arc::clone(cache));
+        }
+        self.client.as_ref().map(Session::media_cache).or_else(|| {
+            (!self.chats.is_empty())
+                .then(Session::retained_media_cache)
+                .flatten()
+        })
+    }
+
+    /// Demand avatar images for visible rows and overscan (+/- 10 rows).
+    pub fn demand_avatars_for_visible_range(
+        &mut self,
+        rows: &[ChatRow],
+        visible_range: std::ops::Range<usize>,
+        _cx: &mut App,
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        let start = visible_range.start.saturating_sub(10);
+        let end = (visible_range.end + 10).min(rows.len());
+        if start >= end || start >= rows.len() {
+            return;
+        }
+
+        // Fast fingerprint check to avoid recalculating or locking on identical renders
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.avatar_manager.demand_epoch().hash(&mut hasher);
+        visible_range.hash(&mut hasher);
+        for row in &rows[start..end] {
+            row.jid.hash(&mut hasher);
+            row.avatar_key.hash(&mut hasher);
+        }
+        let fingerprint = hasher.finish();
+        if self.last_avatar_window_fingerprint == Some(fingerprint) {
+            return;
+        }
+        self.last_avatar_window_fingerprint = Some(fingerprint);
+
+        let vis_start = visible_range.start.min(rows.len());
+        let vis_end = visible_range.end.min(rows.len());
+        let to_demand = |row: &ChatRow| {
+            let picture_id = self
+                .find_chat(&row.jid)
+                .and_then(|c| c.avatar_picture_id.clone());
+            crate::session::avatar::ChatDemand {
+                jid: row.jid.clone(),
+                picture_id,
+                cache_key: row.avatar_key.clone(),
+            }
+        };
+        let visible_demands: Vec<crate::session::avatar::ChatDemand> =
+            rows[vis_start..vis_end].iter().map(&to_demand).collect();
+
+        let mut overscan_demands = Vec::new();
+        if start < vis_start {
+            overscan_demands.extend(rows[start..vis_start].iter().map(&to_demand));
+        }
+        if vis_end < end {
+            overscan_demands.extend(rows[vis_end..end].iter().map(&to_demand));
+        }
+
+        self.avatar_manager
+            .demand_chats_windowed(&visible_demands, &overscan_demands);
+        if let Some(session) = &self.client {
+            self.avatar_manager.flush_demands(session);
+        }
+    }
+
+    /// Demand avatar image for an individual open chat (e.g. from the header).
+    pub fn demand_avatar_for_chat(&mut self, chat: &Chat) {
+        self.avatar_manager
+            .demand_chat(&crate::session::avatar::ChatDemand {
+                jid: chat.jid.clone(),
+                picture_id: chat.avatar_picture_id.clone(),
+                cache_key: chat.avatar_cache_key.clone(),
+            });
+        if let Some(session) = &self.client {
+            self.avatar_manager.flush_demands(session);
+        }
+    }
+
+    /// Drain the control connection's events.
+    ///
+    /// The control plane carries no account state, so there is nothing to
+    /// apply. The reader resolves global requests and forwards explicit account
+    /// retirements so active and retained selections survive cleanup and restart.
+    fn spawn_control_reader(mut ui_rx: crate::session::Events, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            while let Some(event) = ui_rx.recv().await {
+                if let FromDaemon::AccountRetired { account, successor } = event
+                    && entity
+                        .update(cx, |app, cx| app.account_retired(account, successor, cx))
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// The control plane if this window has one.
+    ///
+    /// `None` between connections, or when the daemon answered the account
+    /// connection but not a second one. Every caller that needs it says what
+    /// it could not do rather than panicking.
+    fn control(&self) -> Option<&Session> {
+        self.control.as_ref()
+    }
+
+    /// Spawn the event handling task that processes UI events from the WhatsApp client
+    fn spawn_event_task(mut ui_rx: crate::session::Events, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            while let Some(message) = ui_rx.recv().await {
+                let result = match message {
+                    FromDaemon::AccountRetired { account, successor } => {
+                        entity.update(cx, |app, cx| app.account_retired(account, successor, cx))
+                    }
+                    FromDaemon::Session(event) => entity.update(cx, |app, cx| {
+                        // The two events that carry media, and so the only
+                        // two that can leave this window holding more of it
+                        // than it is allowed to. Asked before the event is
+                        // applied because applying it consumes it; swept
+                        // after, because the bytes arrive with it.
+                        let bearing = matches!(
+                            &*event,
+                            UiEvent::MessageReceived { .. } | UiEvent::HistoryLoaded { .. }
+                        );
+                        let hydration = matches!(&*event, UiEvent::HistoryLoaded { .. });
+                        app.handle_event(*event, cx);
+                        if hydration {
+                            app.reset_notification_retry_backoff();
+                        }
+                        // A notification click may have arrived before the
+                        // list/history event that owns its chat. Retrying
+                        // after every session event is cheap when there is no
+                        // pending tag, and makes HistoryLoaded a valid retry
+                        // point without coupling the paging module to window
+                        // handles.
+                        app.retry_pending_notification(cx);
+                        if bearing {
+                            app.sweep_retained_media(cx);
+                        }
+                    }),
+                    // Adopted whole rather than replayed: these are the calls
+                    // that were already happening when this window attached,
+                    // and a call this account placed was never an event.
+                    FromDaemon::Calls(calls) => entity.update(cx, |app, cx| {
+                        app.adopt_calls(*calls, cx);
+                    }),
+                    // Whole every time. A plugin republishes its tree when
+                    // anything in it changes, and the daemon publishes
+                    // nothing when the set has not moved, so replacing is
+                    // both correct and no more work than merging.
+                    FromDaemon::Plugins(plugins) => entity.update(cx, |app, cx| {
+                        app.adopt_plugins(plugins, cx);
+                    }),
+                    // Announced on connect, before this window existed, so it
+                    // arrives with the snapshot rather than as an event.
+                    FromDaemon::Account(account) => entity.update(cx, |app, cx| {
+                        // `None` is an answer, not a missing one: a daemon
+                        // with no account paired is saying so. Keeping the
+                        // last identity meant the old account survived a
+                        // re-pair — its name under the sidebar, its number
+                        // beneath, and its JID still reading as "(You)" —
+                        // until some later `AccountUpdated` corrected it.
+                        let jid = account.as_ref().and_then(|a| a.jid.clone());
+                        let lid = account.as_ref().and_then(|a| a.lid.clone());
+                        if (app.account_jid != jid || app.account_lid != lid)
+                            && let Some(window) = app.modal_window
+                        {
+                            let _ = window.update(cx, |_, window, cx| {
+                                clear_window_message_selection(window, cx);
+                            });
+                        }
+                        app.account_name = account.as_ref().and_then(|a| a.name.clone());
+                        app.account_jid = jid;
+                        app.account_lid = lid;
+                        cx.notify();
+                    }),
+                    FromDaemon::Avatar { jid, key } => entity.update(cx, |app, cx| {
+                        app.last_avatar_window_fingerprint = None;
+                        app.avatar_manager.on_avatar_ready(&jid, &key);
+                        if let Some(chat) = app.find_chat_mut(&jid) {
+                            chat.ready_avatar(key);
+                            app.invalidate_chat_cache();
+                            cx.notify();
+                        }
+                    }),
+                    FromDaemon::AvatarLoaded => entity.update(cx, |_app, cx| cx.notify()),
+                    FromDaemon::AvatarFailed { jid, retryable } => entity.update(cx, |app, _cx| {
+                        app.last_avatar_window_fingerprint = None;
+                        app.avatar_manager.on_avatar_failed(&jid, retryable);
+                    }),
+                    // Refused, or it never left this process. The ring came
+                    // down when the update was opened, which is right — a
+                    // view that waits for a round trip flickers — so the
+                    // correction is to put it back rather than to leave a
+                    // watched update that returns new on the next start.
+                    // One page of a conversation, for the timeline that
+                    // asked. Folded in rather than replacing: the rows a
+                    // page brings sit before the ones the window already has.
+                    FromDaemon::Messages {
+                        jid,
+                        messages,
+                        next,
+                    } => entity.update(cx, |app, cx| {
+                        app.apply_message_page(jid, messages, next, cx);
+                    }),
+                    FromDaemon::Chats {
+                        chats,
+                        next,
+                        archived,
+                    } => entity.update(cx, |app, cx| {
+                        app.apply_chat_page(chats, next, archived, cx);
+                        app.reset_notification_retry_backoff();
+                        app.retry_pending_notification(cx);
+                    }),
+                    // Who is in a group, for the line under its name.
+                    FromDaemon::Members(roster) => entity.update(cx, |app, cx| {
+                        app.rosters_in_flight.remove(&roster.jid);
+                        app.group_rosters.insert(roster.jid.clone(), roster);
+                        cx.notify();
+                    }),
+                    // Released rather than remembered as a failure: the next
+                    // time this conversation is opened is the next time the
+                    // line is worth asking for.
+                    FromDaemon::MembersLost { jid } => entity.update(cx, |app, _cx| {
+                        app.rosters_in_flight.remove(&jid);
+                    }),
+                    // A stream, not an event: the newest picture replaces
+                    // the one before it and nothing is queued.
+                    FromDaemon::CallFrames => entity.update(cx, |app, cx| {
+                        app.draw_waiting_call_frames(cx);
+                    }),
+                    FromDaemon::PageLost { jid, archived } => entity.update(cx, |app, cx| {
+                        let chat_list_page = jid.is_none();
+                        app.page_lost(jid, archived, cx);
+                        if chat_list_page {
+                            app.retry_pending_notification_after_page_loss(cx);
+                        }
+                    }),
+                    FromDaemon::StatusViewLost(message_ids) => entity.update(cx, |app, cx| {
+                        app.forget_status_views(&message_ids, cx);
+                    }),
+                    // The tray's "Open", or another front end asking on a
+                    // user's behalf. One window, so there is one to raise.
+                    // The connection ended, and why. One screen drew three
+                    // different endings as an outage that would be retried;
+                    // this carries which one it was.
+                    FromDaemon::Ended(fault) => entity.update(cx, |app, cx| {
+                        app.connection_ended(fault, cx);
+                    }),
+                    FromDaemon::ShowWindow => {
+                        cx.update(|cx| {
+                            // Every window on its own: one that closed
+                            // between listing and raising must not fail the
+                            // rest, and a close racing this request is
+                            // ordinary — the person closed the window at the
+                            // same moment the tray asked for it — so a stale
+                            // handle is a debug line, not an error.
+                            for window in cx.windows() {
+                                if window
+                                    .update(cx, |_, window, _| window.activate_window())
+                                    .is_err()
+                                {
+                                    log::debug!("a window went away while being raised");
+                                }
+                            }
+                        });
+                        Ok(())
+                    }
+                    // The tray's Hide, or its icon clicked over this window.
+                    // What going away means is a platform question — on a
+                    // desktop the window is the process — and it is answered
+                    // beneath `platform/` like every other one.
+                    FromDaemon::HideWindow => {
+                        cx.update(crate::platform::leave);
+                        Ok(())
+                    }
+                };
+                if result.is_err() {
+                    // Entity was dropped, stop the loop
+                    break;
+                }
+            }
+        })
+    }
+
+    /// Create a new WhatsApp application
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            calls_open: false,
+            call_history_view: None,
+            shared_files_open: false,
+            contact_info_open: false,
+            sidebar_preference_rem: None,
+            shared_files_filter: Default::default(),
+            shared_files_sort: Default::default(),
+            global_search: Default::default(),
+            shared_files_search: None,
+            files_open: false,
+            files_view: None,
+            body: None,
+            #[cfg(test)]
+            body_renders: 0,
+            app_state: AppState::Loading,
+            chats: Vec::new(),
+            unwritten_chat: None,
+            selected_chat: None,
+            client: None,
+            account_selection: recovery::AccountSelection::load(),
+            incoming_file_epoch: 0,
+            incoming_file_reading: false,
+            paste_preview: None,
+            pending_attachment_previews: VecDeque::new(),
+            #[cfg(test)]
+            attachment_attempts: Vec::new(),
+            chat_list_scroll: VirtualListScrollHandle::new(),
+            status_list_scroll: gpui::ScrollHandle::new(),
+            chat_list_focus: cx.focus_handle(),
+            call_focus: cx.focus_handle(),
+            paste_preview_focus: cx.focus_handle(),
+            message_delete_focus: cx.focus_handle(),
+            root_focus: cx.focus_handle(),
+            keyboard_owner: None,
+            window_focused: false,
+            window_activation: None,
+            notified_messages: IndexMap::new(),
+            notification_window: None,
+            account_window: None,
+            modal_window: None,
+            pending_notification_tags: VecDeque::new(),
+            latest_notification_tag: None,
+            notification_retry_task: None,
+            notification_retry_backoff: NOTIFICATION_PAGE_RETRY_DELAY,
+            // Nothing has been opened to talk to yet, and a window that comes
+            // up on a restored selection is one nobody has typed into.
+            keyboard_intent: ChatOpen::ToPreview,
+            keyboard_surfaces: KeyboardSurfaces::default(),
+            playback_epoch: 0,
+            audio_preparation: None,
+            status_tick_at: None,
+            visible_chat: None,
+            retained_chat: None,
+            departed_chats: std::collections::HashSet::new(),
+            archived_scan: std::collections::HashSet::new(),
+            owed_reads: std::collections::HashSet::new(),
+            attempted_poll_votes: std::collections::HashMap::new(),
+            pages: cx.new(|_| paging::Pages::new()),
+            watched_status: std::collections::HashSet::new(),
+            viewer: cx.new(viewer::Viewer::new),
+            // The window's own base font is not known until it has been laid
+            // out; the reference scale is what it starts from.
+            message_list: {
+                let state = new_timeline_state(0, crate::theme::Metrics::default());
+                let weak = cx.entity().downgrade();
+                state.set_scroll_handler(move |event, _window, cx| {
+                    // A few messages of slack, so the button does not flicker
+                    // in and out at the very foot of the conversation.
+                    let away = event.visible_range.end + 2 < event.count;
+                    let _ = weak.update(cx, |app, cx| {
+                        if app.away_from_latest != away {
+                            app.away_from_latest = away;
+                            cx.notify();
+                        }
+                    });
+                });
+                state
+            },
+            away_from_latest: false,
+            timeline_anchor: None,
+            input_area: None,
+            file_drop_listener: None,
+            composing_chat: None,
+            drafts: HashMap::new(),
+            event_task: None,
+            reconnect_task: None,
+            control: None,
+            control_event_task: None,
+            recorder: cx.new(|_| recording::Recorder::new()),
+            audio_player: AudioPlayer::new(),
+            playback_speed: 1.0,
+            playback_tick: None,
+            audio: AudioHolder::None,
+            active_media: ActiveMedia::None,
+            pending_media_request: None,
+            recovery: cx.new(|_| recovery::Recovering::new()),
+            notices: cx.new(|_| notices::Notices::new()),
+            downloads_in_flight: std::collections::HashSet::new(),
+            media_materialization: media_materialization::Materialization::default(),
+            #[cfg(test)]
+            materialization_cache: None,
+            channel_preview_attempts: std::collections::HashMap::new(),
+            image_downloads_in_flight: std::collections::HashSet::new(),
+            saved_documents: HashMap::new(),
+            document_downloads_in_flight: std::collections::HashSet::new(),
+            document_state_generation: 0,
+            calls: cx.new(|cx| {
+                cx.on_release(|calls: &mut calls_ctl::Calls, cx| calls.silence_alerts(cx))
+                    .detach();
+                calls_ctl::Calls::new()
+            }),
+            plugins: cx.new(|_| plugins_ctl::Plugins::new()),
+            search: cx.new(|_| search::Search::new()),
+            name_cache: HashMap::new(),
+            group_rosters: HashMap::new(),
+            rosters_in_flight: std::collections::HashSet::new(),
+            pending_notices: HashMap::new(),
+            video_players: HashMap::new(),
+            video_update_task: None,
+            decoded_images: RefCell::new(IndexMap::new()),
+            sticker_validation: RefCell::new(IndexMap::new()),
+            message_list_cache: RefCell::new(HashMap::new()),
+            chat_list_cache: RefCell::new(None),
+            chat_cache_version: std::cell::Cell::new(0),
+            destination: Destination::default(),
+            destination_selections: HashMap::new(),
+            status_pane: StatusPane::default(),
+            status_feed_cache: RefCell::new(None),
+            mobile_panel: MobilePanel::default(),
+            chat_filter: ChatFilter::default(),
+            collapsed_communities: std::collections::HashSet::new(),
+            reply_to: None,
+            edit_draft: None,
+            edit_revision: 0,
+            edit_generation: 0,
+            pending_edits: std::collections::HashSet::new(),
+            reaction_picker_for: None,
+            delete_confirmation: None,
+            chat_confirmation: None,
+            forward_picker: None,
+            pending_message_actions: HashSet::new(),
+            #[cfg(test)]
+            delete_attempts: Vec::new(),
+            presence: PresenceRegistry::new(),
+            account_name: None,
+            account_jid: None,
+            account_lid: None,
+            settings: cx.new(|_| settings::Settings::new()),
+            status_tick: None,
+            heartbeat: None,
+            avatar_manager: crate::session::avatar::AvatarManager::new(),
+            last_avatar_window_fingerprint: None,
+        }
+    }
+
+    /// Reach the daemon, from a window that already exists.
+    ///
+    /// Separate from [`Self::new`] because connecting is not instant on a
+    /// first launch: there is no daemon listening, so `connect_or_start`
+    /// starts one and polls for it, which is up to ten seconds. Done in the
+    /// constructor that was ten seconds with no window on screen at all —
+    /// the loading state cannot be drawn by the entity that is still being
+    /// built. Off the UI thread, exactly like the retry it shares.
+    pub fn start(&mut self, cx: &mut Context<Self>) {
+        self.retry_connection(cx);
+        self.pump_notification_activations(cx);
+    }
+
+    /// Deliver web-notification clicks to the conversation they name.
+    ///
+    /// The browser reports a click to a JS callback, not to GPUI's
+    /// notification-response path, so the callback queues the banner's tag
+    /// (see `platform::notifications`) and this task opens each queued tag
+    /// through the same [`Self::open_system_notification`] the desktop path
+    /// calls. One task for the window's whole life: the queue is empty until
+    /// a click lands, and a dropped view ends the loop. Away from the web the
+    /// queue never fills — clicks arrive through GPUI already — so the task
+    /// parks on the first wait and costs nothing.
+    fn pump_notification_activations(&mut self, cx: &mut Context<Self>) {
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            loop {
+                let tag = crate::platform::next_notification_activation().await;
+                let alive = cx.update(|cx| {
+                    let window = entity
+                        .update(cx, |app, _| app.notification_window)
+                        .unwrap_or(None);
+                    let Some(window) = window else {
+                        return false;
+                    };
+                    let _ = window.update(cx, |_, window, cx| {
+                        window.activate_window();
+                        let _ = entity.update(cx, |app, cx| {
+                            app.open_system_notification(&tag, window, cx);
+                        });
+                    });
+                    true
+                });
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    // ========== Responsive Layout ==========
+
+    /// The layout facts for this frame: the viewport, the mobile panel, and
+    /// the active design scale.
+    ///
+    /// Read once at the top of render and threaded down, so every component in
+    /// a frame agrees on the same breakpoint and the same metrics.
+    pub fn responsive_layout(&self, window: &Window, cx: &App) -> ResponsiveLayout {
+        ResponsiveLayout::new(
+            window.viewport_size(),
+            self.visible_panel(),
+            cx.product().metrics,
+        )
+        .with_panes(
+            self.sidebar_preference_rem,
+            self.shared_files_open
+                && self.destination.has_conversations()
+                && self.selected_destination_jid().is_some(),
+        )
+    }
+
+    /// Which panel a phone-width window is showing.
+    ///
+    /// Derived, not merely stored. A phone shows one panel at a time, and the
+    /// stored one is a record of where the *user* went — which can name the
+    /// conversation panel while there is no conversation in it: select a chat
+    /// on a wide window, close it, then narrow the window, and the phone
+    /// layout had a panel with nothing in it and no list to pick from. The
+    /// list is what a window falls back to, because it is the one panel that
+    /// is never empty of things to do.
+    fn visible_panel(&self) -> MobilePanel {
+        match self.mobile_panel {
+            MobilePanel::Chat if !self.has_something_to_show() => MobilePanel::ChatList,
+            panel => panel,
+        }
+    }
+
+    /// Whether the conversation panel has anything in it, whichever
+    /// destination the window is on.
+    fn has_something_to_show(&self) -> bool {
+        match self.destination {
+            Destination::Chats | Destination::Channels | Destination::Communities => {
+                self.selected_destination_jid().is_some()
+            }
+            Destination::Status => self.status_pane.is_open(),
+        }
+    }
+
+    /// Navigate back to chat list (for mobile)
+    pub fn navigate_back(&mut self, cx: &mut Context<Self>) {
+        self.mobile_panel = MobilePanel::ChatList;
+        // Keep an in-flight media download alive, but revoke its autoplay
+        // intent: its answer may arrive after this conversation is no longer
+        // on screen and must not start audio behind the chat list.
+        self.cancel_hidden_media_autoplay();
+        // Leaving the panel means leaving what was in it: a status left open
+        // would put the window straight back into it on the next layout,
+        // since the panel is derived from whether there is anything to show.
+        // Stopped before it is closed, and in that order — afterwards there
+        // is no way to ask which update was on screen, so a video went on
+        // decoding and playing behind the chat list.
+        self.leave_shown_status();
+        self.status_pane.close();
+        cx.notify();
+    }
+
+    /// Navigate to chat view (for mobile) - called when selecting a chat
+    fn navigate_to_chat(&mut self) {
+        self.mobile_panel = MobilePanel::Chat;
+    }
+
+    // ========== Render Caches ==========
+
+    /// Get or compute the chat list cache.
+    /// This avoids expensive recomputation of chat list data on every render.
+    /// Filters by search query if active. Item sizes are computed at render time
+    /// based on ResponsiveLayout.
+    pub fn get_chat_list_cache(&self, cx: &App) -> ChatListCache {
+        let mut cache = self.chat_list_cache.borrow_mut();
+
+        // Asked before anything is filtered, which is the whole of this: the
+        // filter walks every chat, and it used to run on every frame just to
+        // compare the count it produced. Both halves of this are O(1). The
+        // version is what every path that changes a preview (a receipt, a
+        // draft, a typing notice) already announces; the length is what
+        // catches a chat that reached the list without announcing anything.
+        //
+        // The walk itself no longer allocates either — `contains_ignore_case`
+        // folds as it goes rather than lowercasing a name and a JID into two
+        // `String`s per chat — which is what the *miss* path costs, and a
+        // search misses on every keystroke.
+        let version = self.chat_cache_version.get();
+        if let Some(cached) = cache.as_ref()
+            && cached.language == crate::i18n::Language::current()
+            && cached.version == version
+            && cached.chats_len == self.chats.len()
+        {
+            return cached.clone();
+        }
+
+        let query = self.search.read(cx).list_query();
+        let filtered: Vec<&Chat> = self
+            .conversations()
+            .filter(|chat| {
+                self.destination.matches(chat)
+                    && (if self.destination == Destination::Chats {
+                        self.chat_filter.matches(chat)
+                    } else {
+                        !chat.archived
+                    })
+            })
+            .collect();
+
+        let mut rows: Vec<ChatRow> = filtered
+            .into_iter()
+            .map(|chat| {
+                ChatRow::new(
+                    chat,
+                    self.presence.typing(&chat.jid),
+                    // The open chat's text lives in the composer, not the
+                    // draft map, so it would otherwise show as a stale draft.
+                    (self.selected_chat.as_deref() != Some(chat.jid.as_str()))
+                        .then(|| self.drafts.get(&chat.jid).map(String::as_str))
+                        .flatten(),
+                    self.is_own_number(&chat.jid),
+                )
+            })
+            .collect();
+        let mut rows = if self.destination == Destination::Communities {
+            chats::hierarchical_group_rows(&rows, query, &self.collapsed_communities)
+        } else {
+            rows.retain(|row| {
+                contains_ignore_case(&row.name, query) || contains_ignore_case(&row.jid, query)
+            });
+            rows
+        };
+        chat_row::disambiguate_names(&mut rows);
+        let rows: Arc<[ChatRow]> = rows.into();
+
+        let new_cache = ChatListCache {
+            version,
+            language: crate::i18n::Language::current(),
+            chats_len: self.chats.len(),
+            rows,
+        };
+
+        *cache = Some(new_cache.clone());
+        new_cache
+    }
+
+    /// How many conversations carry unread state, for the filter chip.
+    ///
+    /// Counted over every chat rather than the filtered view: the number has
+    /// to say what pressing `Unread` would reveal.
+    pub fn unread_chat_count(&self) -> usize {
+        self.unread_destination_count(Destination::Chats)
+    }
+
+    pub fn unread_destination_count(&self, destination: Destination) -> usize {
+        self.conversations()
+            .filter(|chat| destination.matches(chat) && ChatFilter::Unread.matches(chat))
+            .count()
+    }
+
+    /// The chats that are conversations.
+    ///
+    /// Every list of people to talk to goes through here, so the status
+    /// broadcast is excluded once rather than at each of them: it is not a
+    /// conversation, and it has [its own destination](Destination::Status).
+    fn conversations(&self) -> impl Iterator<Item = &Chat> {
+        self.chats
+            .iter()
+            .map(Arc::as_ref)
+            .filter(|chat| !chat.is_status)
+    }
+
+    pub fn selected_destination_jid(&self) -> Option<String> {
+        self.selected_chat
+            .as_ref()
+            .filter(|jid| {
+                self.chat_named(jid)
+                    .is_some_and(|chat| self.destination.matches(chat))
+                    && self
+                        .destination_selections
+                        .get(self.destination.id())
+                        .is_none_or(|selected| selected.as_ref() == Some(jid))
+            })
+            .cloned()
+    }
+
+    pub fn chat_filter(&self) -> ChatFilter {
+        self.chat_filter
+    }
+
+    /// Narrow the list. Changing the filter re-derives the rows, so the cache
+    /// has to go with it.
+    pub fn set_chat_filter(&mut self, filter: ChatFilter, cx: &mut Context<Self>) {
+        if self.chat_filter == filter {
+            return;
+        }
+        self.chat_filter = filter;
+        self.invalidate_chat_cache();
+        cx.notify();
+    }
+
+    /// Toggle the selected community when the chat list (not its search
+    /// input) owns focus. This keeps the disclosure action keyboard reachable
+    /// without turning a typed space into a list command.
+    pub fn toggle_selected_community(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let search_input = self.search.read(cx).list_input().cloned();
+        if search_input.is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window)) {
+            return;
+        }
+        let jid = {
+            let cache = self.chat_list_cache.borrow();
+            let Some(cache) = cache.as_ref() else {
+                return;
+            };
+            let Some(selected) = self.chat_list_selection_jid(cache) else {
+                return;
+            };
+            let Some(jid) = chats::selected_community_toggle(&cache.rows, &selected) else {
+                return;
+            };
+            jid
+        };
+        self.toggle_community(&jid, cx);
+    }
+
+    /// Expand or collapse a community by its stable JID.
+    pub fn toggle_community(&mut self, jid: &str, cx: &mut Context<Self>) {
+        if !self.collapsed_communities.remove(jid) {
+            self.collapsed_communities.insert(jid.to_string());
+        }
+        self.invalidate_chat_cache();
+        cx.notify();
+    }
+
+    /// Whether a search is currently narrowing the list, which is what makes
+    /// an empty list mean "no matches" rather than "no chats".
+    pub fn is_searching(&self, cx: &App) -> bool {
+        self.search.read(cx).narrowing_the_list()
+    }
+
+    /// The linked-device row at the foot of the sidebar.
+    ///
+    /// Present whenever this device is linked, whether or not the account has
+    /// a push name: gating the whole row on the name is what made a live
+    /// session read as "not linked".
+    pub fn account_summary(&self) -> Option<AccountSummary> {
+        if !self.is_linked() {
+            return None;
+        }
+        let connected = matches!(self.app_state, AppState::Connected);
+        Some(AccountSummary {
+            name: self
+                .account_name
+                .clone()
+                .or_else(|| self.account_jid.clone())
+                .unwrap_or_else(|| crate::tr!(ThisDevice).to_string()),
+            // Offline is a state the user chose, so it is named rather than
+            // described as a connection still being attempted.
+            status: match self.app_state {
+                AppState::Connected => crate::tr!(LinkedSynced).to_string(),
+                AppState::Offline | AppState::OfflineLoggedOut { .. } => {
+                    crate::tr!(LocalOffline).to_string()
+                }
+                _ => crate::tr!(LinkedReconnecting).to_string(),
+            },
+            is_healthy: connected,
+            // The account's own picture is its "You" chat's picture: the
+            // same fetched, cached image, not a second request.
+            avatar_key: self
+                .chats
+                .iter()
+                .find(|chat| self.is_own_number(&chat.jid))
+                .and_then(|chat| chat.avatar_cache_key.clone()),
+        })
+    }
+
+    /// Open or close Contact info / Group info for the open chat.
+    pub(crate) fn toggle_contact_info(&mut self, cx: &mut Context<Self>) {
+        if self.selected_chat.is_none() {
+            return;
+        }
+        self.contact_info_open = !self.contact_info_open;
+        if self.contact_info_open {
+            self.shared_files_open = false;
+            self.demand_member_avatars();
+        }
+        cx.notify();
+    }
+
+    /// Ask for the pictures of a group's members, for Group info.
+    ///
+    /// Only members this account also has a chat with: their picture has a
+    /// cache key to land under and a row that already knows how to show it.
+    /// Bounded, because a group can have a thousand members and the panel
+    /// shows the first screenful before anyone scrolls.
+    /// Ask for the pictures of the people whose updates the Status list
+    /// shows, the way a chat row asks for its own when it scrolls into view.
+    pub(crate) fn demand_status_avatars(&mut self) {
+        const MAX: usize = 60;
+        let feed = self.status_feed();
+        let demands: Vec<crate::session::avatar::ChatDemand> = feed
+            .authors()
+            .iter()
+            .filter_map(|author| self.find_chat(&author.jid))
+            .take(MAX)
+            .map(|chat| crate::session::avatar::ChatDemand {
+                jid: chat.jid.clone(),
+                picture_id: chat.avatar_picture_id.clone(),
+                cache_key: chat.avatar_cache_key.clone(),
+            })
+            .collect();
+        if demands.is_empty() {
+            return;
+        }
+        self.avatar_manager.demand_chats(&demands);
+        if let Some(session) = &self.client {
+            self.avatar_manager.flush_demands(session);
+        }
+    }
+
+    fn demand_member_avatars(&mut self) {
+        const MAX: usize = 60;
+        let Some(jid) = self.selected_chat.clone() else {
+            return;
+        };
+        let Some(roster) = self.group_rosters.get(&jid) else {
+            return;
+        };
+        let demands: Vec<crate::session::avatar::ChatDemand> = roster
+            .members
+            .iter()
+            .filter_map(|member| self.find_chat(&member.jid))
+            .take(MAX)
+            .map(|chat| crate::session::avatar::ChatDemand {
+                jid: chat.jid.clone(),
+                picture_id: chat.avatar_picture_id.clone(),
+                cache_key: chat.avatar_cache_key.clone(),
+            })
+            .collect();
+        if demands.is_empty() {
+            return;
+        }
+        self.avatar_manager.demand_chats(&demands);
+        if let Some(session) = &self.client {
+            self.avatar_manager.flush_demands(session);
+        }
+    }
+
+    /// The account's own number, when the session has said.
+    pub fn account_jid(&self) -> Option<&str> {
+        self.account_jid.as_deref()
+    }
+
+    /// Whether `jid` addresses this account's own number.
+    ///
+    /// Through the library's own comparison rather than a string match: the
+    /// account is announced as a JID with a device on it and the chat is keyed
+    /// without one, so the two never match outright, and `is_same_user_as` is
+    /// the rule that already knows which parts of a JID are its identity.
+    pub fn is_own_number(&self, jid: &str) -> bool {
+        let Ok(other) = jid.parse::<Jid>() else {
+            return false;
+        };
+        // Against both aliases, and on `user_base`: the account is announced
+        // as a device JID whose user part carries the device after a colon
+        // (`5599…:57`), and `is_same_user_as` compares that field raw — so the
+        // one comparison that had to succeed never did. The LID is here
+        // because the chat with your own number can be keyed by it while the
+        // account announces a phone number, and neither string matches the
+        // other.
+        [self.account_jid.as_deref(), self.account_lid.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|own| own.parse::<Jid>().ok())
+            .any(|own| own.user_base() == other.user_base())
+    }
+
+    /// Whether this device is paired at all.
+    ///
+    /// The states that mean "there is no account yet" are the ones that show
+    /// a QR code or an ended session; everything else is a linked device,
+    /// including one that is reconnecting or still syncing.
+    fn is_linked(&self) -> bool {
+        !matches!(
+            self.app_state,
+            AppState::WaitingForPairing { .. } | AppState::LoggedOut { .. }
+        )
+    }
+
+    /// Invalidate chat list cache (call when chats change or search changes)
+    ///
+    /// The status feed is derived from the same chats, so it goes with it: a
+    /// second cache that outlived the first would draw a run of updates that
+    /// no longer matches the messages behind it.
+    fn invalidate_chat_cache(&self) {
+        self.chat_cache_version
+            .set(self.chat_cache_version.get().wrapping_add(1));
+        *self.chat_list_cache.borrow_mut() = None;
+        *self.status_feed_cache.borrow_mut() = None;
+    }
+
+    // ========== Message List Cache ==========
+
+    /// The timeline's rows for a chat, rebuilt only when they changed.
+    ///
+    /// Also keeps `message_list` pointing at them: the list holds one row
+    /// count and one set of measurements, so it has to learn about a row
+    /// appearing at the same moment the rows do. Appending splices — which
+    /// keeps the reader where they were — and anything else resets, which
+    /// lands them at the newest message.
+    /// The chat is named rather than handed over, and that is the whole
+    /// point: this needs the app mutably, so a caller holding a `&Chat`
+    /// cannot call it — and the way round that was to clone the chat, every
+    /// frame, with every `ChatMessage` in it. Scrolling a conversation of
+    /// five thousand messages copied five thousand strings, reaction maps and
+    /// quotes per frame for a reader that only ever looks at the timeline
+    /// cache.
+    pub fn get_message_list_cache(
+        &mut self,
+        chat_jid: &str,
+        typing: Option<TypingSummary>,
+        layout: ResponsiveLayout,
+        cx: &mut App,
+    ) -> MessageListCache {
+        let rows = {
+            let Some(chat) = self.find_chat(chat_jid) else {
+                return MessageListCache::new(&[], false, typing);
+            };
+            let (messages, is_group) = (chat.messages.as_slice(), chat.is_group);
+            let cached = {
+                let cache = self.message_list_cache.borrow();
+                cache
+                    .get(chat_jid)
+                    .filter(|cached| cached.is_valid_for(messages.len(), is_group, typing.as_ref()))
+                    .cloned()
+            };
+            cached.unwrap_or_else(|| {
+                let built = MessageListCache::new(messages, is_group, typing);
+                let mut cache = self.message_list_cache.borrow_mut();
+                cache.insert(chat_jid.to_string(), built.clone());
+                evict_stale_timelines(&mut cache, chat_jid);
+                built
+            })
+        };
+
+        // Asked before the rows are handed over, because the question is
+        // about the frame that was drawn: a splice replaces measurements with
+        // unmeasured rows, and a list asked in between reports a height that
+        // is missing whatever has not been laid out yet. Asked from here at
+        // all because this is the frame's one pass over the timeline and it
+        // already holds the list.
+        if timeline_may_page(
+            self.visible_chat.as_deref(),
+            self.timeline_anchor
+                .as_ref()
+                .map(|anchor| anchor.jid.as_str()),
+            chat_jid,
+        ) && self.timeline_nearing_start()
+        {
+            self.want_older_messages(chat_jid, cx);
+        }
+
+        self.sync_timeline(
+            chat_jid,
+            &rows,
+            MeasuredAgainst {
+                language: crate::i18n::Language::current(),
+                rem: layout.metrics().rem_size(),
+                width: layout.message_list_width(),
+            },
+        );
+        rows
+    }
+
+    /// Whether the reader is close enough to the head of the timeline to want
+    /// the page before it.
+    ///
+    /// The decision is [`paging::timeline_nearing_start`]; this is where the
+    /// list is asked the three things it needs. "Can it scroll" is the one
+    /// `gpui` has no plainer name for: the largest offset the list will accept
+    /// is zero exactly when its rows fit inside it.
+    fn timeline_nearing_start(&self) -> bool {
+        paging::timeline_nearing_start(
+            self.message_list.logical_scroll_top().item_ix,
+            self.message_list.item_count(),
+            self.message_list.max_offset_for_scrollbar().y > gpui::px(0.),
+        )
+    }
+
+    /// Tell the list what its rows are now, in the way that preserves the
+    /// most.
+    ///
+    /// The list keeps one measured height per row index, so what it is told
+    /// has to match what actually changed. A count on its own cannot say: a
+    /// history backfill inserts older messages *before* the head and raises
+    /// the count doing it, which read as an append and spliced the new rows
+    /// in at the wrong end; and a row that changes height without the count
+    /// moving — an image arriving, a reaction, a revoke, a failed send
+    /// growing its retry button — read as nothing having happened at all,
+    /// leaving bubbles measured at a size they no longer are.
+    ///
+    /// So the question is asked of the rows: are the ones the list measured
+    /// still those rows? The last of them is what answers it. An append
+    /// leaves that row where it was; a prepend, a removal, and a row landing
+    /// in the *middle* — a system notice stamped in the past, a backfilled
+    /// message newer than the head but older than the tail — all push it
+    /// along, and all of those raise the count exactly as an arrival does.
+    /// Comparing the first row instead saw none of the middle three.
+    fn sync_timeline(
+        &mut self,
+        chat_jid: &str,
+        rows: &MessageListCache,
+        measured: MeasuredAgainst,
+    ) {
+        let count = rows.items.len();
+        let previous = self.timeline_anchor.take();
+
+        match timeline_sync(previous.as_ref(), chat_jid, rows, measured) {
+            // One stretch of rows for another, leaving every measurement
+            // outside it in place — and the reader with it, since a
+            // bottom-anchored list is moved by neither a page arriving above
+            // nor a message arriving below. Reset instead, and a reader who
+            // scrolled back far enough to ask for more was thrown to the
+            // newest message for asking.
+            TimelineSync::Spliced { at, removed, added } => {
+                // Where the reader is, before the splice moves them. `gpui`
+                // carries a scroll top *past* the replaced stretch along by
+                // what the splice did, but one that fell *inside* it has no
+                // row to be carried to and is pinned to the front of the new
+                // stretch instead — which for a page of older history is its
+                // oldest message. A reader who asked for one page by reaching
+                // the top of the last was thrown to the top of the new one,
+                // where they were near the start again and so asked for
+                // another: history unrolled under them for as long as the
+                // store had any. The row after the stretch is the one they
+                // were actually looking at, and it is where they belong.
+                //
+                // Only while there *is* one. A frame that carries a page and
+                // a change to the last row — someone starting to type, an
+                // arrival — has nothing in common at the end, so the stretch
+                // runs to the foot of the list and `at + added` is the row
+                // past it: the correction would land the reader at the newest
+                // message, which is further from where they were than gpui's
+                // own answer. Nothing here can say where they went, so
+                // nothing here overrides it.
+                let scrolled_to = self.message_list.logical_scroll_top();
+                let survivor = (at + added < count).then_some(at + added);
+                let anchor = survivor.filter(|_| (at..at + removed).contains(&scrolled_to.item_ix));
+                self.message_list.splice(at..at + removed, added);
+                if let Some(item_ix) = anchor {
+                    self.message_list.scroll_to(gpui::ListOffset {
+                        item_ix,
+                        offset_in_item: gpui::px(0.),
+                    });
+                }
+                // Only while the measurements outside it still describe those
+                // rows: a window resized in the same frame is one where they
+                // do not, and a splice keeps every one of them.
+                if previous.as_ref().is_some_and(|a| a.measured != measured) {
+                    self.message_list.remeasure();
+                }
+            }
+            // Something is a different size now; remeasure rather than reset,
+            // which keeps the reader where they were.
+            TimelineSync::Remeasure => self.message_list.remeasure(),
+            TimelineSync::Reset => self.message_list.reset(count),
+            TimelineSync::Nothing => {}
+        }
+
+        self.timeline_anchor = Some(TimelineAnchor {
+            jid: chat_jid.to_string(),
+            measured,
+            rows: rows.clone(),
+        });
+    }
+
+    /// Invalidate message list cache for a chat (call when messages change)
+    /// Drop a chat's rendered timeline, and anything derived from it.
+    ///
+    /// `&mut self` because an open conversation search is derived from those
+    /// same messages: every caller here is announcing that the chat's history
+    /// changed, which is exactly when the search's matches stop describing it.
+    fn invalidate_message_cache(&mut self, chat_jid: &str, cx: &mut App) {
+        if self.selected_chat.as_deref() == Some(chat_jid)
+            && let Some(window) = self.modal_window
+        {
+            let selected_messages =
+                crate::components::rich_text_selection::active_selection_message_snapshots(
+                    window.window_id(),
+                    cx,
+                );
+            let selection_is_stale = if selected_messages.is_empty() {
+                false
+            } else {
+                let cache = self.message_list_cache.borrow();
+                match self.find_chat(chat_jid) {
+                    Some(current) => {
+                        let current_by_id: HashMap<&str, (usize, &ChatMessage)> = current
+                            .messages
+                            .iter()
+                            .enumerate()
+                            .map(|(index, message)| (message.id.as_str(), (index, message)))
+                            .collect();
+                        let previous_by_id: Option<HashMap<&str, &ChatMessage>> =
+                            cache.get(chat_jid).map(|previous| {
+                                previous
+                                    .messages
+                                    .iter()
+                                    .map(|message| (message.id.as_str(), message.as_ref()))
+                                    .collect()
+                            });
+                        selected_messages.iter().any(
+                            |(selection, selected_text, selected_order)| {
+                                let Some((current_order, message)) =
+                                    current_by_id.get(selection.message_id.as_ref())
+                                else {
+                                    return true;
+                                };
+                                let Some(source) = selection.source_text(message) else {
+                                    return true;
+                                };
+                                selection.document_order(*current_order) != *selected_order
+                                    || crate::components::BubbleText::of(source).text()
+                                        != selected_text.as_ref()
+                                    || previous_by_id.as_ref().is_some_and(|previous| {
+                                        previous.get(selection.message_id.as_ref()).is_none_or(
+                                            |old| selection.source_text(old) != Some(source),
+                                        )
+                                    })
+                            },
+                        )
+                    }
+                    None => true,
+                }
+            };
+            if selection_is_stale {
+                let _ = window.update(cx, |_, window, cx| {
+                    clear_window_message_selection(window, cx);
+                });
+            }
+        }
+        self.message_list_cache.borrow_mut().remove(chat_jid);
+        self.refresh_conversation_search(chat_jid, cx);
+        self.refresh_media_viewer(chat_jid, cx);
+        // The status feed is a second view of one chat's messages, and its
+        // own guard — the message count — cannot see a message *changing*.
+        if Self::is_status_jid(chat_jid) {
+            *self.status_feed_cache.borrow_mut() = None;
+        }
+    }
+
+    /// Record what this frame draws as the conversation. See
+    /// [`Self::visible_chat`].
+    ///
+    /// Also where a conversation asks for its history: a chat is *on screen*
+    /// exactly when its timeline needs filling, and the frame that draws it
+    /// is the one place that knows which chat that is — the selection can
+    /// name a chat the window is not showing (Settings is up, the reader is
+    /// in Status). Leaving that visible conversation clears its message-text
+    /// selection so the hidden pane cannot keep answering Copy.
+    pub fn note_visible_conversation(
+        &mut self,
+        jid: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .retained_chat
+            .as_deref()
+            .is_some_and(|previous| jid.as_deref() != Some(previous))
+            && gpui_base::TextSelection::has_selection(window, cx)
+        {
+            clear_window_message_selection(window, cx);
+        }
+        if let Some(jid) = &jid {
+            self.ensure_timeline_page(jid, cx);
+        }
+        // Moving to *another* conversation is the moment the last one's media
+        // stops being anything anybody can see, and the one signal a front
+        // end has that a row is off screen. Compared against
+        // [`Self::retained_chat`] rather than the field below, which the
+        // render pass clears at the top of every frame: against that, every
+        // frame would look like a move and sweep the whole account.
+        let moved = jid.is_some() && self.retained_chat != jid;
+        if jid.is_some() {
+            self.retained_chat.clone_from(&jid);
+        }
+        self.visible_chat = jid;
+        self.resume_visible_read(cx);
+        if moved {
+            self.sweep_retained_media(cx);
+        }
+    }
+
+    fn observe_window_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.account_window = Some(window.window_handle());
+        if self.window_activation.is_some() {
+            return;
+        }
+        // GPUI's `active_window` is the application's main window on macOS,
+        // which can remain this window while another application is in front.
+        // Only the key window is actually receiving input and may claim that
+        // its visible conversation was read.
+        self.window_focused = window.is_window_active();
+        self.window_activation = Some(cx.observe_window_activation(window, |app, window, cx| {
+            let focused = window.is_window_active();
+            if app.window_focused == focused {
+                return;
+            }
+            app.window_focused = focused;
+            if focused {
+                app.resume_visible_read(cx);
+            }
+            cx.notify();
+        }));
+    }
+
+    fn resume_visible_read(&mut self, cx: &mut Context<Self>) {
+        if !chat_read_can_be_committed(
+            self.window_focused,
+            crate::platform::application_is_active(),
+            self.client.is_some(),
+        ) {
+            return;
+        }
+        let Some(client) = self.client.as_ref() else {
+            return;
+        };
+        let Some(jid) = self.visible_chat.clone() else {
+            return;
+        };
+        let owed = self.owed_reads.contains(&jid);
+        let Some(chat) = self
+            .find_chat(&jid)
+            .filter(|chat| chat_read_needs_resume(chat, owed))
+        else {
+            return;
+        };
+        let ReadBound::Now(newest) = read_bound(chat) else {
+            self.owed_reads.insert(jid);
+            return;
+        };
+        client.mark_chat_read(&jid, newest);
+        self.owed_reads.remove(&jid);
+        if let Some(chat) = self.find_chat_mut(&jid) {
+            chat.mark_as_read();
+        }
+        self.invalidate_chat_cache();
+        self.invalidate_message_cache(&jid, cx);
+    }
+
+    /// Whether the chat list this frame draws has no rows in it at all.
+    ///
+    /// Asked by the frame rather than by the list component: the virtual list
+    /// that pages the sidebar is not built when there is nothing to put in
+    /// it, so the one list that most needs another page — a filter matching
+    /// nothing yet — would be the one list that never asks for one.
+    pub fn chat_list_is_empty(&self, cx: &App) -> bool {
+        self.get_chat_list_cache(cx).rows.is_empty()
+    }
+
+    /// Record which keyboard surfaces this frame drew. See
+    /// [`KeyboardSurfaces`].
+    pub fn note_keyboard_surfaces(&mut self, surfaces: KeyboardSurfaces) {
+        self.keyboard_surfaces = surfaces;
+    }
+
+    /// Drop everything this window learned from the account it is leaving.
+    ///
+    /// Not only the chats. Anything keyed by a JID or a message id belongs to
+    /// the account that produced it, and the next account can share those
+    /// keys: a group survives a re-pair, and a contact certainly does. A
+    /// draft is the one that bites — text composed under the old account
+    /// reappearing in the composer of the new one, ready to be sent to
+    /// someone it was never written for.
+    fn clear_account_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.calls_open = false;
+        self.call_history_view = None;
+        // The microphone and the speaker belong to the account too. This is
+        // the same departure a disconnect or a logout makes — the connected
+        // view is going away — and skipping it left capture running with no
+        // controls to stop it, and an encode that could still finish, pass an
+        // epoch nothing had bumped, and send the old account's note from the
+        // newly paired one.
+        self.leave_connected_view(Some(window), cx);
+        self.incoming_file_epoch = self.incoming_file_epoch.wrapping_add(1);
+        self.incoming_file_reading = false;
+        self.paste_preview = None;
+        self.delete_confirmation = None;
+        self.pending_attachment_previews.clear();
+        self.notified_messages.clear();
+        crate::platform::clear_notifications();
+        self.pending_notification_tags.clear();
+        self.latest_notification_tag = None;
+        self.notification_retry_task = None;
+        self.notification_retry_backoff = NOTIFICATION_PAGE_RETRY_DELAY;
+        // A call is account state as much as a chat is. See
+        // [`calls_ctl::Calls::forget`].
+        self.calls.update(cx, |calls, cx| calls.forget(cx));
+        // And the notices, which are drawn by the root over every screen and
+        // so outlive the view they were raised in. "That recording could not
+        // be sent" is about an account that has gone, shown to whoever pairs
+        // next, and a reset is a departure rather than a clear.
+        self.notices.update(cx, |notices, _| notices.forget());
+        // What the *old* account occupied, and the query that is still
+        // measuring it. See [`settings::Settings::forget`].
+        self.settings.update(cx, |settings, cx| settings.forget(cx));
+        // A plugin's boxes are the departing account's too. See
+        // [`plugins_ctl::Plugins::forget`].
+        self.plugins.update(cx, |plugins, cx| plugins.forget(cx));
+        self.chats.clear();
+        self.collapsed_communities.clear();
+        self.selected_chat = None;
+        self.visible_chat = None;
+        self.retained_chat = None;
+        self.departed_chats.clear();
+        self.archived_scan.clear();
+        // The cursors describe positions in one account's store; the next
+        // account's rows are not behind them.
+        self.forget_paging(cx);
+        self.owed_reads.clear();
+        self.attempted_poll_votes.clear();
+        // The reader is a selection too, and a JID-keyed one. Left alone, it
+        // pointed the new account at the old account's contact: at their
+        // updates if that contact exists there — watched by nobody in this
+        // account — and otherwise at an empty reader which, on a phone, is
+        // the whole screen with no way back out of it.
+        self.status_pane.close();
+        self.destination = Destination::default();
+        self.destination_selections.clear();
+        self.message_list_cache.borrow_mut().clear();
+        self.chat_list_cache.borrow_mut().take();
+        self.status_feed_cache.borrow_mut().take();
+        self.decoded_images.borrow_mut().clear();
+        self.avatar_manager.clear();
+        self.avatar_manager.set_session(None);
+        self.last_avatar_window_fingerprint = None;
+        let _ = crate::session::avatar::rotate_account_scope();
+        self.sticker_validation.borrow_mut().clear();
+        self.timeline_anchor = None;
+        // Composed text, and the reply bar it may be answering.
+        self.edit_generation = self.edit_generation.wrapping_add(1);
+        self.edit_draft = None;
+        self.pending_edits.clear();
+        self.drafts.clear();
+        self.reply_to = None;
+        if let Some(input) = self.input_area.clone() {
+            input.update(cx, |view, cx| {
+                view.set_reply(None, cx);
+                view.set_edit_state(false, false, cx);
+                view.swap_text("", window, cx);
+            });
+        }
+        // Names, watched updates, notices with nowhere to go yet. Presence
+        // and the composing state left with `leave_connected_view`, above.
+        self.name_cache.clear();
+        // Group membership is the departing account's view of who is where,
+        // and the asks still out belong to a connection that is going.
+        self.group_rosters.clear();
+        self.rosters_in_flight.clear();
+        self.watched_status.clear();
+        self.pending_notices.clear();
+        // Anything mid-flight against a message id that is about to be gone.
+        // Playback itself is already stopped, above.
+        self.video_players.clear();
+        self.downloads_in_flight.clear();
+        self.channel_preview_attempts.clear();
+        self.image_downloads_in_flight.clear();
+        self.saved_documents.clear();
+        self.document_downloads_in_flight.clear();
+        self.document_state_generation = self.document_state_generation.wrapping_add(1);
+        // The viewer names a chat and a message in it, both of which have
+        // just gone; and both searches were typed against a list and a
+        // conversation this account no longer has.
+        self.viewer.update(cx, |viewer, cx| {
+            viewer.close(cx);
+        });
+        self.search.update(cx, |search, cx| search.forget(cx));
+    }
+
+    /// Stop transient controls tied to a live connection when it goes away.
+    ///
+    /// The controls that stop them are drawn by that view, so anything still
+    /// running when it is replaced has no way to be stopped: a recording
+    /// holds the microphone open, ticks every 100ms and grows a buffer, and
+    /// a voice note plays on over a screen that is now an error message.
+    /// A disconnect keeps cached history on screen in [`AppState::Offline`],
+    /// while an error or logout replaces it. In all three cases, controls
+    /// whose work belongs to the live connection must stop here.
+    fn leave_connected_view(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        self.calls.update(cx, |calls, cx| calls.silence_alerts(cx));
+        // The window-scoped text selection outlives the conversation's rows.
+        // Clear it with the rest of the connected view so Copy cannot expose
+        // hidden message text after a disconnect, error, or logout. Account
+        // teardown already has the Window; other transitions use its handle.
+        if let Some(window) = window {
+            clear_window_message_selection(window, cx);
+        } else if let Some(window) = self.modal_window {
+            let _ = window.update(cx, |_, window, cx| {
+                clear_window_message_selection(window, cx);
+            });
+        }
+        self.delete_confirmation = None;
+        self.pending_message_actions.clear();
+        if self.recorder.read(cx).state() != RecordingState::Idle {
+            self.cancel_recording(cx);
+        }
+        self.stop_current_media();
+        // Who was around was true of the connection that has just ended. A
+        // typing notice expires on its own, but `Availability::Online` has no
+        // TTL — nothing but another presence event ever takes it down, and
+        // that event is exactly what a dropped connection stops delivering.
+        // The header went on saying a contact was online for as long as the
+        // window stayed open.
+        self.presence = PresenceRegistry::new();
+        // The composer may have said this window was typing. `composing_chat`
+        // names a chat in the account being left, and the view's own timeout
+        // would send its `paused` down whatever session comes next — after
+        // swallowing the first keystroke there as an already-live
+        // composition.
+        self.composing_chat = None;
+        if let Some(input) = self.input_area.clone() {
+            input.update(cx, |view, _| view.reset_typing());
+        }
+    }
+
+    /// Put the caret where typing goes.
+    ///
+    /// Also the place focus comes back to when a transient surface gives it
+    /// up: a blurred handle leaves the window with no keyboard target at
+    /// all, which reads as a window that stopped listening.
+    pub(super) fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Putting the caret in the composer *is* the statement that typing
+        // goes here now, so the owner model records it here rather than at
+        // each of the three callers — a reply begun, a chat opened to talk
+        // to, the sync handing it back.
+        self.keyboard_intent = ChatOpen::ToCompose;
+        if let Some(input_area) = self.input_area.clone() {
+            // Read the handle out before focusing: `focus` needs `&mut App`
+            // and `read` holds `cx` borrowed for as long as its result lives.
+            let handle = input_area.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+    }
+
+    /// Re-resolve an open media viewer against the chat's current messages.
+    ///
+    /// The viewer names the picture it is showing and resolves it on every
+    /// frame, so a revoke behind it left a modal that drew nothing and still
+    /// swallowed the Escape meant to close it — a window that had stopped
+    /// responding, as far as anyone looking at it could tell. Reconciled here
+    /// because this is the announcement that a chat's history changed, which
+    /// is the whole set of ways a picture can stop existing.
+    fn refresh_media_viewer(&mut self, chat_jid: &str, cx: &mut App) {
+        if self.viewer.read(cx).jid() != Some(chat_jid) {
+            return;
+        }
+        let messages = self
+            .find_chat(chat_jid)
+            .map(|chat| chat.messages.as_slice());
+        self.viewer
+            .update(cx, |viewer, cx| viewer.reconcile(messages, cx));
+    }
+
+    /// Re-run an open conversation search over the chat's current messages.
+    ///
+    /// The matches were rebuilt only when the *query* changed, so a message
+    /// arriving, a history merge, an edit or a revoke left the count and the
+    /// navigation describing a conversation that had moved on — with no way
+    /// to correct it but to retype the query. Called from every path that
+    /// invalidates a chat's timeline, which is the same set of changes.
+    fn refresh_conversation_search(&mut self, chat_jid: &str, cx: &mut App) {
+        if !self.search.read(cx).stale_for(chat_jid) {
+            return;
+        }
+        let Some(chat) = self.find_chat(chat_jid) else {
+            return;
+        };
+        self.search
+            .update(cx, |search, cx| search.refresh_open(&chat.messages, cx));
+    }
+
+    // ========== Accessors ==========
+
+    /// Check if the client is connected
+    pub(crate) fn is_connected(&self) -> bool {
+        matches!(self.app_state, AppState::Connected)
+    }
+
+    /// Whether this window can send anything at all.
+    ///
+    /// The composer, the call buttons and the recorder all hang off this: in
+    /// [`AppState::Offline`] the history is readable and nothing else, and a
+    /// control that accepted input there would produce a message with nowhere
+    /// to go.
+    pub fn can_send(&self) -> bool {
+        self.is_connected()
+    }
+
+    /// Whether the conversation is covered by the send-confirmation modal.
+    pub fn paste_preview_showing(&self) -> bool {
+        self.paste_preview.is_some()
+    }
+
+    /// Whether the user chose to stop waiting and read what is here.
+    pub fn is_offline(&self) -> bool {
+        matches!(
+            self.app_state,
+            AppState::Offline | AppState::OfflineLoggedOut { .. }
+        )
+    }
+
+    /// Get the selected chat JID
+    pub fn selected_chat_jid(&self) -> Option<String> {
+        self.selected_chat.clone()
+    }
+
+    /// The message whose quick-react strip is open, if any.
+    pub fn reaction_picker_for(&self) -> Option<&str> {
+        self.reaction_picker_for.as_deref()
+    }
+
+    /// Get the currently selected chat data
+    /// One chat by address, for a frame that named it rather than holding it.
+    pub fn chat_named(&self, jid: &str) -> Option<&Chat> {
+        self.find_chat(jid).map(std::convert::AsRef::as_ref)
+    }
+
+    /// Whether this window holds the chat at `jid`.
+    pub fn has_chat(&self, jid: &str) -> bool {
+        self.find_chat(jid).is_some()
+    }
+
+    /// What the conversation at `chat_jid` calls the author of `message`.
+    ///
+    /// Here rather than at the call site because the caller has the address
+    /// and not the chat: holding the chat means borrowing this across the
+    /// decoding the same frame does, which is what the whole-conversation
+    /// clone existed to avoid.
+    pub fn author_label(&self, chat_jid: Option<&str>, message: &ChatMessage) -> String {
+        chat_jid
+            .and_then(|jid| self.chat_named(jid))
+            .and_then(|chat| {
+                chat.author_name(message)
+                    .map(str::to_owned)
+                    .or_else(|| Some(chat.name.clone()))
+            })
+            // No chat to ask: the row still knows who wrote it, and answers
+            // the way its own bubble would.
+            .unwrap_or_else(|| message.author_label().into_owned())
+    }
+
+    pub fn selected_chat_data(&self) -> Option<&Arc<Chat>> {
+        self.selected_chat
+            .as_ref()
+            .and_then(|jid| self.find_chat(jid))
+    }
+
+    /// Find a chat by JID (immutable)
+    pub(crate) fn find_chat(&self, jid: &str) -> Option<&Arc<Chat>> {
+        self.chats.iter().find(|c| c.jid == jid)
+    }
+
+    /// Find a chat by JID (mutable)
+    fn find_chat_mut(&mut self, jid: &str) -> Option<&mut Chat> {
+        self.chats
+            .iter_mut()
+            .find(|c| c.jid == jid)
+            .map(Arc::make_mut)
+    }
+
+    /// Add a message to a chat, bumping it to the top of the list only when
+    /// the message actually advances the chat (duplicates and older backfills
+    /// leave the ordering alone).
+    /// Returns true if the chat was found and updated, false otherwise.
+    fn add_message_to_chat(&mut self, jid: &str, message: ChatMessage, cx: &mut App) -> bool {
+        if let Some(index) = self.chats.iter().position(|c| c.jid == jid) {
+            if Arc::make_mut(&mut self.chats[index]).add_message(message) {
+                self.reposition_chat(index);
+            }
+            // Always invalidate chat cache since the chat's content changed
+            // (even if it didn't move, the last message preview needs updating)
+            self.invalidate_chat_cache();
+            // Also invalidate message cache for this chat
+            self.invalidate_message_cache(jid, cx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Make sure there is a conversation for `jid` to put a row in.
+    ///
+    /// A call is the one thing that can name a peer this window has never had
+    /// a conversation with — a first-time caller, or a stranger — and
+    /// [`Self::add_message_to_chat`] answers "no such chat" by dropping the
+    /// row. That silently discarded every declined, missed and completed
+    /// record for such a call, badge included, so once the card went away
+    /// nothing said the phone had rung. The inbound-message path already
+    /// creates a chat for a sender it has not seen; this is the same rule for
+    /// the caller.
+    ///
+    /// Live-only, so a later complete store load leaves it alone rather than
+    /// pruning it as a chat that was deleted elsewhere.
+    fn ensure_chat(&mut self, jid: &str) {
+        if self.chats.iter().any(|chat| chat.jid == jid) {
+            return;
+        }
+        let chat = match self.name_cache.get(jid) {
+            Some(name) => Chat::with_name(jid.to_string(), name.clone()),
+            None => Chat::new(jid.to_string()),
+        };
+        // Into its sidebar slot, not index 0: a fresh chat carries no pin
+        // and no head, so it sorts at the end until traffic moves it.
+        let chat = Arc::new(chat);
+        let target = slot_for_chat(&self.chats, &chat);
+        self.chats.insert(target, chat);
+        self.invalidate_chat_cache();
+    }
+
+    /// Drop the chats a complete load said were gone, now that nobody is
+    /// looking at them.
+    ///
+    /// See [`Self::departed_chats`]. Deferred rather than skipped: the
+    /// deletion is a fact from the moment the complete load arrived, and the
+    /// only reason to keep the rows is that someone is reading them.
+    ///
+    /// Called from the render pass, straight after
+    /// [`Self::note_visible_conversation`] and before anything reads the chat
+    /// list — so it answers against *this* frame's visibility rather than the
+    /// last one's. Every way of looking away is already accounted for there:
+    /// Status, Settings, the viewer, another conversation, a phone going back
+    /// to its list. Asking a frame earlier meant a mobile Back deferred the
+    /// removal one last time and then drew the list with the stale row still
+    /// in it, with no repaint scheduled to take it away.
+    pub(crate) fn prune_departed_chats(&mut self, cx: &mut App) {
+        if self.departed_chats.is_empty() {
+            return;
+        }
+        let visible = self.visible_chat.clone();
+        let gone: Vec<String> = self
+            .departed_chats
+            .iter()
+            .filter(|jid| visible.as_deref() != Some(jid.as_str()))
+            .cloned()
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        for jid in &gone {
+            self.departed_chats.remove(jid);
+        }
+        self.chats.retain(|chat| !gone.contains(&chat.jid));
+        {
+            // Keyed by JID alone, so a recreated chat would otherwise inherit
+            // the removed one's rows. See the same eviction on the load path.
+            let mut cache = self.message_list_cache.borrow_mut();
+            for jid in &gone {
+                cache.remove(jid);
+            }
+        }
+        // For the same reason, and it is the stronger one here: a paging
+        // position outliving its chat is a conversation that never asks for
+        // its history again.
+        self.forget_chat_paging(&gone, cx);
+        for jid in &gone {
+            // A read owed by a chat that has left is a read nobody is waiting
+            // for. Kept, it is spent by the first merge that brings the chat
+            // back — archived elsewhere and unarchived months later — and
+            // marks messages nobody has looked at, which is the opposite of
+            // what a read is bounded by.
+            self.owed_reads.remove(jid);
+            // And a draft for a conversation that is gone has nowhere to be
+            // typed, let alone sent.
+            self.drafts.remove(jid);
+        }
+        self.forget_missing_selection(cx);
+        // The viewer names a chat and a message in it, and resolves them every
+        // frame: one left open over a chat that has just gone draws nothing,
+        // keeps the keyboard, and swallows the Escape meant to close it.
+        self.viewer
+            .update(cx, |viewer, cx| viewer.close_if_about_any(&gone, cx));
+        self.invalidate_chat_cache();
+    }
+
+    /// Drop a selection that no longer names a chat.
+    ///
+    /// The conversation pane resolves the selection every frame, so one left
+    /// pointing at a deleted chat draws the empty state — and on a phone that
+    /// is the whole screen, with the Back button belonging to a conversation
+    /// that is not there.
+    fn forget_missing_selection(&mut self, cx: &mut App) {
+        if self
+            .selected_chat
+            .as_deref()
+            .is_some_and(|jid| !self.chats.iter().any(|chat| chat.jid == jid))
+        {
+            if let Some(window) = self.modal_window {
+                let _ = window.update(cx, |_, window, cx| {
+                    clear_window_message_selection(window, cx);
+                });
+            }
+            self.selected_chat = None;
+        }
+    }
+
+    /// Move a chat to where it belongs in the sidebar order.
+    ///
+    /// The one answer for every arrival, live traffic included. "Advanced" is
+    /// a fact about that chat and not about the list: a catch-up drain after
+    /// a reconnect delivers conversations in whatever order the socket had
+    /// them, and dropping each at index 0 as it arrived left the sidebar in
+    /// arrival order — until the next history load sorted it, with the rows
+    /// jumping under the reader's finger. A held system notice is the same
+    /// case from the other direction: replayed after a load, it carries the
+    /// clock it arrived with, so it can advance its own conversation and
+    /// still be older than another chat's head.
+    ///
+    /// Pinned chats keep their pin grouping here exactly as the merge sort
+    /// does: an unpinned chat with a newer head does not stand above an
+    /// older pinned one. `None` heads sort last, which is where the merge
+    /// sort puts a chat with nothing in it.
+    fn reposition_chat(&mut self, index: usize) {
+        if index >= self.chats.len() {
+            return;
+        }
+        let chat = self.chats.remove(index);
+        let target = slot_for_chat(&self.chats, &chat);
+        self.chats.insert(target, chat);
+        // Note: chat cache invalidation is handled by the caller
+    }
+
+    /// Get the chat list scroll handle
+    /// The Status sidebar's scroll handle, which is also what its scrollbar
+    /// paints itself over.
+    pub fn status_list_scroll(&self) -> &gpui::ScrollHandle {
+        &self.status_list_scroll
+    }
+
+    pub fn chat_list_scroll(&self) -> &VirtualListScrollHandle {
+        &self.chat_list_scroll
+    }
+
+    /// The conversation's list state.
+    pub fn message_list(&self) -> &ListState {
+        &self.message_list
+    }
+
+    /// Put the reader at the foot of the conversation.
+    ///
+    /// Rarely needed: the list is anchored at the bottom, so it is already
+    /// there unless the reader scrolled away. This is for after *they* did
+    /// something — sending, or finishing a recording — where following the
+    /// message down is what they expect.
+    fn scroll_to_last_message(&self) {
+        let count = self.message_list.item_count();
+        if count > 0 {
+            self.message_list.scroll_to_reveal_item(count - 1);
+        }
+    }
+
+    /// Back to the newest message, from the button that shows while the
+    /// reader is scrolled up.
+    pub(crate) fn jump_to_latest(&mut self, cx: &mut Context<Self>) {
+        self.scroll_to_last_message();
+        self.away_from_latest = false;
+        cx.notify();
+    }
+
+    /// Get the isolated input area view entity
+    pub fn input_area(&self) -> Option<Entity<InputAreaView>> {
+        self.input_area.clone()
+    }
+
+    pub fn chat_list_focus(&self) -> &FocusHandle {
+        &self.chat_list_focus
+    }
+
+    /// The sidebar's search field, when one has been built.
+    pub fn chat_search_input<'a>(&self, cx: &'a App) -> Option<&'a Entity<InputState>> {
+        self.search.read(cx).list_input()
+    }
+
+    /// Make sure the sidebar has a field to type a filter into.
+    ///
+    /// Built here rather than inside [`search::Search`], and subscribed to
+    /// here too, because that is what makes typing in it safe: a
+    /// subscription's handler is given its own entity leased out of the map,
+    /// so one registered on the search that called back into the window —
+    /// which answers by updating the search — would take a second lease of
+    /// one entity, and gpui panics on that rather than papering over it. The
+    /// box is the window's; where what is typed in it *goes* is the search's.
+    pub fn ensure_chat_search_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_component::input::InputEvent;
+
+        if self.search.read(cx).list_input().is_some() {
+            return;
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(crate::tr!(SearchChats)));
+        cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
+            if let InputEvent::Change = event {
+                let query = input.read(cx).value().to_string();
+                this.set_chat_search(query, cx);
+            }
+        })
+        .detach();
+        self.search
+            .update(cx, |search, _| search.adopt_list_input(input));
+    }
+
+    // ========== Chat List Navigation ==========
+
+    /// Select the next chat in the list (keyboard navigation)
+    pub fn select_next_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cache = self.get_chat_list_cache(cx);
+        if cache.rows.is_empty() {
+            return;
+        }
+
+        let selected_row = self.chat_list_selection_jid(&cache);
+        let current_index = selected_row
+            .as_deref()
+            .and_then(|jid| cache.rows.iter().position(|row| row.jid == jid));
+
+        let next_index = match current_index {
+            Some(idx) if idx + 1 < cache.rows.len() => idx + 1,
+            None => 0,
+            _ => return, // Already at the end
+        };
+
+        let next_jid = cache.rows[next_index].jid.clone();
+        self.select_chat(next_jid, ChatOpen::ToPreview, window, cx);
+        self.chat_list_scroll
+            .scroll_to_item(next_index, ScrollStrategy::Top);
+    }
+
+    /// Select the previous chat in the list (keyboard navigation)
+    /// Open the next chat below the current one that has something unread,
+    /// wrapping to the top. Nothing happens when every chat is read.
+    pub fn select_next_unread_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cache = self.get_chat_list_cache(cx);
+        let current = self
+            .chat_list_selection_jid(&cache)
+            .and_then(|jid| cache.rows.iter().position(|row| row.jid == jid));
+        let len = cache.rows.len();
+        let start = current.map_or(0, |i| i + 1);
+        let Some(index) = (0..len).map(|step| (start + step) % len.max(1)).find(|&i| {
+            Some(i) != current && cache.rows[i].unread != crate::app::chat_row::Unread::None
+        }) else {
+            return;
+        };
+        let jid = cache.rows[index].jid.clone();
+        self.select_chat(jid, ChatOpen::ToCompose, window, cx);
+        self.chat_list_scroll
+            .scroll_to_item(index, ScrollStrategy::Center);
+    }
+
+    pub fn select_previous_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cache = self.get_chat_list_cache(cx);
+        if cache.rows.is_empty() {
+            return;
+        }
+
+        let selected_row = self.chat_list_selection_jid(&cache);
+        let current_index = selected_row
+            .as_deref()
+            .and_then(|jid| cache.rows.iter().position(|row| row.jid == jid));
+
+        let prev_index = match current_index {
+            Some(idx) if idx > 0 => idx - 1,
+            None => cache.rows.len() - 1,
+            _ => return, // Already at the beginning
+        };
+
+        let prev_jid = cache.rows[prev_index].jid.clone();
+        self.select_chat(prev_jid, ChatOpen::ToPreview, window, cx);
+        self.chat_list_scroll
+            .scroll_to_item(prev_index, ScrollStrategy::Top);
+    }
+
+    // ========== Chat Search ==========
+
+    /// Filter the list by what was typed, once the typing has settled.
+    ///
+    /// The cache is dropped here rather than in the search itself, for the
+    /// reason the search hands the answer back at all: what a filter costs is
+    /// this window's chat cache, and the search holds no chats.
+    pub fn set_chat_search(&mut self, query: String, cx: &mut Context<Self>) {
+        let app = cx.entity().downgrade();
+        let now = self
+            .search
+            .update(cx, |search, cx| search.set_list_query(query, app, cx));
+        if now {
+            self.invalidate_chat_cache();
+            self.refresh_global_search(cx);
+            cx.notify();
+        }
+    }
+
+    // ========== Actions ==========
+
+    pub fn select_chat(
+        &mut self,
+        jid: String,
+        open: ChatOpen,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(chat) = self.chat_named(&jid)
+            && !self.destination.matches(chat)
+        {
+            let destination = if Destination::Channels.matches(chat) {
+                Destination::Channels
+            } else if Destination::Communities.matches(chat) {
+                Destination::Communities
+            } else {
+                Destination::Chats
+            };
+            self.set_destination(destination, window, cx);
+        }
+        // Opening a chat by hand is the explicit user action a notification
+        // permission prompt needs: on the web the startup ask runs without
+        // transient activation and most browsers ignore it, so without this
+        // the permission would sit undecided and every banner stay silent.
+        // Asked only while undecided — a grant or a block ends it — and only
+        // on this target, where the prompt is the browser's rather than the
+        // operating system's.
+        if open != ChatOpen::Restore {
+            crate::platform::request_gesture_authorization();
+        }
+        if self.selected_chat.as_deref() != Some(jid.as_str()) {
+            self.cancel_message_delete(cx);
+            // Message-text selection belongs to the conversation being left,
+            // not to the next list reusing the window selection layer.
+            clear_window_message_selection(window, cx);
+        }
+        if self.destination.has_conversations() {
+            self.destination_selections
+                .insert(self.destination.id(), Some(jid.clone()));
+        }
+        self.stop_user_media();
+        // Leaving a chat mid-composition: release its typing indicator now,
+        // or it would stay "typing..." and the eventual paused would land on
+        // the newly selected chat instead.
+        if self.composing_chat.as_deref() != Some(jid.as_str())
+            && let Some(prev) = self.composing_chat.take()
+        {
+            if let Some(client) = &self.client {
+                client.send_paused(&prev);
+            }
+            if let Some(ref input_area) = self.input_area {
+                input_area.update(cx, |view, _| view.reset_typing());
+            }
+        }
+        if self.selected_chat.as_deref() != Some(jid.as_str()) {
+            self.leave_message_edit(window, cx);
+        }
+        // Stash the outgoing chat's unsent text and restore the target's, or
+        // the shared input would send A's draft to B. Skipped on reselect so
+        // in-progress text survives a same-chat click.
+        if self.selected_chat.as_deref() != Some(jid.as_str())
+            && let Some(ref input_area) = self.input_area
+        {
+            let restored = self.drafts.remove(&jid).unwrap_or_default();
+            let old = input_area.update(cx, |view, cx| view.swap_text(&restored, window, cx));
+            let stashed = self
+                .selected_chat
+                .clone()
+                .filter(|_| !old.trim().is_empty());
+            if let Some(prev) = stashed.clone() {
+                self.drafts.insert(prev, old);
+            }
+            // The list draws a "Draft" preview off this map, and its own
+            // guard counts messages — which neither of these changed. Without
+            // saying so, the chat being left showed no draft and the one being
+            // opened kept claiming one while its text was already back in the
+            // composer.
+            if stashed.is_some() || !restored.is_empty() {
+                self.invalidate_chat_cache();
+            }
+        }
+        // A conversation opened to message someone and left without a word
+        // goes again, as on the phone: it was somewhere to type, not a chat.
+        // One with a draft stays, so the draft has somewhere to live.
+        if let Some(left) = self.unwritten_chat.clone()
+            && left != jid
+        {
+            self.unwritten_chat = None;
+            if !self.drafts.contains_key(&left)
+                && self
+                    .find_chat(&left)
+                    .is_some_and(|chat| chat.messages.is_empty())
+            {
+                self.chats.retain(|chat| chat.jid != left);
+                self.invalidate_chat_cache();
+            }
+        }
+        // A search belongs to the conversation it was typed for, so leaving
+        // that conversation closes it rather than carrying a query into a
+        // chat it says nothing about.
+        self.search
+            .update(cx, |search, cx| search.close_unless_about(&jid, cx));
+        self.viewer
+            .update(cx, |viewer, cx| viewer.close_unless_about(&jid, cx));
+        // And so does a reply. The draft is one shared field feeding one
+        // shared composer, so a reply begun in A and sent from B quoted A's
+        // message — putting A's text in front of B as the thing being
+        // answered.
+        if self.selected_chat.as_deref() != Some(jid.as_str()) && self.reply_to.is_some() {
+            self.cancel_reply(cx);
+        }
+        self.selected_chat = Some(jid.clone());
+        if let Some(chat) = self.find_chat(&jid).cloned() {
+            self.demand_avatar_for_chat(&chat);
+        }
+        if open != ChatOpen::Restore {
+            self.navigate_to_chat();
+        }
+
+        self.keyboard_intent = if open == ChatOpen::Restore {
+            ChatOpen::ToPreview
+        } else {
+            open
+        };
+        if open == ChatOpen::ToCompose {
+            // After `navigate_to_chat`, so on mobile the composer exists on the
+            // panel being switched to rather than the one being left.
+            self.ensure_input_area(window, cx);
+            self.focus_composer(window, cx);
+        }
+
+        // One request, where this used to send receipts and a bounded chat
+        // action separately: the daemon owns both, along with the boundary
+        // that keeps a read from swallowing anything newer. All it needs from
+        // here is the message this side is looking at.
+        let mut mark_locally = false;
+        let owed = self.owed_reads.contains(&jid);
+        if open != ChatOpen::Restore
+            && chat_read_can_be_committed(
+                self.window_focused,
+                crate::platform::application_is_active(),
+                self.client.is_some(),
+            )
+            && let Some(chat) = self
+                .find_chat(&jid)
+                .filter(|c| chat_read_needs_resume(c, owed))
+        {
+            match read_bound(chat) {
+                ReadBound::Now(newest) => {
+                    info!("Marking {} read", observe_str(&jid));
+                    if let Some(client) = self.client.as_ref() {
+                        client.mark_chat_read(&jid, newest);
+                        self.owed_reads.remove(&jid);
+                        mark_locally = true;
+                    }
+                }
+                ReadBound::WhenLoaded => {
+                    debug!(
+                        "holding the read for {} until its messages arrive",
+                        observe_str(&jid)
+                    );
+                    self.owed_reads.insert(jid.clone());
+                    mark_locally = true;
+                }
+            }
+        }
+
+        // Mark as read locally only after a remote read was sent or retained
+        // in `owed_reads`. If the app is inactive, or the session is absent,
+        // keep the unread state so activation/reattach can retry the receipt.
+        if mark_locally && let Some(chat) = self.find_chat_mut(&jid) {
+            chat.mark_as_read();
+            // Both caches: the badge, and the is_read snapshot the message
+            // list renders ticks from (its count guard can't see this).
+            self.invalidate_chat_cache();
+            self.invalidate_message_cache(&jid, cx);
+        }
+
+        self.request_group_members(&jid);
+
+        // Scroll to the last message
+        self.scroll_to_last_message();
+        cx.notify();
+    }
+
+    /// Ask who is in `jid`, if it is a group and nobody is asking already.
+    ///
+    /// On every open rather than once per session: membership changes while
+    /// the window is running, and the answer normally costs nothing — the
+    /// daemon's connection keeps the list because sending needs one. What is
+    /// already known stays on screen until the new answer lands.
+    fn request_group_members(&mut self, jid: &str) {
+        if !jid.contains("@g.us") || self.rosters_in_flight.contains(jid) {
+            return;
+        }
+        let Some(client) = &self.client else {
+            return;
+        };
+        client.load_group_members(jid.to_string());
+        self.rosters_in_flight.insert(jid.to_string());
+    }
+
+    /// Who is in `jid`, as far as this window has been told.
+    pub fn group_members(&self, jid: &str) -> Option<&velo_core::GroupRoster> {
+        self.group_rosters.get(jid)
+    }
+
+    /// Retry connection after an error
+    /// Drop the dead session and start over at pairing.
+    ///
+    /// Split from [`retry_connection`](Self::retry_connection) because the
+    /// server rejected the stored credentials: reconnecting with them is the
+    /// 401 loop. The store belongs to the daemon, so the wipe is a request
+    /// rather than something this side does: it is the process holding the
+    /// SQLite file open, and it stops itself once the file is gone.
+    pub fn reset_and_pair_again(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.app_state = AppState::Loading;
+
+        let dying = self.client.take().inspect(|client| client.forget_session());
+        // Before the connection goes, because dropping it waits for its
+        // reader to leave and a reader parked for room in this queue is
+        // waiting on the thread standing here.
+        self.event_task.take();
+        let asked = dying.is_some();
+        drop(dying);
+
+        let old_scope = crate::session::avatar::active_account();
+        self.clear_account_view(window, cx);
+
+        if !asked {
+            self.app_state = AppState::Error(crate::session::Fault::unreachable(
+                "not connected to the daemon, so nothing was cleared",
+            ));
+            cx.notify();
+            return;
+        }
+
+        crate::session::avatar::spawn_task(async move {
+            if let Err(error) = crate::session::avatar::delete_account_storage(old_scope).await {
+                log::warn!("account avatar storage cleanup failed: {error}");
+            }
+        });
+
+        // Reconnecting rides straight into the same retry loop a cold start
+        // uses: the old daemon is still closing the database it has just been
+        // told to delete, so the first attempts fail and the loop keeps
+        // starting one until the lock it is waiting on is free.
+        self.retry_connection(cx);
+    }
+
+    pub fn retry_connection(&mut self, cx: &mut Context<Self>) {
+        self.avatar_manager.reset_connection();
+        self.avatar_manager.set_session(None);
+        self.last_avatar_window_fingerprint = None;
+        self.app_state = AppState::Loading;
+
+        // Drop the old connection first: a second one alongside it would be
+        // served the whole history again for nothing — and dropping it is
+        // what ends its reader, which is the half the daemon counts.
+        //
+        // The event task goes first, because dropping the session waits for
+        // the reader to leave and a reader parked for room in that queue is
+        // waiting on this very thread to drain it.
+        self.event_task.take();
+        self.control_event_task.take();
+        self.client.take();
+        self.control.take();
+
+        // A failure routes back to the error screen, where retry stays
+        // available.
+        let account = self.account_selection.active;
+        self.reconnect_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let connected = Session::attach(account, cx).await;
+            // The control plane, best effort and alongside: a daemon that
+            // answers the account connection answers this one too, and one
+            // that does not leaves the account plane usable with the global
+            // requests refused, rather than failing the whole attach over a
+            // second socket.
+            let control = Session::attach_control(cx).await;
+            let _ = entity.update(cx, |app, cx| {
+                match connected {
+                    Ok((client, ui_rx)) => {
+                        // A new stream may restore descriptors this window
+                        // did not observe while detached.
+                        for chat in &mut app.chats {
+                            Arc::make_mut(chat).avatar_live = false;
+                        }
+                        app.event_task = Some(Self::spawn_event_task(ui_rx, cx));
+                        app.avatar_manager.set_session(Some(client.handle()));
+                        app.avatar_manager.flush_demands(&client);
+                        app.client = Some(client);
+                        app.resume_visible_read(cx);
+                        if let Ok((control, control_rx)) = control {
+                            // Its frames answer through the control session's
+                            // own request table; the reader just has to keep
+                            // running so those answers land.
+                            app.control_event_task =
+                                Some(Self::spawn_control_reader(control_rx, cx));
+                            app.control = Some(control);
+                        }
+                        // A level chosen while this was unreachable reached
+                        // nobody, and the daemon on the other end may be a
+                        // new one. Nothing is sent if nobody chose.
+                        app.resend_log_level(cx);
+                        app.refresh_call_device_preferences(cx);
+                    }
+                    Err(e) if Session::is_settled(&e) => {
+                        // A refusal, not a failure to reach anything: this
+                        // preview has not been told it may keep an account, or
+                        // a tab is holding one and would not answer for it —
+                        // which is now the narrow case it sounds like, since a
+                        // tab that loses the claim ordinarily attaches to the
+                        // tab that won and draws the account through it. Said
+                        // in its own words — a "Failed to reach the daemon" in
+                        // front of it would be the one sentence that is not
+                        // true — and with no timer behind it, because the
+                        // attempt that reached here had already asked the
+                        // holder for a connection and been left waiting.
+                        app.app_state = AppState::Refused {
+                            reason: e.to_string(),
+                        };
+                    }
+                    Err(e) => {
+                        app.app_state = AppState::Error(crate::session::Fault::unreachable(
+                            format!("failed to reach the daemon: {e}"),
+                        ));
+                        // The error screen says "we'll keep trying", and this
+                        // is the attempt that was doing the trying: the timer
+                        // that fired it has already ended. Without arming the
+                        // next one the promise stops being true after exactly
+                        // one automatic retry, with the sentence still on
+                        // screen.
+                        app.schedule_retry(cx);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Initialize the isolated input area view (needs window context)
+    /// The InputAreaView has its own render cycle, so typing doesn't trigger app re-renders.
+    /// IMPORTANT: This method should NOT update the InputAreaView on every call,
+    /// as that would defeat the purpose of isolation.
+    pub fn ensure_input_area(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.input_area.is_none() {
+            // Create the isolated input area view
+            let input_area = cx.new(|cx| InputAreaView::new(window, cx));
+
+            // Subscribe to events from the input area
+            cx.subscribe_in(&input_area, window, Self::handle_input_area_event)
+                .detach();
+
+            self.input_area = Some(input_area);
+        }
+        // NOTE: Do NOT call input_area.update() here - it would trigger re-renders
+        // on every parent render, defeating the purpose of component isolation.
+        // Recording state is updated via update_input_recording() when it changes.
+    }
+
+    /// Handle events from the isolated input area view
+    fn handle_input_area_event(
+        &mut self,
+        _input_area: &Entity<InputAreaView>,
+        event: &InputAreaEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            InputAreaEvent::SendMessage(text) => {
+                if self.edit_draft.is_some() {
+                    self.save_message_edit(text, window, cx);
+                } else {
+                    self.send_message(text, cx);
+                }
+            }
+            InputAreaEvent::AttachFiles(category) => {
+                self.attach_category(*category, cx);
+            }
+            InputAreaEvent::PasteMedia => self.paste_media(cx),
+            InputAreaEvent::StartRecording => {
+                self.start_recording(cx);
+            }
+            InputAreaEvent::StopRecording => {
+                self.stop_recording_and_send(cx);
+            }
+            InputAreaEvent::CancelRecording => {
+                self.cancel_recording(cx);
+            }
+            InputAreaEvent::CancelEdit => {
+                self.cancel_message_edit(window, cx);
+            }
+            InputAreaEvent::CancelReply => {
+                self.cancel_reply(cx);
+            }
+            InputAreaEvent::StartedTyping => {
+                // Send "composing" presence
+                if let Some(jid) = &self.selected_chat {
+                    self.composing_chat = Some(jid.clone());
+                    if let Some(client) = &self.client {
+                        client.send_composing(jid);
+                    }
+                }
+            }
+            InputAreaEvent::StoppedTyping => {
+                // Send "paused" presence to the chat the composing went to,
+                // not whatever chat is selected when the timeout fires
+                let target = self
+                    .composing_chat
+                    .take()
+                    .or_else(|| self.selected_chat.clone());
+                if let Some(jid) = target
+                    && let Some(client) = &self.client
+                {
+                    client.send_paused(&jid);
+                }
+            }
+        }
+    }
+
+    /// Unique optimistic-bubble id.
+    ///
+    /// A millisecond timestamp alone collides on fast double-sends
+    /// (`add_message` would dedup one bubble away and `MessageIdAssigned`
+    /// could rename the wrong one), and a timestamp plus a counter collides
+    /// across processes: two windows on the same daemon each start their
+    /// counter at zero, and the daemon broadcasts every assignment to both.
+    /// [`crate::platform::front_end_id`] is what keeps them apart, and it also namespaces the
+    /// media-cache file a voice note is staged in.
+    fn next_local_id(prefix: &str) -> String {
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{prefix}_{}_{}_{}",
+            crate::platform::front_end_id(),
+            wacore::time::now_millis(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// Send a message to the currently selected chat
+    fn send_message(&mut self, text: &str, cx: &mut Context<Self>) {
+        // Taken, not read: a reply is answered once. Leaving the draft in
+        // place quoted the same message from every message that followed.
+        let quoted = self.reply_to.take().map(QuotedMessage::from);
+        self.send_quoted(text, quoted, cx);
+    }
+
+    /// Send `text`, quoting whatever the caller says it quotes.
+    ///
+    /// Split from [`send_message`](Self::send_message) so a retry can carry
+    /// the *original* message's quote: retrying is presented as sending the
+    /// failed message again, and the reply draft that produced it was
+    /// consumed when it was first sent.
+    fn send_quoted(&mut self, text: &str, quoted: Option<QuotedMessage>, cx: &mut Context<Self>) {
+        // Check if connected before attempting to send
+        if !self.is_connected() {
+            warn!("Cannot send message: not connected");
+            return;
+        }
+
+        let Some(jid) = self.selected_chat.clone() else {
+            return;
+        };
+
+        let local_id = Self::next_local_id("local");
+        let Some(client) = &self.client else {
+            warn!("Cannot send message: client is unavailable");
+            return;
+        };
+        client.send_message(&jid, text, local_id.clone(), quoted.clone());
+
+        // Add to local chat immediately for responsiveness; the client renames
+        // it to the real id via MessageIdAssigned.
+        let mut msg = ChatMessage::new_outgoing(local_id, text.to_string());
+        // The bubble shows its own quote from the moment it is drawn, the way
+        // the reply will look once it comes back from the store.
+        msg.quoted = quoted;
+        if self.add_message_to_chat(&jid, msg, cx) {
+            self.scroll_to_last_message();
+        }
+        // The reply bar goes with the reply it composed.
+        if let Some(input) = &self.input_area {
+            input.update(cx, |view, cx| view.set_reply(None, cx));
+        }
+
+        cx.notify();
+    }
+
+    // ========== PTT Recording ==========
+
+    // ========== Call State ==========
+
+    // ========== Media Playback Control ==========
+
+    // ========== Audio Playback ==========
+
+    // ========== Video Playback ==========
+
+    /// Start the video frame update task
+    /// Give back the codec session of every player that is not playing.
+    ///
+    /// A `VideoDecoder` is hardware and a browser allows a handful, while the
+    /// window caches players so a clip replays without re-fetching. Called
+    /// where one video becomes the one playing, and again where playback
+    /// ends: `stop` is not the place, because that is where a poster frame is
+    /// asked for and so where the decoder is still needed, but once the
+    /// settling polls are done nothing is waiting on it. What cost a download
+    /// stays and only the session goes.
+    fn release_idle_decoders(&mut self) {
+        let playing = self.playing_video_id().map(|s| s.to_string());
+        for (id, player) in &mut self.video_players {
+            if Some(id) != playing.as_ref() {
+                player.release_decoder();
+            }
+        }
+    }
+
+    fn start_video_update_task(&mut self, cx: &mut Context<Self>) {
+        // Cancel any existing task
+        self.video_update_task = None;
+
+        // One codec session at a time. A `VideoDecoder` is hardware, not a
+        // buffer, and a browser allows only a handful; the cache keeps up to
+        // `MAX_VIDEO_PLAYERS` players so a clip replays without re-fetching,
+        // which meant every attachment opened in a conversation held a
+        // session for as long as its player lived. Released here, where one
+        // video demonstrably becomes the one playing, rather than in `stop`,
+        // which is where a poster frame is asked for and so is where the
+        // decoder is still needed. What cost a download stays; only the
+        // session goes, and it is rebuilt from the samples on the next play.
+        self.release_idle_decoders();
+
+        // Get completion receiver from current video player
+        // Clone the message_id first to avoid borrow conflicts
+        let msg_id = self.playing_video_id().map(|s| s.to_string());
+        let completion_rx = msg_id
+            .as_ref()
+            .and_then(|id| self.video_players.get_mut(id))
+            .map(|player| player.on_complete());
+
+        // Spawn update loop (~30 fps) with completion handling
+        self.video_update_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            // Create a fused future for completion (handles None case)
+            let mut completion_rx = completion_rx;
+            // How many polls a player that has left `Playing` still gets.
+            //
+            // Stopping on the same tick was right while every decode was
+            // inline: `stop` asks for the first frame and the answer was
+            // already there. Where the decoder is the browser's it is not,
+            // and a loop that ended immediately left the poster frame
+            // nowhere to arrive. A third of a second, after which the last
+            // frame is what the video is worth showing anyway.
+            const SETTLING_POLLS: u8 = 10;
+            let mut settling = 0u8;
+
+            loop {
+                // Check for completion event (non-blocking)
+                if let Some(ref mut rx) = completion_rx {
+                    // Try to receive without blocking
+                    match rx.try_recv() {
+                        Ok(()) => {
+                            // Video completed naturally
+                            let _ = entity.update(cx, |app, cx| {
+                                app.active_media = ActiveMedia::None;
+                                // After the clear, not before it: the sweep
+                                // spares whatever is playing, and what has
+                                // just finished stops being that only once
+                                // `active_media` says so.
+                                app.release_idle_decoders();
+                                app.video_update_task = None;
+                                app.audio_player.stop();
+                                // Ownership must not survive the sink: a stale
+                                // owner reads to the resume path as proof the
+                                // audio can be resumed, replaying the video
+                                // silently.
+                                app.audio = AudioHolder::None;
+                                cx.notify();
+                            });
+                            break;
+                        }
+                        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                            // Channel closed (player dropped or stopped manually)
+                            break;
+                        }
+                        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                            // Not completed yet, continue updating frames
+                        }
+                    }
+                }
+
+                // Wait for next frame (~30 fps)
+                crate::platform::sleep(std::time::Duration::from_millis(33)).await;
+
+                // Update frame
+                let should_stop = entity
+                    .update(cx, |app, cx| {
+                        // Clone message_id first to avoid borrow conflicts
+                        let msg_id = app.playing_video_id().map(|s| s.to_string());
+                        if let Some(ref id) = msg_id
+                            && let Some(player) = app.video_players.get_mut(id)
+                        {
+                            if player.update() {
+                                cx.notify();
+                            }
+                            if player.state() == VideoPlayerState::Playing {
+                                settling = 0;
+                                return false;
+                            }
+                            // Left `Playing`, and possibly still waiting on a
+                            // picture it has already asked for.
+                            settling = settling.saturating_add(1);
+                            return settling >= SETTLING_POLLS;
+                        }
+                        true // Stop if no playing video
+                    })
+                    .unwrap_or(true);
+
+                if should_stop {
+                    let _ = entity.update(cx, |app, cx| {
+                        app.active_media = ActiveMedia::None;
+                        // After the clear and after the settling polls: the
+                        // sweep spares whatever is playing, and a poster
+                        // frame still on its way has landed by now. A codec
+                        // session is hardware a browser allows a handful of.
+                        app.release_idle_decoders();
+                        app.video_update_task = None;
+                        app.audio_player.stop();
+                        app.audio = AudioHolder::None;
+                        cx.notify();
+                    });
+                    break;
+                }
+            }
+        }));
+    }
+
+    // ========== Event Handling ==========
+
+    /// Handle a received message
+    fn handle_message_received(
+        &mut self,
+        chat_jid: String,
+        mut message: ChatMessage,
+        sender_name: Option<String>,
+        metadata: IncomingMessageMetadata,
+        cx: &mut App,
+    ) {
+        // Parse JID to determine chat type
+        let jid = chat_jid.parse::<Jid>().ok();
+        let is_group = jid.as_ref().is_some_and(|j| j.is_group());
+        let is_status = jid.as_ref().is_some_and(|j| j.is_status_broadcast());
+
+        // A message landing in the conversation *on screen* is read
+        // immediately: receipt out now, no badge (select_chat won't re-run to
+        // send it). On screen, not merely selected — the selection outlives
+        // the pane that shows it, so reading statuses, opening Settings or
+        // walking the chat list on a phone would otherwise send a read
+        // receipt for a message nobody had laid eyes on.
+        let read_now = read_is_allowed(
+            self.window_focused,
+            crate::platform::application_is_active(),
+            self.visible_chat.as_deref() == Some(chat_jid.as_str()),
+            message.is_from_me,
+        );
+
+        // Cache the sender's name if provided
+        if let Some(ref name) = sender_name {
+            self.name_cache.insert(message.sender.clone(), name.clone());
+        }
+
+        // For group chats — and the status broadcast, which is likewise a
+        // stream of other people's rows — set sender_name for display.
+        if (is_group || is_status) && !message.is_from_me {
+            message.sender_name = sender_name
+                .clone()
+                .or_else(|| self.name_cache.get(&message.sender).cloned());
+        }
+
+        // Capture the user-facing part before the message moves into its
+        // conversation. Statuses have their own reader and do not represent a
+        // chat asking for attention; our own sends likewise never notify us.
+        let notification = (metadata.allowed
+            && !message.is_read
+            && !read_now
+            && !message.is_from_me
+            && !is_status)
+            .then(|| {
+                let body = if is_group {
+                    format!("{}: {}", message.author_label(), message.preview_text())
+                } else {
+                    message.preview_text()
+                };
+                (message.id.clone(), message.sender.clone(), body)
+            });
+
+        // Their message ends their typing, more reliably than `paused` does:
+        // the peer that stopped composing is not obliged to say so, and a
+        // sender whose message just arrived is definitively no longer
+        // mid-word. Without this the header and the sidebar row went on
+        // claiming they were typing for the whole 10-second TTL, underneath
+        // the message they had already sent.
+        if !message.is_from_me {
+            self.presence.clear_composing(&chat_jid, &message.sender);
+        }
+
+        // Find the chat index so we can move it to the top after adding message
+        let chat_index = self.chats.iter().position(|c| c.jid == chat_jid);
+
+        if let Some(index) = chat_index {
+            // Update the existing chat
+            let chat = Arc::make_mut(&mut self.chats[index]);
+            if let Some(archived) = metadata.archived {
+                chat.muted_until = metadata.muted_until_ms.and_then(|ms| {
+                    if ms == i64::MAX {
+                        Some(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+                    } else {
+                        chrono::DateTime::from_timestamp_millis(ms)
+                    }
+                });
+                chat.archived = archived;
+            }
+
+            if let Some(ref name) = metadata.chat_name {
+                chat.set_name_if_not_worse(name.clone(), 2);
+            }
+
+            // For groups: update participant name, NOT the chat name
+            if is_group {
+                if let Some(ref name) = sender_name {
+                    chat.update_participant(message.sender.clone(), name.clone());
+                }
+            } else if !is_status {
+                // For DMs only: update chat name if we have a better one
+                if metadata.chat_name.is_none()
+                    && let Some(ref name) = sender_name
+                    && !message.is_from_me
+                {
+                    chat.set_name_if_not_worse(name.clone(), 2);
+                }
+            }
+            // Status broadcasts: don't update any names
+            let advanced = chat.add_message(message);
+
+            // To where its own head belongs, newest first; duplicates and
+            // older backfills do not reorder at all.
+            if advanced {
+                self.reposition_chat(index);
+            }
+
+            // Always invalidate caches since chat content changed
+            self.invalidate_chat_cache();
+            self.invalidate_message_cache(&chat_jid, cx);
+        } else {
+            // Create new chat
+            let display_name = if is_group || is_status {
+                // A participant is not the conversation. Only use the
+                // store-backed subject delivered separately by the session.
+                metadata.chat_name.clone()
+            } else if message.is_from_me {
+                // Prefer the durable contact name, then a local cache entry.
+                metadata
+                    .chat_name
+                    .clone()
+                    .or_else(|| self.name_cache.get(&chat_jid).cloned())
+            } else {
+                // The resolved address-book name outranks a push name.
+                metadata.chat_name.clone().or_else(|| sender_name.clone())
+            };
+
+            let mut new_chat = if let Some(name) = display_name {
+                Chat::with_name(chat_jid.clone(), name)
+            } else {
+                Chat::new(chat_jid.clone())
+            };
+            // An absent row has no previous archive state to preserve. Keep
+            // an unknown answer out of the active inbox until store hydration
+            // supplies an explicit state; `Some(false)` still unarchives it.
+            new_chat.archived = metadata.archived.unwrap_or(true);
+            new_chat.muted_until = metadata.muted_until_ms.and_then(|ms| {
+                if ms == i64::MAX {
+                    Some(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+                } else {
+                    chrono::DateTime::from_timestamp_millis(ms)
+                }
+            });
+
+            // For groups: track participant
+            if is_group && let Some(ref name) = sender_name {
+                new_chat.update_participant(message.sender.clone(), name.clone());
+            }
+
+            new_chat.add_message(message);
+            // A live chat joins the same order a load would put it in, below
+            // the pinned block rather than above it.
+            let new_chat = Arc::new(new_chat);
+            let target = slot_for_chat(&self.chats, &new_chat);
+            self.chats.insert(target, new_chat);
+            self.invalidate_chat_cache();
+        }
+
+        if read_now {
+            let newest = self
+                .find_chat(&chat_jid)
+                .map(Arc::as_ref)
+                .and_then(newest_shared_message);
+            if let Some(client) = &self.client {
+                // Receipt and the persisted read in one: see `select_chat`.
+                client.mark_chat_read(&chat_jid, newest);
+            }
+            if let Some(chat) = self.find_chat_mut(&chat_jid) {
+                chat.mark_as_read();
+            }
+            self.invalidate_chat_cache();
+            self.invalidate_message_cache(&chat_jid, cx);
+        }
+
+        if let Some((message_id, sender, body)) = notification {
+            self.notify_incoming_message(&chat_jid, &message_id, &sender, body, metadata.title, cx);
+        }
+    }
+
+    /// Raise one operating-system notification for an incoming message.
+    ///
+    /// One stable tag per conversation lets a newer message replace the
+    /// previous banner instead of stacking an unbounded column. The bounded
+    /// id set is separate: reconnects can repeat a message after its banner
+    /// has already been delivered, and replacement alone would still make it
+    /// alert a second time.
+    fn notify_incoming_message(
+        &mut self,
+        chat_jid: &str,
+        message_id: &str,
+        sender: &str,
+        body: String,
+        notification_title: Option<String>,
+        cx: &mut App,
+    ) {
+        const REMEMBERED_MESSAGES: usize = 256;
+
+        let key = (
+            chat_jid.to_string(),
+            message_id.to_string(),
+            sender.to_string(),
+        );
+        if self.notified_messages.contains_key(&key) {
+            return;
+        }
+        let Some(chat) = self.find_chat(chat_jid) else {
+            return;
+        };
+        // The event's policy was read from the durable store after commit.
+        // This Chat may be a snapshot placeholder or a brand-new live row,
+        // so its mute/archive defaults cannot override that answer.
+        let title = notification_title.unwrap_or_else(|| {
+            if chat.is_group
+                && matches!(
+                    chat.name.as_str(),
+                    "Unnamed group" | "Group name unavailable"
+                )
+            {
+                "Group message".to_string()
+            } else {
+                chat.name.clone()
+            }
+        });
+        let avatar_key = chat.avatar_cache_key.clone();
+        let is_group = chat.is_group;
+        self.notified_messages.insert(key, ());
+        while self.notified_messages.len() > REMEMBERED_MESSAGES {
+            self.notified_messages.shift_remove_index(0);
+        }
+        let tag = notification_tag(chat_jid);
+        let media_cache = self.media_cache();
+        crate::platform::notifications::play_message_chime(is_group);
+        // The native path can include a cached profile image as a content
+        // thumbnail. Its reader runs off the UI thread after macOS confirms
+        // authorization. Web builds and non-bundle tests stay on GPUI's path.
+        if !crate::platform::show_notification_with_avatar(&tag, &title, &body, move || {
+            let key = avatar_key.as_deref()?;
+            media_cache.as_ref()?.read(key).ok()
+        }) {
+            cx.show_system_notification(SystemNotification {
+                tag: tag.into(),
+                title: title.into(),
+                body: body.into(),
+                actions: Vec::new(),
+            });
+        }
+    }
+
+    /// Give notification responses a handle that remains usable after the
+    /// click callback returns. Hydration can finish later, so keeping only the
+    /// callback's `&mut Window` would make a retry impossible.
+    pub fn set_notification_window(&mut self, window: gpui::AnyWindowHandle) {
+        self.notification_window = Some(window);
+    }
+
+    /// Give the send-confirmation modal a window to build its caption field
+    /// in. Called once, where the window is created beside the app.
+    pub fn set_modal_window(&mut self, window: gpui::AnyWindowHandle) {
+        self.modal_window = Some(window);
+    }
+
+    /// Retry queued notification responses after a chat/list hydration pass.
+    ///
+    /// The retry is deferred until the current entity update unwinds. GPUI
+    /// does not permit re-entering an entity while it is applying an event,
+    /// and the stored [`WindowHandle`] is the supported way to obtain a live
+    /// `Window` for the normal selection path. The FIFO is drained in order:
+    /// an older unresolved tag cannot let a newer click be overwritten by a
+    /// late selection, and the newest queued tag is the final selection.
+    pub(super) fn retry_pending_notification(&mut self, cx: &mut Context<Self>) {
+        if self.pending_notification_tags.is_empty() {
+            self.notification_retry_task = None;
+            self.notification_retry_backoff = NOTIFICATION_PAGE_RETRY_DELAY;
+            return;
+        }
+        let Some(window) = self.notification_window else {
+            return;
+        };
+
+        let entity = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let tags = entity
+                .update(cx, |app, _| {
+                    app.pending_notification_tags
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for tag in tags {
+                let result = window.update(cx, |_, window, cx| {
+                    entity
+                        .update(cx, |app, cx| {
+                            app.retry_queued_notification(&tag, window, cx)
+                        })
+                        .unwrap_or(false)
+                });
+                if result.is_err() {
+                    // A closed window leaves the
+                    // queue intact. A later hydration/page-loss event can
+                    // retry it without losing a response.
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Retry one queued tag. Every snapshot entry is attempted once so an
+    /// unresolved older click cannot block a newer chat that already
+    /// hydrated.
+    fn retry_queued_notification(
+        &mut self,
+        tag: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self
+            .pending_notification_tags
+            .iter()
+            .any(|queued| queued == tag)
+        {
+            return true;
+        }
+        if let Some(jid) = notification_chat_jid(&self.chats, tag) {
+            let should_select = self.latest_notification_tag.as_deref() == Some(tag);
+            remove_pending_notification(&mut self.pending_notification_tags, tag);
+            self.reset_notification_retry_backoff();
+            if should_select {
+                self.select_chat(jid, ChatOpen::ToPreview, window, cx);
+            }
+            return true;
+        }
+        if self
+            .request_notification_pages(cx)
+            .is_some_and(|plan| plan.done())
+        {
+            // Both complete scans say the tag is not held by this account.
+            remove_pending_notification(&mut self.pending_notification_tags, tag);
+            self.reset_notification_retry_backoff();
+            return true;
+        }
+        false
+    }
+
+    fn reset_notification_retry_backoff(&mut self) {
+        self.notification_retry_task = None;
+        self.notification_retry_backoff = NOTIFICATION_PAGE_RETRY_DELAY;
+    }
+
+    /// Back off a notification retry after a chat-list page refusal. One task
+    /// serves the queue, so repeated failures cannot create a tight retry
+    /// loop or duplicate requests.
+    pub(super) fn retry_pending_notification_after_page_loss(&mut self, cx: &mut Context<Self>) {
+        if self.pending_notification_tags.is_empty() || self.notification_retry_task.is_some() {
+            return;
+        }
+        let delay = self.notification_retry_backoff;
+        self.notification_retry_backoff = next_notification_retry_delay(delay);
+        let entity = cx.entity().downgrade();
+        self.notification_retry_task = Some(cx.spawn(async move |_, cx| {
+            crate::platform::sleep(delay).await;
+            let _ = entity.update(cx, |app, cx| {
+                app.notification_retry_task = None;
+                app.retry_pending_notification(cx);
+            });
+        }));
+    }
+
+    /// Open the conversation named by a system-notification response.
+    ///
+    /// The tag carries only a stable hash, not a phone number or JID. Resolve
+    /// it against chats this window already owns, then take the ordinary chat
+    /// selection path so paging, read bounds and group metadata stay intact.
+    pub fn open_system_notification(
+        &mut self,
+        tag: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.open_call_notification(tag, cx) {
+            return;
+        }
+        self.latest_notification_tag = Some(tag.to_string());
+        if let Some(jid) = notification_chat_jid(&self.chats, tag) {
+            remove_pending_notification(&mut self.pending_notification_tags, tag);
+            self.reset_notification_retry_backoff();
+            self.select_chat(jid, ChatOpen::ToPreview, window, cx);
+            // An older click may still be waiting; it remains queued for
+            // hydration but can no longer steal focus from this newer click.
+            self.retry_pending_notification(cx);
+            return;
+        }
+        // The response may arrive before the first HistoryLoaded/Chats page,
+        // or before the archived page that contains this chat. Queue it while
+        // unresolved; the hydrated branch above opens it immediately even if
+        // an older click is still waiting.
+        enqueue_pending_notification(&mut self.pending_notification_tags, tag);
+        self.retry_pending_notification(cx);
+    }
+
+    /// A server acknowledgement or peer receipt about our own messages:
+    /// advance their ticks.
+    ///
+    /// Only ever moves forward. Receipts arrive out of order and another of
+    /// the peer's devices can repeat a delivery ack after the read one, so a
+    /// naive assignment makes bubbles flicker from ✓✓ back to ✓.
+    fn handle_receipt_received(
+        &mut self,
+        chat_jid: String,
+        message_ids: Vec<String>,
+        receipt_type: ReceiptType,
+        cx: &mut App,
+    ) {
+        let Some(status) = receipt_status(receipt_type.clone()) else {
+            return;
+        };
+
+        let Some(chat) = self.find_chat_mut(&chat_jid) else {
+            return;
+        };
+        let advanced = if receipt_type == ReceiptType::PlayedSelf {
+            advance_authorless_self_play(chat, &chat_jid, &message_ids)
+        } else {
+            chat.advance_status(&message_ids, status)
+        };
+        // A read receipt is also the peer telling us they opened the chat,
+        // which clears our own unread state for the messages named.
+        let read = if status.is_read() {
+            chat.mark_messages_as_read(&message_ids)
+        } else {
+            0
+        };
+
+        if advanced + read > 0 {
+            debug!(
+                "{:?} for {} message(s) in {}",
+                receipt_type,
+                advanced + read,
+                observe_str(&chat_jid)
+            );
+            // Ticks and the unread badge changed; count-based cache guards
+            // can't see either.
+            self.invalidate_message_cache(&chat_jid, cx);
+            self.invalidate_chat_cache();
+        }
+    }
+
+    /// Someone started or stopped typing.
+    fn handle_chat_presence(
+        &mut self,
+        chat_jid: String,
+        sender_jid: String,
+        sender_name: Option<String>,
+        composing: Option<ComposingKind>,
+        cx: &mut Context<Self>,
+    ) {
+        match composing {
+            Some(kind) => {
+                // The session resolved this name the same way it resolves the
+                // one on their bubbles, so the typing line under them says
+                // the same thing — and the conversation keeps it, rather than
+                // the line above it keeping it alone. A chat whose only word
+                // about someone is that they are typing otherwise draws their
+                // rows under a fallback JID while naming them overhead, which
+                // is the same person under two names one line apart.
+                //
+                // Only when it is news, though: presence arrives on every
+                // burst of keystrokes, and re-writing the participant map
+                // walks the timeline.
+                let name = match sender_name {
+                    Some(name) => {
+                        if self
+                            .find_chat(&chat_jid)
+                            .and_then(|chat| chat.participant_name(&sender_jid))
+                            != Some(name.as_str())
+                        {
+                            self.name_cache.insert(sender_jid.clone(), name.clone());
+                            if let Some(chat) = self.find_chat_mut(&chat_jid) {
+                                chat.update_participant(sender_jid.clone(), name.clone());
+                            }
+                            // Rows that were waiting for this name have it now.
+                            self.invalidate_message_cache(&chat_jid, cx);
+                        }
+                        name
+                    }
+                    // No answer in this event: memory of earlier ones, and
+                    // the JID is the honest last resort.
+                    None => self
+                        .find_chat(&chat_jid)
+                        .and_then(|chat| chat.participant_name(&sender_jid))
+                        .map(str::to_owned)
+                        .or_else(|| self.name_cache.get(&sender_jid).cloned())
+                        .unwrap_or_else(|| sender_jid.clone()),
+                };
+                self.presence
+                    .set_composing(chat_jid, sender_jid, name, kind);
+                // Nothing is ticking unless something needs expiring, and a
+                // `composing` with no matching `paused` is exactly that.
+                self.ensure_tick(cx);
+            }
+            None => self.presence.clear_composing(&chat_jid, &sender_jid),
+        }
+        self.invalidate_chat_cache();
+        cx.notify();
+    }
+
+    /// Who is typing in a conversation, for the header and the timeline.
+    pub fn typing_in(&self, chat_jid: &str) -> Option<TypingSummary> {
+        self.presence.typing(chat_jid)
+    }
+
+    /// Where a contact is, for the header subtitle.
+    pub fn availability_of(&self, jid: &str) -> Option<&Availability> {
+        self.presence.availability(jid)
+    }
+
+    /// A group changed, or something else happened *to* a chat.
+    ///
+    /// Inserted the way hydrated history is, not the way a message is: no
+    /// unread bump. Nobody replies to "Ana changed the group name", and a
+    /// badge for one would be a badge for nothing to read.
+    ///
+    /// The sidebar is the exception, and deliberately so: `preview_for` draws
+    /// the last row, so a notice that *is* the last row is already the line
+    /// the list shows. Leaving the head metadata behind then made the row
+    /// disagree with itself — the new text under the previous message's
+    /// clock, still sitting at the previous message's place in the list.
+    ///
+    /// Transient notices are local to this window. Identified membership
+    /// notifications arrive through committed history instead.
+    fn handle_system_notice(
+        &mut self,
+        chat_jid: String,
+        notice_id: String,
+        at: chrono::DateTime<chrono::Utc>,
+        notice: SystemNotice,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.chats.iter().position(|chat| chat.jid == chat_jid) else {
+            // A notification for a chat this window has never loaded — which
+            // is the *normal* order for the one that says you were added to a
+            // group. Fabricating the chat around it would draw a conversation
+            // with no messages and no name; dropping it loses the row for
+            // good, because the store does not hold system notices and the
+            // reload that brings the chat cannot bring this back. So it waits.
+            debug!("holding a system notice for {}", observe_str(&chat_jid));
+            self.pending_notices
+                .entry(chat_jid)
+                .or_default()
+                .push((notice_id, at, notice));
+            return;
+        };
+        let chat = Arc::make_mut(&mut self.chats[index]);
+        if chat.messages.iter().any(|message| message.id == notice_id) {
+            return;
+        }
+        let mut message = ChatMessage::new_incoming(notice_id, chat_jid.clone(), String::new());
+        message.timestamp = at;
+        message.is_read = true;
+        message.system = Some(notice);
+        chat.insert_history_message(message);
+        // The head metadata, when this is now the newest thing in the
+        // conversation. Not the unread count: see above.
+        if chat.last_message_time.is_none_or(|last| at > last) {
+            chat.last_message_time = Some(at);
+            self.reposition_chat(index);
+        }
+
+        self.invalidate_message_cache(&chat_jid, cx);
+        // And the sidebar, when the notice is now the last thing in the
+        // conversation: the list's preview is drawn from that row, while its
+        // cache guard counts chats and cannot see one gaining a message.
+        self.invalidate_chat_cache();
+        cx.notify();
+    }
+
+    /// Put back the notices that arrived before their conversation did.
+    ///
+    /// Called wherever chats are installed. Only the ones whose chat is now
+    /// here are taken, so a notice for a group this account is still syncing
+    /// keeps waiting rather than being dropped a second time.
+    fn flush_pending_notices(&mut self, cx: &mut Context<Self>) {
+        if self.pending_notices.is_empty() {
+            return;
+        }
+        let ready: Vec<String> = self
+            .pending_notices
+            .keys()
+            .filter(|jid| self.find_chat(jid).is_some())
+            .cloned()
+            .collect();
+        for jid in ready {
+            let Some(held) = self.pending_notices.remove(&jid) else {
+                continue;
+            };
+            for (notice_id, at, notice) in held {
+                self.handle_system_notice(jid.clone(), notice_id, at, notice, cx);
+            }
+        }
+    }
+
+    /// Handle a reaction event
+    fn handle_reaction_received(
+        &mut self,
+        chat_jid: String,
+        message_id: String,
+        sender: String,
+        emoji: String,
+        cx: &mut App,
+    ) {
+        if let Some(chat) = self.find_chat_mut(&chat_jid) {
+            if chat.add_reaction(&message_id, emoji.clone(), sender.clone()) {
+                // Invalidate cache since reactions affect message height
+                self.invalidate_message_cache(&chat_jid, cx);
+                info!(
+                    "Added reaction '{}' from {} to message {} in {}",
+                    emoji,
+                    observe_str(&sender),
+                    message_id,
+                    observe_str(&chat_jid)
+                );
+            } else {
+                info!(
+                    "Message {} not found for reaction in chat {}",
+                    message_id,
+                    observe_str(&chat_jid)
+                );
+            }
+        }
+    }
+}
+
+/// The delivery state carried by one receipt, when it says anything the
+/// bubble can draw. `Sent` is the live projection of a positive server ack;
+/// durable history remains the recovery path if this event is dropped.
+fn receipt_status(receipt_type: ReceiptType) -> Option<MessageStatus> {
+    match receipt_type {
+        ReceiptType::Sent => Some(MessageStatus::Sent),
+        ReceiptType::Delivered => Some(MessageStatus::Delivered),
+        // Played is Read plus "and listened to it"; the ticks are the same.
+        ReceiptType::Read | ReceiptType::ReadSelf => Some(MessageStatus::Read),
+        ReceiptType::Played | ReceiptType::PlayedSelf => Some(MessageStatus::Played),
+        // Retries, errors and sender echoes say nothing about delivery.
+        _ => None,
+    }
+}
+
+// The live event has no original-author field. Participant-keyed plays must
+// arrive through confirmed store hydration instead of a currently unique row.
+fn advance_authorless_self_play(chat: &mut Chat, chat_jid: &str, ids: &[String]) -> usize {
+    let Ok(jid) = chat_jid.parse::<Jid>() else {
+        return 0;
+    };
+    if !(jid.is_pn() || jid.is_lid() || jid.is_newsletter()) {
+        return 0;
+    }
+    let mut changed = 0;
+    for id in ids {
+        let mut matches = chat
+            .messages
+            .iter_mut()
+            .filter(|message| !message.is_from_me && message.id == *id);
+        if let Some(message) = matches.next()
+            && matches.next().is_none()
+        {
+            let before = message.status;
+            message.status.advance(MessageStatus::Played);
+            changed += usize::from(before != message.status);
+        }
+    }
+    changed
+}
+
+/// The newest message in `chat` that the daemon can also name.
+///
+/// `MarkRead` is a claim about what the requester saw, and the daemon checks it
+/// against the second its read would clear. A call record and a group notice
+/// are written *here* — the daemon holds no messages and never put them in a
+/// summary — so bounding the request with one names a message that is in no
+/// boundary anywhere, and the read is refused. The chat is cleared locally all
+/// the same, so no receipt goes out, nothing is persisted, and the next
+/// hydration puts the badge back.
+/// Whether a read for this chat can be bounded now.
+///
+/// The daemon checks a `MarkRead` against the second it would clear and
+/// refuses one that names nothing while it knows messages of its own — so a
+/// row painted from the daemon's snapshot, which carries a preview and no
+/// messages, cannot be read the moment it is opened. A chat with nothing
+/// behind it at all still can: that is the manually-unread case, which has no
+/// message to name and has to stay clearable.
+enum ReadBound {
+    Now(Option<String>),
+    WhenLoaded,
+}
+
+fn read_bound(chat: &Chat) -> ReadBound {
+    match newest_shared_message(chat) {
+        Some(newest) => ReadBound::Now(Some(newest)),
+        // Nothing to name and nothing behind it, so there is no boundary for
+        // the daemon to hold this against either.
+        None if chat.last_message.is_none() => ReadBound::Now(None),
+        None => ReadBound::WhenLoaded,
+    }
+}
+
+fn chat_read_can_be_committed(
+    window_focused: bool,
+    application_active: bool,
+    client_available: bool,
+) -> bool {
+    window_focused && application_active && client_available
+}
+
+fn chat_read_needs_resume(chat: &Chat, owed: bool) -> bool {
+    owed || chat.unread_count > 0 || chat.manually_unread
+}
+
+fn read_is_allowed(
+    window_focused: bool,
+    application_active: bool,
+    chat_visible: bool,
+    is_from_me: bool,
+) -> bool {
+    window_focused && application_active && chat_visible && !is_from_me
+}
+
+/// Stable, opaque identity for one conversation's desktop notification.
+///
+/// The operating system persists notification tags, so the raw address does
+/// not belong in one. FNV-1a is sufficient here: this is replacement identity,
+/// not authentication, and the app resolves a response against the chats it
+/// already holds before opening anything.
+fn notification_tag(jid: &str) -> String {
+    let mut hash = 14_695_981_039_346_656_037u64;
+    for byte in jid.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    format!("velo-chat-{hash:016x}")
+}
+
+fn notification_chat_jid(chats: &[Arc<Chat>], tag: &str) -> Option<String> {
+    chats
+        .iter()
+        .find(|chat| notification_tag(&chat.jid) == tag)
+        .map(|chat| chat.jid.clone())
+}
+
+/// The newest message in `chat` that the daemon has also seen.
+///
+/// Which excludes a send this window has drawn but not yet had named, as well
+/// as its own notices: until `MessageIdAssigned` lands, the id is one
+/// [`WhatsAppApp::next_local_id`] invented here and the daemon has never
+/// heard of. That matters because messages sort by `(timestamp, id)` and a
+/// local id sorts after the uppercase hex the server issues, so a reply
+/// arriving in the same second as a send still in flight left the local id as
+/// the newest — the daemon refuses a read naming a message it does not know,
+/// the badge clears here anyway, no receipt goes out, and the next hydration
+/// puts it straight back.
+///
+/// The *id*, not the send's status. A send is renamed before the network
+/// attempt, so a bubble can be `Pending` or `Failed` and still carry a real
+/// id the daemon has folded into its own tracker; excluded by status, a chat
+/// whose only row is a failed send could never be read at all — `read_bound`
+/// answers `WhenLoaded`, and no load changes the answer.
+fn newest_shared_message(chat: &Chat) -> Option<String> {
+    chat.messages
+        .iter()
+        .rev()
+        .find(|message| message.system.is_none() && !is_local_id(&message.id))
+        .map(|message| message.id.clone())
+}
+
+/// Whether this id is one this window invented and nothing else has seen.
+///
+/// Beside [`WhatsAppApp::next_local_id`], which is its only producer, so the
+/// two cannot drift: every id it makes carries the prefix it was asked for
+/// and then an underscore, and the server's own ids are uppercase hex.
+fn is_local_id(id: &str) -> bool {
+    LOCAL_ID_PREFIXES
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
+}
+
+/// Every prefix [`WhatsAppApp::next_local_id`] is called with for something
+/// that becomes a message. A call's placeholder is not one: it names a call.
+const LOCAL_ID_PREFIXES: [&str; 2] = ["local_", "local_audio_"];
+
+impl WhatsAppApp {
+    /// One second, for the two things that change with no event behind them.
+    ///
+    /// A pairing code expires on a wall clock, and `theme.json` changes when a
+    /// person saves it in an editor. Neither produces anything to react to, so
+    /// without this the countdown sat at the second it was issued until an
+    /// unrelated event repainted the window, and `reload_if_changed` — written
+    /// to be polled — had no caller at all.
+    ///
+    /// One task rather than two, and it only runs while there is something to
+    /// watch: it stops as soon as pairing ends, unless a theme file exists to
+    /// keep watching.
+    /// Start polling `theme.json`, whatever the connection is doing.
+    ///
+    /// The same heartbeat drives the pairing countdown, which is why it is
+    /// armed from there too; this is the other reason it has to run.
+    pub fn watch_theme_file(&mut self, cx: &mut Context<Self>) {
+        self.ensure_heartbeat(cx);
+    }
+
+    fn ensure_heartbeat(&mut self, cx: &mut Context<Self>) {
+        if self.heartbeat.is_some() {
+            return;
+        }
+        self.heartbeat = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            loop {
+                crate::platform::sleep(std::time::Duration::from_secs(1)).await;
+                // A `stat` unless the stamp moved, which is why polling a
+                // file a person edits by hand is affordable.
+                let (theme_changed, watching) = cx.update(|cx| {
+                    let changed = crate::theme::reload_if_changed(cx);
+                    // The base font is the window's rem reference, so a
+                    // reload that moves it leaves every frame already laid
+                    // out measured against the old scale — tokens reporting
+                    // one size into a layout built for another. Both
+                    // interactive paths call `window.refresh()` for this;
+                    // editing the file by hand deserves the same.
+                    if changed {
+                        cx.refresh_windows();
+                    }
+                    (changed, crate::theme::watches_a_file(cx))
+                });
+
+                let alive = entity.update(cx, |app, cx| {
+                    let pairing = matches!(app.app_state, AppState::WaitingForPairing { .. });
+                    if theme_changed {
+                        app.adopt_reloaded_theme(cx);
+                    }
+                    if pairing || theme_changed {
+                        cx.notify();
+                    }
+                    // The countdown stops mattering the moment pairing ends;
+                    // the file does not.
+                    pairing || watching
+                });
+                match alive {
+                    Ok(true) => continue,
+                    // Nothing left to tick, or the view is gone.
+                    Ok(false) | Err(_) => break,
+                }
+            }
+            let _ = entity.update(cx, |app, _| app.heartbeat = None);
+        }));
+    }
+}
+
+impl Focusable for WhatsAppApp {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.chat_list_focus.clone()
+    }
+}
+
+impl Render for WhatsAppApp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.search
+            .update(cx, |search, cx| search.refresh_language(window, cx));
+        self.reconcile_media_owner(cx);
+        self.observe_window_activation(window, cx);
+        let unread = self.unread_chat_count();
+        let theme = gpui_component::ActiveTheme::theme(&**cx);
+        let (fill, ink) = (theme.primary.to_rgb(), theme.primary_foreground.to_rgb());
+        crate::platform::taskbar::show(
+            window,
+            crate::platform::taskbar::label(unread).map(|label| crate::platform::taskbar::Badge {
+                label,
+                description: crate::tr!(unread_chats, unread).to_string(),
+                fill,
+                ink,
+            }),
+        );
+        // First, because every dimension below resolves from the scale this
+        // settles: the window's size is folded into the base font here and
+        // nowhere else, which is what lets a 480×640 handheld get the whole
+        // design at its own size without a single component learning that
+        // small screens exist. See `theme::fit_to_viewport`.
+        if crate::theme::fit_to_viewport(window.viewport_size(), cx) {
+            // Frames already laid out against the previous scale are stale —
+            // including the rem gpui-component's own controls resolve from.
+            window.refresh();
+        }
+        let entity = cx.entity();
+        if self.body.is_none() {
+            self.body = Some(cx.new(|cx| body::Body::new(self, entity.clone(), cx)));
+        }
+        let body = self.body.as_ref().unwrap().clone();
+
+        // Window-level commands hang off the root so they work wherever focus
+        // happens to be, which is the point of a window-level command.
+        let root = div()
+            .size_full()
+            // The window's own keyboard target. Every frame draws it, which
+            // is what makes it somewhere focus can always be put — and what
+            // brings the handlers below into the dispatch path, since a
+            // focused handle that is not in the frame sends keys to gpui's
+            // root and never reaches ours.
+            .track_focus(&self.root_focus)
+            // The call overlay is positioned against this box, because it
+            // outlives the branch below: a phone ringing while Settings is
+            // open is still a phone ringing.
+            .relative()
+            .on_action(cx.listener(|app, _: &FocusSearch, window, cx| {
+                app.focus_search(window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &NextChat, window, cx| {
+                app.select_next_chat(window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &PreviousChat, window, cx| {
+                app.select_previous_chat(window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &NextUnreadChat, window, cx| {
+                app.select_next_unread_chat(window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &ToggleContactInfo, _window, cx| {
+                app.toggle_contact_info(cx);
+            }))
+            .on_action(cx.listener(|app, _: &ToggleSharedFiles, _window, cx| {
+                if app.selected_chat.is_some() {
+                    app.shared_files_open = !app.shared_files_open;
+                    if app.shared_files_open {
+                        app.contact_info_open = false;
+                    }
+                    cx.notify();
+                }
+            }))
+            .on_action(
+                cx.listener(|app, _: &ToggleConversationSearch, window, cx| {
+                    app.toggle_conversation_search(window, cx);
+                }),
+            )
+            .on_action(cx.listener(|app, _: &PageChatHistoryUp, window, cx| {
+                app.page_chat_history(false, window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &PageChatHistoryDown, window, cx| {
+                app.page_chat_history(true, window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &OpenSettings, window, cx| {
+                app.open_settings(window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &CloseOverlay, window, cx| {
+                app.close_overlay(window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &ReturnToCall, _window, cx| {
+                app.return_to_call(cx);
+            }))
+            // The message actions land here rather than on the bubble that
+            // raised them: a popup menu dispatches from its own focus, which
+            // is inside the menu and not inside the row, and the root is the
+            // one ancestor both paths share.
+            .on_action(cx.listener(|app, edit: &EditMessage, window, cx| {
+                app.begin_message_edit(&edit.id, window, cx);
+            }))
+            .on_action(cx.listener(|app, reply: &ReplyToMessage, window, cx| {
+                app.begin_reply(&reply.id, window, cx);
+            }))
+            .on_action(cx.listener(|app, retry: &RetryMessage, window, cx| {
+                app.retry_send(&retry.id, window, cx);
+            }))
+            .on_action(cx.listener(|app, react: &ReactToMessage, window, cx| {
+                app.toggle_reaction(&react.id, &react.emoji, window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &forward::NewChat, window, cx| {
+                app.open_new_chat(window, cx);
+            }))
+            .on_action(
+                cx.listener(|app, forward: &forward::ForwardMessage, window, cx| {
+                    app.open_forward_picker(&forward.jid, &forward.id, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|app, delete: &DeleteSentMessage, _window, cx| {
+                app.begin_message_delete(&delete.jid, &delete.id, delete.for_everyone, cx);
+            }))
+            .on_action(|copy: &CopyMessage, _window, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.text.to_string()));
+            })
+            .on_action(|link: &OpenMessageLink, _window, cx| {
+                cx.open_url(&link.url);
+            });
+        let root = Self::register_chat_action_handlers(root, cx);
+
+        // Whether this frame draws the app rather than a screen on the way to
+        // it, computed before the borrow below.
+        let connected = matches!(
+            self.app_state,
+            AppState::Connected | AppState::Offline | AppState::OfflineLoggedOut { .. }
+        );
+
+        let paste_preview = self.paste_preview.as_ref().map(|preview| {
+            render_paste_preview(
+                PastePreviewProps {
+                    files: &preview.files,
+                    caption: preview.caption.as_ref(),
+                    list_scroll: &preview.list_scroll,
+                    app: cx.entity().clone(),
+                    can_send: self.can_send(),
+                    focus_handle: &self.paste_preview_focus,
+                    metrics: cx.product().metrics,
+                },
+                cx,
+            )
+            .into_any_element()
+        });
+        let message_delete = self
+            .delete_confirmation
+            .as_ref()
+            .map(|confirmation| {
+                message_actions::render_message_delete(
+                    confirmation,
+                    cx.entity().clone(),
+                    &self.message_delete_focus,
+                    cx,
+                )
+                .into_any_element()
+            })
+            .or_else(|| {
+                // The same modal surface and focus as a message deletion:
+                // the two never show together, and every keyboard rule the
+                // root keeps for one (Escape, the focus trap) holds for both.
+                self.chat_confirmation.as_ref().map(|confirmation| {
+                    chat_actions::render_chat_confirmation(
+                        confirmation,
+                        cx.entity().clone(),
+                        &self.message_delete_focus,
+                        cx,
+                    )
+                    .into_any_element()
+                })
+            })
+            .or_else(|| {
+                self.forward_picker.as_ref().map(|picker| {
+                    self.render_forward_picker(picker, &self.message_delete_focus, cx)
+                        .into_any_element()
+                })
+            });
+
+        // Outside the Settings-versus-conversation branch on purpose. The
+        // card and the focus it takes were built by the conversation view
+        // alone, so a call arriving while Settings was open rang at the far
+        // end with nothing on screen to answer or refuse it — and no working
+        // shortcut either — until the user happened to close Settings.
+        // Modal surfaces own mouse and keyboard input while open. Keep the
+        // call state alive underneath them, but do not render an interactive
+        // call card above a fullscreen viewer or confirmation surface.
+        let paste_preview_open = paste_preview.is_some();
+        let message_delete_open = message_delete.is_some();
+        let media_viewer_open = self.viewer.read(cx).showing().is_some();
+        let modal_open = paste_preview_open || message_delete_open || media_viewer_open;
+        let call_overlay = (connected && !modal_open)
+            .then(|| render_call_overlay(self, window, cx))
+            .flatten();
+
+        // The card is the one surface the root draws itself, so it is the
+        // one the root answers for.
+        let call_card = call_overlay.is_some();
+
+        // Above the call card as well as the body: a notice raised by
+        // something the call did is about the call, and a card that covered
+        // it would leave the sentence unread. A view rather than a slice read
+        // out of here, so the clock taking a line down repaints the stack and
+        // asks nothing of the conversation underneath it; the stack draws
+        // nothing at all while it is empty.
+        let conversation_strip = !self.showing_settings(cx)
+            && self.destination.has_conversations()
+            && self.responsive_layout(window, cx).show_chat_area()
+            && self.selected_destination_jid().is_some();
+        let offline_banner =
+            self.offline_recovery()
+                .filter(|_| !conversation_strip)
+                .map(|recovery| {
+                    crate::views::render_offline_strip(
+                        entity.clone(),
+                        recovery,
+                        cx.product().metrics,
+                        cx,
+                    )
+                });
+        #[cfg(not(target_family = "wasm"))]
+        let window_bar = Some(crate::components::render_window_bar(cx));
+        #[cfg(target_family = "wasm")]
+        let window_bar: Option<gpui::Empty> = None;
+        root.child(
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .children(window_bar)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(body.cached(gpui::StyleRefinement::default().size_full())),
+                )
+                .children(offline_banner),
+        )
+        .children(paste_preview)
+        .children(message_delete.map(|modal| {
+            crate::motion::fade_in(div().absolute().inset_0().child(modal), "modal-in")
+        }))
+        .children(call_overlay.map(|card| {
+            // A fade, not a rise: the wrapper is absolutely placed over the
+            // window, and the rise works by making its element relative.
+            crate::motion::fade_in(div().absolute().inset_0().child(card), "call-card-in")
+        }))
+        .child(self.notices().clone())
+        // Cached views report their surfaces in prepaint. Move focus after
+        // drawing, when focus can schedule the frame that delivers blur/focus.
+        .child(
+            gpui::canvas(
+                move |_, window, cx| {
+                    entity.update(cx, |app, _| {
+                        app.keyboard_surfaces.call_card = call_card;
+                        app.keyboard_surfaces.paste_preview = paste_preview_open;
+                        app.keyboard_surfaces.message_delete = message_delete_open;
+                    });
+                    let entity = entity.downgrade();
+                    window.defer(cx, move |window, cx| {
+                        let _ = entity.update(cx, |app, cx| {
+                            app.sync_overlay_focus(window, cx);
+                        });
+                    });
+                },
+                |_, (), _, _| {},
+            )
+            .absolute(),
+        )
+    }
+}
+
+/// Drop the least recently built timelines, sparing the one on screen.
+///
+/// The build number is a monotonic counter stamped when a timeline is built,
+/// so the smallest ones are the conversations nothing has touched for
+/// longest. Rebuilding one costs a pass over its rows, which is what opening
+/// a conversation already pays.
+fn evict_stale_timelines(cache: &mut HashMap<String, MessageListCache>, keep: &str) {
+    if cache.len() <= MAX_CACHED_TIMELINES {
+        return;
+    }
+    let mut by_age: Vec<(usize, String)> = cache
+        .iter()
+        .filter(|(jid, _)| jid.as_str() != keep)
+        .map(|(jid, rows)| (rows.build, jid.clone()))
+        .collect();
+    by_age.sort_unstable();
+    for (_, jid) in by_age
+        .into_iter()
+        .take(cache.len().saturating_sub(MAX_CACHED_TIMELINES))
+    {
+        cache.remove(&jid);
+    }
+}
+
+/// Whether the decoded-image cache should give up an entry.
+///
+/// Two bounds and a floor, in one place because they only make sense
+/// together: entries are capped absolutely, bytes are capped only while
+/// there is more than a viewport left to cap. See [`MIN_DECODED_IMAGES`].
+fn over_budget(held: usize, entries: usize) -> bool {
+    entries >= MAX_DECODED_IMAGES || (held > DECODED_IMAGE_BUDGET && entries > MIN_DECODED_IMAGES)
+}
+
+/// Where `chat` belongs in a sidebar-ordered list that does not contain it:
+/// the first slot whose neighbour sorts strictly after it.
+///
+/// An unpinned head sorts below every pinned one and a `None` head below
+/// every dated one, so an empty conversation lands behind every dated
+/// one — the same place the merge sort puts it.
+fn slot_for_chat(rest: &[Arc<Chat>], chat: &Chat) -> usize {
+    rest.iter()
+        .position(|other| chats::chat_list_order(chat, other) == std::cmp::Ordering::Less)
+        .unwrap_or(rest.len())
+}
+
+/// What a decoded image was decoded from.
+///
+/// A message's bytes are not fixed: a preview is replaced by the real
+/// picture, and one of the two paths that does it — `fill`, on the way in
+/// from the daemon — never reaches the app at all. So the cache remembers
+/// enough to notice, rather than trusting whoever swapped the bytes to have
+/// evicted the entry.
+///
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cached {
+    bytes: usize,
+    format: gpui::ImageFormat,
+    preview: bool,
+    identity: usize,
+}
+
+type StickerValidation = (Cached, bool, Arc<Vec<u8>>);
+
+/// Whether the timeline this frame is building may ask for the page before
+/// it.
+///
+/// Both halves, and they are different questions. `anchored` is about the
+/// list's geometry: there is one list for whichever chat is on screen, so on
+/// the frame a reader opens a new conversation it still holds the
+/// measurements of the one they left, and a chat left near its top would have
+/// every chat opened after it ask for history nobody had scrolled to.
+/// `visible` is about the screen: the selection outlives it — a phone's Back
+/// leaves it standing, and so do Status and the fullscreen viewer — while the
+/// measurements stay frozen where the reader left them, so a conversation
+/// nobody is drawing went on asking for a page every frame, for ever, since a
+/// list with nothing to scroll answers "at the top" permanently.
+fn timeline_may_page(visible: Option<&str>, anchored: Option<&str>, chat_jid: &str) -> bool {
+    visible == Some(chat_jid) && anchored == Some(chat_jid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct SelectionExitTestView {
+        focus_handle: FocusHandle,
+        selection_key: crate::components::rich_text_selection::MessageSelection,
+    }
+
+    impl Render for SelectionExitTestView {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let text = crate::components::BubbleText::of("alpha beta");
+            div().track_focus(&self.focus_handle).size_full().child(
+                div()
+                    .id("message-row")
+                    .w(gpui::px(400.))
+                    .h(gpui::px(40.))
+                    .child(crate::components::render_message_segment(
+                        &text,
+                        self.selection_key.clone(),
+                        self.selection_key.document_order(0),
+                        cx,
+                    )),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn repeated_cache_misses_preserve_unchanged_message_selection(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let jid = "peer@example.invalid";
+        let mut focus_handle = None;
+        let mut app_entity = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let app = cx.new(|cx| {
+                let mut app = WhatsAppApp::new(cx);
+                let mut chat = Chat::new(jid.to_string());
+                chat.messages.push(ChatMessage::new_incoming(
+                    "test-message".into(),
+                    jid.into(),
+                    "alpha beta".into(),
+                ));
+                app.chats.push(Arc::new(chat));
+                app.selected_chat = Some(jid.to_string());
+                app
+            });
+            app.update(cx, |app, _| app.set_modal_window(window.window_handle()));
+            app_entity = Some(app);
+            let view = cx.new(|cx| {
+                let handle = cx.focus_handle();
+                focus_handle = Some(handle.clone());
+                SelectionExitTestView {
+                    focus_handle: handle,
+                    selection_key: Arc::<str>::from("test-message").into(),
+                }
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            focus_handle.as_ref().unwrap().focus(window, cx);
+        });
+        visual.simulate_mouse_down(
+            gpui::point(gpui::px(1.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_move(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_up(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
+            "alpha "
+        );
+
+        visual.update(|window, cx| {
+            app_entity.as_ref().unwrap().update(cx, |app, cx| {
+                // Model the call-history path: two updates before another list
+                // frame leaves the render cache absent both times.
+                app.invalidate_message_cache(jid, cx);
+                app.invalidate_message_cache(jid, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
+            "alpha "
+        );
+    }
+
+    #[gpui::test]
+    fn business_segment_selection_survives_unrelated_updates_and_clears_when_changed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::components::rich_text_selection::{MessageSelection, MessageTextSegment};
+        use velo_core::{BusinessContent, BusinessKind};
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        for segment in [MessageTextSegment::Header, MessageTextSegment::Footer] {
+            let jid = "peer@example.invalid";
+            let mut focus_handle = None;
+            let mut app_entity = None;
+            let (_, visual) = cx.add_window_view(|window, cx| {
+                let app = cx.new(|cx| {
+                    let mut app = WhatsAppApp::new(cx);
+                    let mut chat = Chat::new(jid.into());
+                    let mut message = ChatMessage::new_incoming(
+                        "test-message".into(),
+                        jid.into(),
+                        "different body".into(),
+                    );
+                    message.business = Some(BusinessContent {
+                        kind: BusinessKind::Template,
+                        header: "alpha beta".into(),
+                        body: "different body".into(),
+                        footer: "alpha beta".into(),
+                        buttons: vec![],
+                        notice: None,
+                    });
+                    chat.messages.push(message);
+                    let cache = MessageListCache::new(&chat.messages, false, None);
+                    app.chats.push(Arc::new(chat));
+                    app.message_list_cache
+                        .borrow_mut()
+                        .insert(jid.into(), cache);
+                    app.selected_chat = Some(jid.into());
+                    app
+                });
+                app.update(cx, |app, _| app.set_modal_window(window.window_handle()));
+                app_entity = Some(app);
+                let view = cx.new(|cx| {
+                    let handle = cx.focus_handle();
+                    focus_handle = Some(handle.clone());
+                    SelectionExitTestView {
+                        focus_handle: handle,
+                        selection_key: MessageSelection {
+                            message_id: Arc::from("test-message"),
+                            segment,
+                        },
+                    }
+                });
+                gpui_component::Root::new(view, window, cx)
+            });
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                focus_handle.as_ref().unwrap().focus(window, cx);
+            });
+            visual.simulate_mouse_down(
+                gpui::point(gpui::px(1.), gpui::px(12.)),
+                gpui::MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            visual.simulate_mouse_move(
+                gpui::point(gpui::px(58.), gpui::px(12.)),
+                Some(gpui::MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            visual.simulate_mouse_up(
+                gpui::point(gpui::px(58.), gpui::px(12.)),
+                gpui::MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            assert_eq!(
+                visual.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    let snapshots =
+                        crate::components::rich_text_selection::active_selection_message_snapshots(
+                            window.window_handle().window_id(),
+                            cx,
+                        );
+                    assert_eq!(snapshots.len(), 1);
+                    assert_eq!(snapshots[0].0.message_id.as_ref(), "test-message");
+                    assert_eq!(snapshots[0].0.segment, segment);
+                    gpui_base::TextSelection::selected_text(window, cx)
+                }),
+                "alpha "
+            );
+            // Daemon events invalidate without holding a Window lease.
+            visual.cx.update(|cx| {
+                app_entity.as_ref().unwrap().update(cx, |app, cx| {
+                    app.find_chat_mut(jid)
+                        .unwrap()
+                        .messages
+                        .push(ChatMessage::new_incoming(
+                            "unrelated".into(),
+                            jid.into(),
+                            "new message".into(),
+                        ));
+                    app.invalidate_message_cache(jid, cx);
+                    app.invalidate_message_cache(jid, cx);
+                });
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(
+                visual.update(gpui_base::TextSelection::selected_text),
+                "alpha "
+            );
+            // Daemon events invalidate without holding a Window lease.
+            visual.cx.update(|cx| {
+                app_entity.as_ref().unwrap().update(cx, |app, cx| {
+                    let business = app.find_chat_mut(jid).unwrap().messages[0]
+                        .business
+                        .as_mut()
+                        .unwrap();
+                    match segment {
+                        MessageTextSegment::Header => business.header = "changed".into(),
+                        MessageTextSegment::Footer => business.footer = "changed".into(),
+                        _ => unreachable!(),
+                    }
+                    app.invalidate_message_cache(jid, cx);
+                });
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(visual.update(gpui_base::TextSelection::selected_text), "");
+        }
+    }
+
+    #[gpui::test]
+    fn leaving_connected_view_clears_selected_message_text(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut focus_handle = None;
+        let mut app_entity = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let app = cx.new(WhatsAppApp::new);
+            app.update(cx, |app, _| app.set_modal_window(window.window_handle()));
+            app_entity = Some(app);
+            let view = cx.new(|cx| {
+                let handle = cx.focus_handle();
+                focus_handle = Some(handle.clone());
+                SelectionExitTestView {
+                    focus_handle: handle,
+                    selection_key: Arc::<str>::from("test-message").into(),
+                }
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            focus_handle.as_ref().unwrap().focus(window, cx);
+        });
+        visual.simulate_mouse_down(
+            gpui::point(gpui::px(1.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_move(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_up(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
+            "alpha "
+        );
+
+        visual.update(|window, cx| {
+            app_entity
+                .as_ref()
+                .unwrap()
+                .update(cx, |app, cx| app.leave_connected_view(Some(window), cx));
+        });
+        assert_eq!(
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_sent_receipt_replaces_only_the_outgoing_pending_clock() {
+        assert_eq!(receipt_status(ReceiptType::Sent), Some(MessageStatus::Sent));
+
+        let mut chat = Chat::new("12025550143@s.whatsapp.net".to_string());
+        let mut pending = ChatMessage::new_outgoing("ACKED-1".to_string(), "waiting".to_string());
+        pending.status = MessageStatus::Pending;
+        let mut delivered =
+            ChatMessage::new_outgoing("DELIVERED-1".to_string(), "already there".to_string());
+        delivered.status = MessageStatus::Delivered;
+        let mut failed =
+            ChatMessage::new_outgoing("FAILED-1".to_string(), "did not leave".to_string());
+        failed.status = MessageStatus::Failed;
+        let incoming = ChatMessage::new_incoming(
+            "INCOMING-1".to_string(),
+            "12025550143@s.whatsapp.net".to_string(),
+            "hello".to_string(),
+        );
+        chat.messages = vec![pending, delivered, failed, incoming];
+
+        assert_eq!(
+            chat.advance_status(&["ACKED-1".to_string()], MessageStatus::Sent),
+            1
+        );
+        assert_eq!(chat.messages[0].status, MessageStatus::Sent);
+        assert_eq!(
+            chat.advance_status(&["DELIVERED-1".to_string()], MessageStatus::Sent),
+            0,
+            "an older acknowledgement must not regress delivery"
+        );
+        assert_eq!(chat.messages[1].status, MessageStatus::Delivered);
+        assert_eq!(
+            chat.advance_status(&["FAILED-1".to_string()], MessageStatus::Sent),
+            0,
+            "a late acknowledgement must not revive a failed send"
+        );
+        assert_eq!(chat.messages[2].status, MessageStatus::Failed);
+        assert_eq!(
+            chat.advance_status(&["INCOMING-1".to_string()], MessageStatus::Sent),
+            0,
+            "our delivery state never belongs on an incoming message"
+        );
+    }
+
+    #[test]
+    fn reads_require_a_focused_visible_chat() {
+        assert!(!read_is_allowed(false, true, true, false));
+        assert!(!read_is_allowed(true, false, true, false));
+        assert!(!read_is_allowed(true, true, false, false));
+        assert!(!read_is_allowed(true, true, true, true));
+        assert!(read_is_allowed(true, true, true, false));
+    }
+
+    #[test]
+    fn chat_reads_stay_pending_until_window_and_client_can_commit_them() {
+        assert!(!chat_read_can_be_committed(false, true, true));
+        assert!(!chat_read_can_be_committed(true, false, true));
+        assert!(!chat_read_can_be_committed(true, true, false));
+        assert!(chat_read_can_be_committed(true, true, true));
+    }
+
+    #[test]
+    fn an_owed_read_is_resumed_after_local_badge_was_cleared() {
+        let mut row = chat("a@s.whatsapp.net", Some(10));
+        row.mark_as_read();
+
+        assert!(!chat_read_needs_resume(&row, false));
+        assert!(chat_read_needs_resume(&row, true));
+    }
+
+    #[test]
+    fn a_notification_tag_can_be_resolved_after_chat_hydration() {
+        let jid = "archived@example.invalid";
+        let tag = notification_tag(jid);
+        let mut chats = Vec::new();
+
+        // A response can arrive before either the active or archived page.
+        assert_eq!(notification_chat_jid(&chats, &tag), None);
+
+        let mut archived = Chat::with_name(jid.into(), "Archived contact".into());
+        archived.archived = true;
+        chats.push(Arc::new(archived));
+        assert_eq!(notification_chat_jid(&chats, &tag).as_deref(), Some(jid));
+    }
+
+    #[test]
+    fn notification_clicks_retry_in_fifo_order_with_newest_last() {
+        let mut queue = VecDeque::new();
+        enqueue_pending_notification(&mut queue, "chat-a");
+        enqueue_pending_notification(&mut queue, "chat-b");
+
+        assert_eq!(queue.pop_front().as_deref(), Some("chat-a"));
+        assert_eq!(queue.pop_front().as_deref(), Some("chat-b"));
+    }
+
+    #[test]
+    fn notification_click_queue_is_deduplicated_without_dropping_clicks() {
+        let mut queue = VecDeque::new();
+        enqueue_pending_notification(&mut queue, "chat-a");
+        enqueue_pending_notification(&mut queue, "chat-b");
+        enqueue_pending_notification(&mut queue, "chat-a");
+        assert_eq!(
+            queue.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["chat-b", "chat-a"]
+        );
+        enqueue_pending_notification(&mut queue, "chat-c");
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue.back().map(String::as_str), Some("chat-c"));
+    }
+
+    #[test]
+    fn notification_page_retry_backoff_doubles_and_is_capped() {
+        let mut delay = NOTIFICATION_PAGE_RETRY_DELAY;
+        assert_eq!(delay, std::time::Duration::from_millis(150));
+        for expected in [300, 600, 1_200, 2_400, 4_800, 9_600, 19_200] {
+            delay = next_notification_retry_delay(delay);
+            assert_eq!(delay, std::time::Duration::from_millis(expected));
+        }
+        assert_eq!(
+            next_notification_retry_delay(delay),
+            MAX_NOTIFICATION_PAGE_RETRY_DELAY
+        );
+        assert_eq!(
+            next_notification_retry_delay(MAX_NOTIFICATION_PAGE_RETRY_DELAY),
+            MAX_NOTIFICATION_PAGE_RETRY_DELAY
+        );
+    }
+
+    #[gpui::test]
+    fn queued_notification_clicks_select_newest_after_both_chats_hydrate(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_app_identity("io.github.RuchinAudichya.Velo.Test", "Velo Test");
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            init_app_bindings(cx);
+        });
+        let mut app_entity = None;
+        let window = cx.open_window(gpui::size(gpui::px(1000.), gpui::px(800.)), |window, cx| {
+            let app = cx.new(|cx| {
+                let mut app = WhatsAppApp::new(cx);
+                app.app_state = AppState::Connected;
+                app.destination = Destination::Chats;
+                app
+            });
+            app_entity = Some(app.clone());
+            gpui_component::Root::new(app, window, cx)
+        });
+        let app = app_entity.unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let first_jid = "first@example.invalid";
+        let second_jid = "second@example.invalid";
+        let first_tag = notification_tag(first_jid);
+        let second_tag = notification_tag(second_jid);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            app.update(cx, |app, cx| {
+                app.set_notification_window(window.window_handle());
+                app.open_system_notification(&first_tag, window, cx);
+                app.open_system_notification(&second_tag, window, cx);
+                assert_eq!(
+                    app.pending_notification_tags.iter().collect::<Vec<_>>(),
+                    [&first_tag, &second_tag]
+                );
+            });
+        });
+        // Both responses arrived before either row. Hydrate only the newer
+        // row first: an unresolved older entry must not block it.
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.chats.push(Arc::new(Chat::new(second_jid.to_string())));
+                app.retry_pending_notification(cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(app.read(cx).selected_chat.as_deref(), Some(second_jid));
+            assert_eq!(
+                app.read(cx)
+                    .pending_notification_tags
+                    .iter()
+                    .collect::<Vec<_>>(),
+                [&first_tag]
+            );
+        });
+
+        // The older tag is eventually consumed, but latest-click-wins keeps
+        // it from navigating away from the newer selection.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.chats.push(Arc::new(Chat::new(first_jid.to_string())));
+                app.retry_pending_notification(cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(app.read(cx).selected_chat.as_deref(), Some(second_jid));
+            assert!(app.read(cx).pending_notification_tags.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn a_hydrated_newer_notification_opens_without_waiting_on_an_older_one(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_app_identity("io.github.RuchinAudichya.Velo.Test", "Velo Test");
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            init_app_bindings(cx);
+        });
+        let mut app_entity = None;
+        let window = cx.open_window(gpui::size(gpui::px(1000.), gpui::px(800.)), |window, cx| {
+            let app = cx.new(|cx| {
+                let mut app = WhatsAppApp::new(cx);
+                app.app_state = AppState::Connected;
+                app.destination = Destination::Chats;
+                app
+            });
+            app_entity = Some(app.clone());
+            gpui_component::Root::new(app, window, cx)
+        });
+        let app = app_entity.unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let older_jid = "older@example.invalid";
+        let newer_jid = "newer@example.invalid";
+        let older_tag = notification_tag(older_jid);
+        let newer_tag = notification_tag(newer_jid);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            app.update(cx, |app, cx| {
+                app.set_notification_window(window.window_handle());
+                app.open_system_notification(&older_tag, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.chats.push(Arc::new(Chat::new(newer_jid.to_string())));
+                app.open_system_notification(&newer_tag, window, cx);
+                assert_eq!(app.selected_chat.as_deref(), Some(newer_jid));
+                assert_eq!(
+                    app.pending_notification_tags.iter().collect::<Vec<_>>(),
+                    [&older_tag]
+                );
+            });
+            window.draw(cx).clear(cx);
+        });
+
+        // The older tag is still retried, but its late resolution cannot
+        // steal focus from the newer click.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.chats.push(Arc::new(Chat::new(older_jid.to_string())));
+                app.retry_pending_notification(cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(app.read(cx).selected_chat.as_deref(), Some(newer_jid));
+            assert!(app.read(cx).pending_notification_tags.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn a_phone_read_message_never_raises_a_system_notification(cx: &mut gpui::TestAppContext) {
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                let mut message = ChatMessage::new_incoming(
+                    "READ".into(),
+                    "peer@example.invalid".into(),
+                    "Already read".into(),
+                );
+                message.is_read = true;
+                app.handle_message_received(
+                    "peer@example.invalid".into(),
+                    message,
+                    None,
+                    IncomingMessageMetadata::new(true, None, Some(false), None),
+                    cx,
+                );
+            })
+        });
+        assert!(cx.shown_system_notifications().is_empty());
+    }
+
+    #[gpui::test]
+    fn an_incoming_message_outside_the_active_chat_raises_one_system_notification(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let app = cx.update(|cx| {
+            cx.set_app_identity("io.github.RuchinAudichya.Velo.Test", "Velo Test");
+            cx.new(|cx| {
+                let mut app = WhatsAppApp::new(cx);
+                app.chats.push(Arc::new(Chat::with_name(
+                    "peer@example.invalid".into(),
+                    "Example contact".into(),
+                )));
+                let mut muted =
+                    Chat::with_name("muted@example.invalid".into(), "Muted contact".into());
+                muted.muted_until = Some(chrono::DateTime::<chrono::Utc>::MAX_UTC);
+                app.chats.push(Arc::new(muted));
+                app.chats.push(Arc::new(Chat::with_name(
+                    "group@g.us".into(),
+                    "Example group".into(),
+                )));
+                app.visible_chat = Some("elsewhere@example.invalid".into());
+                app.window_focused = true;
+                app
+            })
+        });
+
+        for _ in 0..2 {
+            cx.update(|cx| {
+                app.update(cx, |app, cx| {
+                    app.handle_message_received(
+                        "peer@example.invalid".into(),
+                        ChatMessage::new_incoming(
+                            "MESSAGE-1".into(),
+                            "peer@example.invalid".into(),
+                            "New message".into(),
+                        ),
+                        Some("Example contact".into()),
+                        IncomingMessageMetadata::new(true, None, Some(false), None),
+                        cx,
+                    );
+                });
+            });
+        }
+
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.handle_message_received(
+                    "muted@example.invalid".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-MUTED".into(),
+                        "muted@example.invalid".into(),
+                        "Quiet message".into(),
+                    ),
+                    Some("Muted contact".into()),
+                    IncomingMessageMetadata::new(false, None, None, None),
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                // The phone has unmuted it, but this GUI row has not yet
+                // hydrated that change. The event's store decision wins.
+                app.handle_message_received(
+                    "muted@example.invalid".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-MUTED".into(),
+                        "muted@example.invalid".into(),
+                        "No longer quiet".into(),
+                    ),
+                    Some("Muted contact".into()),
+                    IncomingMessageMetadata::new(true, None, Some(false), None),
+                    cx,
+                );
+            });
+        });
+
+        let notifications = cx.shown_system_notifications();
+        assert_eq!(
+            notifications.len(),
+            2,
+            "an ineligible delivery must not consume the deduplication key"
+        );
+        assert_eq!(notifications[0].title.as_ref(), "Example contact");
+        assert_eq!(notifications[0].body.as_ref(), "New message");
+        assert_eq!(notifications[1].title.as_ref(), "Muted contact");
+        assert_eq!(notifications[1].body.as_ref(), "No longer quiet");
+
+        for sender in ["member-a@example.invalid", "member-b@example.invalid"] {
+            cx.update(|cx| {
+                app.update(cx, |app, cx| {
+                    app.handle_message_received(
+                        "group@g.us".into(),
+                        ChatMessage::new_incoming(
+                            "COLLIDING-ID".into(),
+                            sender.into(),
+                            "Group message".into(),
+                        ),
+                        Some(sender.into()),
+                        IncomingMessageMetadata::new(true, None, Some(false), None),
+                        cx,
+                    );
+                });
+            });
+        }
+        assert_eq!(
+            cx.shown_system_notifications().len(),
+            4,
+            "same message id from two group senders is two notifications"
+        );
+
+        // A live group may not be on any GUI page yet. An unknown store
+        // decision suppresses its first alert, and a known decision carries
+        // the durable subject even though this window has only a fallback.
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.handle_message_received(
+                    "new-group@g.us".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-NEW-1".into(),
+                        "member@example.invalid".into(),
+                        "Muted before hydration".into(),
+                    ),
+                    Some("Member".into()),
+                    IncomingMessageMetadata::new(
+                        false,
+                        Some("Stored subject".into()),
+                        None,
+                        Some("Stored subject".into()),
+                    ),
+                    cx,
+                );
+                assert!(
+                    app.find_chat("new-group@g.us")
+                        .is_some_and(|chat| chat.archived),
+                    "unknown archive state must not place an absent chat in the active inbox"
+                );
+                app.handle_message_received(
+                    "new-group@g.us".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-NEW-2".into(),
+                        "member@example.invalid".into(),
+                        "Allowed before hydration".into(),
+                    ),
+                    Some("Member".into()),
+                    IncomingMessageMetadata::new(
+                        true,
+                        Some("Stored subject".into()),
+                        Some(false),
+                        Some("Stored subject".into()),
+                    ),
+                    cx,
+                );
+            });
+        });
+        let notifications = cx.shown_system_notifications();
+        assert_eq!(notifications.len(), 5);
+        assert_eq!(notifications[4].title.as_ref(), "Stored subject");
+        cx.update(|cx| {
+            app.update(cx, |app, _cx| {
+                assert_eq!(
+                    app.find_chat("new-group@g.us")
+                        .map(|chat| chat.name.as_str()),
+                    Some("Stored subject")
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.handle_message_received(
+                    "known-contact@lid".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-KNOWN-CONTACT".into(),
+                        "known-contact@lid".into(),
+                        "Known before hydration".into(),
+                    ),
+                    None,
+                    IncomingMessageMetadata::new(
+                        false,
+                        None,
+                        Some(false),
+                        Some("Address book contact".into()),
+                    ),
+                    cx,
+                );
+                assert_eq!(
+                    app.find_chat("known-contact@lid")
+                        .map(|chat| chat.name.as_str()),
+                    Some("Address book contact")
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.handle_message_received(
+                    "archived-group@g.us".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-ARCHIVED-MENTION".into(),
+                        "member@example.invalid".into(),
+                        "Mentioned you".into(),
+                    ),
+                    Some("Member".into()),
+                    IncomingMessageMetadata::new(
+                        true,
+                        Some("Mentioned in Archived example".into()),
+                        Some(true),
+                        Some("Archived example".into()),
+                    ),
+                    cx,
+                );
+                assert!(
+                    app.find_chat("archived-group@g.us")
+                        .is_some_and(|chat| chat.archived),
+                    "a mentioned archived group must not reappear in the active list"
+                );
+                assert_eq!(
+                    app.find_chat("archived-group@g.us")
+                        .map(|chat| chat.name.as_str()),
+                    Some("Archived example")
+                );
+            });
+        });
+        assert_eq!(
+            cx.shown_system_notifications()[5].title.as_ref(),
+            "Mentioned in Archived example"
+        );
+
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                // The phone explicitly unarchived this conversation. The
+                // live store answer must remove it from Archived immediately,
+                // without waiting for a later paged history reload.
+                app.handle_message_received(
+                    "archived-group@g.us".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-UNARCHIVED".into(),
+                        "member@example.invalid".into(),
+                        "No longer archived".into(),
+                    ),
+                    Some("Member".into()),
+                    IncomingMessageMetadata::new(
+                        false,
+                        None,
+                        Some(false),
+                        Some("Archived example".into()),
+                    ),
+                    cx,
+                );
+                assert!(
+                    app.find_chat("archived-group@g.us")
+                        .is_some_and(|chat| !chat.archived)
+                );
+
+                // A frame without durable metadata is not an instruction to
+                // unarchive an already-known row (older daemon compatibility).
+                app.find_chat_mut("archived-group@g.us").unwrap().archived = true;
+                app.handle_message_received(
+                    "archived-group@g.us".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-UNKNOWN-ARCHIVE".into(),
+                        "member@example.invalid".into(),
+                        "Unknown archive state".into(),
+                    ),
+                    Some("Member".into()),
+                    IncomingMessageMetadata::new(
+                        false,
+                        None,
+                        None,
+                        Some("Archived example".into()),
+                    ),
+                    cx,
+                );
+                assert!(
+                    app.find_chat("archived-group@g.us")
+                        .is_some_and(|chat| chat.archived)
+                );
+            });
+        });
+        assert_eq!(cx.shown_system_notifications().len(), 6);
+    }
+
+    fn at(secs: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::from_timestamp(secs, 0)
+    }
+
+    fn chat(jid: &str, secs: Option<i64>) -> Chat {
+        let mut chat = Chat::new(jid.to_string());
+        chat.last_message_time = secs.and_then(at);
+        chat
+    }
+
+    fn pinned_chat(jid: &str, pin_secs: i64, secs: Option<i64>) -> Chat {
+        let mut pinned = chat(jid, secs);
+        pinned.pinned_at = at(pin_secs);
+        pinned
+    }
+
+    fn timeline_of(ids: &[&str]) -> MessageListCache {
+        MessageListCache::new(&messages_of(ids), false, None)
+    }
+
+    /// Messages whose day comes from their *name*, not their position: the
+    /// rows a page brings are the rows that chat always had, so `["m3","m4"]`
+    /// and `["m1","m2","m3","m4"]` have to agree about m3 and m4 — dividers
+    /// included, since a divider is a row like any other.
+    fn messages_of(ids: &[&str]) -> Vec<ChatMessage> {
+        ids.iter()
+            .map(|id| {
+                let mut message = ChatMessage::new_incoming(
+                    (*id).to_string(),
+                    "a@s.whatsapp.net".into(),
+                    "olá".into(),
+                );
+                // One day apart, so every row also carries its own divider —
+                // the rows a page brings are never only messages.
+                let day: i64 = id.trim_start_matches('m').parse().unwrap();
+                message.timestamp =
+                    chrono::DateTime::from_timestamp(1_700_000_000 + day * 86_400, 0).unwrap();
+                message
+            })
+            .collect()
+    }
+
+    fn anchored(jid: &str, rows: &MessageListCache, measured: MeasuredAgainst) -> TimelineAnchor {
+        TimelineAnchor {
+            jid: jid.to_string(),
+            measured,
+            rows: rows.clone(),
+        }
+    }
+
+    fn same_layout() -> MeasuredAgainst {
+        MeasuredAgainst {
+            language: crate::i18n::Language::current(),
+            rem: 16.0,
+            width: 600.0,
+        }
+    }
+
+    /// The selection outlives the screen — Back on a phone, a trip to Status,
+    /// the fullscreen viewer — and the list keeps the measurements the reader
+    /// left it with. A conversation nobody draws therefore went on asking for
+    /// a page of history every frame, for ever, since a list with nothing to
+    /// scroll answers "at the top" permanently.
+    #[test]
+    fn a_conversation_nobody_draws_asks_for_nothing() {
+        assert!(timeline_may_page(
+            Some("a@s.whatsapp.net"),
+            Some("a@s.whatsapp.net"),
+            "a@s.whatsapp.net"
+        ));
+        assert!(!timeline_may_page(
+            None,
+            Some("a@s.whatsapp.net"),
+            "a@s.whatsapp.net"
+        ));
+        assert!(!timeline_may_page(
+            Some("b@s.whatsapp.net"),
+            Some("a@s.whatsapp.net"),
+            "a@s.whatsapp.net"
+        ));
+        // And the list still has to be describing this chat's rows.
+        assert!(!timeline_may_page(
+            Some("a@s.whatsapp.net"),
+            Some("b@s.whatsapp.net"),
+            "a@s.whatsapp.net"
+        ));
+        assert!(!timeline_may_page(
+            Some("a@s.whatsapp.net"),
+            None,
+            "a@s.whatsapp.net"
+        ));
+    }
+
+    /// A read is bounded by an id the daemon knows, and a send this window
+    /// has only drawn is not one: `local_…` sorts after the server's
+    /// uppercase hex, so a reply landing in the same second as a send still
+    /// in flight left the invented id as the newest. The daemon refuses it,
+    /// the badge clears here anyway, no receipt goes out, and the next
+    /// hydration puts the badge back.
+    #[test]
+    fn a_read_is_not_bounded_by_a_message_only_this_window_has() {
+        let mut chat = Chat::new("a@s.whatsapp.net".to_string());
+        let mut theirs = ChatMessage::new_incoming(
+            "3EB0ABCDEF".to_string(),
+            "a@s.whatsapp.net".to_string(),
+            "oi".to_string(),
+        );
+        theirs.timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut mine = ChatMessage::new_incoming(
+            WhatsAppApp::next_local_id("local"),
+            "me@s.whatsapp.net".to_string(),
+            "já respondo".to_string(),
+        );
+        mine.is_from_me = true;
+        mine.status = MessageStatus::Pending;
+        mine.timestamp = theirs.timestamp;
+        chat.messages = vec![theirs, mine];
+
+        assert_eq!(
+            newest_shared_message(&chat).as_deref(),
+            Some("3EB0ABCDEF"),
+            "the newest message both sides hold"
+        );
+    }
+
+    /// A send is renamed before the network attempt, so a bubble can be
+    /// `Pending` or `Failed` and still carry a real id the daemon knows. Held
+    /// back by status, a chat whose only row is a failed send could never be
+    /// read: `read_bound` answers `WhenLoaded`, and loading the same page
+    /// cannot change that.
+    #[test]
+    fn a_named_send_can_bound_a_read_however_it_ended() {
+        let mut chat = Chat::new("a@s.whatsapp.net".to_string());
+        let mut failed = ChatMessage::new_incoming(
+            "3EB0FAILED".to_string(),
+            "me@s.whatsapp.net".to_string(),
+            "não saiu".to_string(),
+        );
+        failed.is_from_me = true;
+        failed.status = MessageStatus::Failed;
+        chat.messages = vec![failed];
+
+        assert_eq!(
+            newest_shared_message(&chat).as_deref(),
+            Some("3EB0FAILED"),
+            "the daemon named this one, whatever became of it"
+        );
+        // And every prefix the window invents is still held back.
+        assert!(is_local_id(&WhatsAppApp::next_local_id("local")));
+        assert!(is_local_id(&WhatsAppApp::next_local_id("local_audio")));
+        assert!(!is_local_id("3EB0ABCDEF"));
+    }
+
+    /// A blurred preview used to survive the arrival of the real photo, and
+    /// `is_viewable` then let it be opened full screen: the cache is keyed by
+    /// message id, and only one of the two paths that replaces a preview with
+    /// real bytes evicts — `fill`, on the way in from the daemon, never
+    /// reaches the app at all. It came out after fifty other pictures had
+    /// pushed it through the cache, or an account reset.
+    #[test]
+    fn real_bytes_do_not_read_back_as_the_preview_they_replaced() {
+        let preview = Cached {
+            bytes: 4_096,
+            format: gpui::ImageFormat::Jpeg,
+            preview: true,
+            identity: 1,
+        };
+        let full = Cached {
+            bytes: 812_344,
+            format: gpui::ImageFormat::Jpeg,
+            preview: false,
+            identity: 2,
+        };
+        assert_ne!(preview, full);
+
+        assert_ne!(
+            Cached {
+                bytes: 4_096,
+                format: gpui::ImageFormat::Jpeg,
+                preview: true,
+                identity: 2,
+            },
+            preview
+        );
+
+        // And a sticker's preview is a PNG where the real thing is a WebP,
+        // which the format half is for.
+        assert_ne!(
+            Cached {
+                bytes: 4_096,
+                format: gpui::ImageFormat::Png,
+                preview: true,
+                identity: 3,
+            },
+            preview
+        );
+
+        // The length is a signature two pictures can share; the flag the
+        // replacement always clears is what makes this exact rather than
+        // merely unlikely.
+        assert_ne!(
+            Cached {
+                preview: false,
+                identity: 1,
+                ..preview
+            },
+            preview
+        );
+    }
+
+    /// A page of older history arrives in front of every message the list
+    /// has measured — but *not* in front of the encryption notice, which
+    /// holds index 0 whatever else happens. Spliced there rather than at the
+    /// top, the reader stays where they were reading and every measured row
+    /// keeps its own height; spliced at 0, the notice's height lands on a
+    /// message. Reset, and a reader who scrolled back far enough to ask for
+    /// more is thrown to the newest message for asking.
+    #[test]
+    fn a_page_of_older_history_is_spliced_after_the_notice() {
+        let before = timeline_of(&["m3", "m4"]);
+        let anchor = anchored("a@s.whatsapp.net", &before, same_layout());
+        let after = timeline_of(&["m1", "m2", "m3", "m4"]);
+
+        assert_eq!(
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &after, same_layout()),
+            TimelineSync::Spliced {
+                at: 1,
+                removed: 0,
+                added: after.items.len() - before.items.len(),
+            }
+        );
+    }
+
+    /// A page and an arrival between two frames. Both ends moved, so the
+    /// stretch that changed spans everything between them — which is still
+    /// one splice, and was a reset that threw the reader who had just asked
+    /// for older history to the newest message.
+    #[test]
+    fn a_page_and_an_arrival_in_one_frame_are_one_splice() {
+        let before = timeline_of(&["m3", "m4"]);
+        let anchor = anchored("a@s.whatsapp.net", &before, same_layout());
+        let after = timeline_of(&["m1", "m2", "m3", "m4", "m5"]);
+
+        let TimelineSync::Spliced { at, removed, added } =
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &after, same_layout())
+        else {
+            panic!("both ends moved, and the middle is still the middle");
+        };
+        // The notice is common to both, and so is nothing after it once rows
+        // arrived at either end.
+        assert_eq!(at, 1);
+        assert_eq!(removed, before.items.len() - 1);
+        assert_eq!(added, after.items.len() - 1);
+    }
+
+    /// An arrival is still an append: the rows the list measured are all
+    /// still where it measured them.
+    #[test]
+    fn an_arrival_is_still_spliced_at_the_end() {
+        let before = timeline_of(&["m1", "m2"]);
+        let anchor = anchored("a@s.whatsapp.net", &before, same_layout());
+        let after = timeline_of(&["m1", "m2", "m3"]);
+
+        assert_eq!(
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &after, same_layout()),
+            TimelineSync::Spliced {
+                at: before.items.len(),
+                removed: 0,
+                added: after.items.len() - before.items.len(),
+            }
+        );
+    }
+
+    /// The typing indicator is drawn after the last message and comes and
+    /// goes on its own. Anchored on it, the last row is still the last row
+    /// while a message lands in front of it — which reads as a page of older
+    /// history, and put the arrival at the top of the conversation.
+    #[test]
+    fn a_message_landing_under_the_typing_row_is_still_an_arrival() {
+        let typing = Some(TypingSummary {
+            typists: vec![velo_core::Typist {
+                jid: "a@s.whatsapp.net".to_string(),
+                name: "A".to_string(),
+            }],
+            total: 1,
+            kind: velo_core::ComposingKind::Text,
+        });
+        let before = MessageListCache::new(&messages_of(&["m1", "m2"]), false, typing.clone());
+        let anchor = anchored("a@s.whatsapp.net", &before, same_layout());
+        let after = MessageListCache::new(&messages_of(&["m1", "m2", "m3"]), false, typing);
+
+        let TimelineSync::Spliced { at, removed, added } =
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &after, same_layout())
+        else {
+            panic!("a message arrived, whoever else is typing");
+        };
+        assert_eq!(removed, 0, "nothing left");
+        assert_eq!(added, after.items.len() - before.items.len());
+        // Straight after the last message, so the typing row is pushed down
+        // rather than the arrival landing under it.
+        assert_eq!(at, before.items.len() - 1);
+    }
+
+    /// Only a different conversation resets: within one, whatever changed is
+    /// a stretch of rows, and the ones outside it are still what they were.
+    #[test]
+    fn only_another_conversation_is_reset() {
+        let before = timeline_of(&["m1", "m2", "m3"]);
+        let anchor = anchored("a@s.whatsapp.net", &before, same_layout());
+
+        // Another conversation entirely.
+        assert_eq!(
+            timeline_sync(Some(&anchor), "b@s.whatsapp.net", &before, same_layout()),
+            TimelineSync::Reset
+        );
+        // And nothing at all to compare against.
+        assert_eq!(
+            timeline_sync(None, "a@s.whatsapp.net", &before, same_layout()),
+            TimelineSync::Reset
+        );
+    }
+
+    /// A message that leaves — revoked and pruned, or a chat trimmed — is
+    /// the same answer read the other way: the stretch it occupied is
+    /// replaced by nothing.
+    #[test]
+    fn a_message_that_leaves_is_the_stretch_it_occupied() {
+        let before = timeline_of(&["m1", "m2", "m3"]);
+        let anchor = anchored("a@s.whatsapp.net", &before, same_layout());
+        let after = timeline_of(&["m1", "m2"]);
+
+        let TimelineSync::Spliced { removed, added, .. } =
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &after, same_layout())
+        else {
+            panic!("a row left, and the rest of them did not");
+        };
+        assert_eq!(removed - added, before.items.len() - after.items.len());
+    }
+
+    /// A rebuild with the rows unchanged is the other way a height goes
+    /// stale: something inside a bubble grew. Nothing to splice, and nothing
+    /// the list can be left believing either.
+    #[test]
+    fn a_rebuilt_row_is_remeasured_even_where_nothing_moved() {
+        let before = timeline_of(&["m1", "m2"]);
+        let anchor = anchored("a@s.whatsapp.net", &before, same_layout());
+        // The same messages, built again — which is what an arriving image or
+        // a landing reaction does.
+        let rebuilt = timeline_of(&["m1", "m2"]);
+        assert_ne!(rebuilt.build, before.build);
+
+        assert_eq!(
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &rebuilt, same_layout()),
+            TimelineSync::Remeasure
+        );
+        // And the same rows, not rebuilt, are nothing to say at all.
+        assert_eq!(
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &before, same_layout()),
+            TimelineSync::Nothing
+        );
+    }
+
+    #[test]
+    fn a_language_change_remeasures_without_losing_the_timeline_anchor() {
+        let rows = timeline_of(&["m1", "m2"]);
+        let mut english = same_layout();
+        english.language = crate::i18n::Language::English;
+        let anchor = anchored("peer@example.invalid", &rows, english);
+        let portuguese = MeasuredAgainst {
+            language: crate::i18n::Language::Portuguese,
+            ..english
+        };
+        assert_eq!(
+            timeline_sync(Some(&anchor), "peer@example.invalid", &rows, portuguese),
+            TimelineSync::Remeasure
+        );
+    }
+
+    /// The same rows against a layout that has moved under them: every height
+    /// is stale, and none of the rows are.
+    #[test]
+    fn a_resize_remeasures_rather_than_resets() {
+        let rows = timeline_of(&["m1", "m2"]);
+        let anchor = anchored("a@s.whatsapp.net", &rows, same_layout());
+        let wider = MeasuredAgainst {
+            language: crate::i18n::Language::current(),
+            rem: 16.0,
+            width: 900.0,
+        };
+
+        assert_eq!(
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &rows, wider),
+            TimelineSync::Remeasure
+        );
+        assert_eq!(
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &rows, same_layout()),
+            TimelineSync::Nothing,
+            "and a frame that changed nothing tells the list nothing"
+        );
+    }
+
+    /// A row painted from the daemon's snapshot has a preview and no
+    /// messages. Reading it the moment it is opened names nothing, and the
+    /// daemon refuses a read that names nothing for a chat it holds messages
+    /// for — so the badge would clear here and come back on the next
+    /// hydration, with no receipt ever sent.
+    #[test]
+    fn a_row_without_its_messages_owes_its_read_to_the_load() {
+        let mut row = chat("a@s.whatsapp.net", Some(10));
+        row.last_message = Some("olá".to_string());
+        assert!(matches!(read_bound(&row), ReadBound::WhenLoaded));
+
+        row.messages.push(ChatMessage::new_incoming(
+            "3EB0".into(),
+            "a".into(),
+            "olá".into(),
+        ));
+        assert!(
+            matches!(read_bound(&row), ReadBound::Now(Some(id)) if id == "3EB0"),
+            "a loaded row names the message it was looking at"
+        );
+    }
+
+    /// A chat with nothing behind it has no boundary either, and must stay
+    /// clearable: that is what marking a chat unread by hand produces.
+    #[test]
+    fn a_chat_with_nothing_behind_it_is_read_at_once() {
+        assert!(matches!(
+            read_bound(&chat("a@s.whatsapp.net", None)),
+            ReadBound::Now(None)
+        ));
+    }
+
+    #[test]
+    fn the_newest_head_goes_first() {
+        let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(20)))];
+        assert_eq!(slot_for_chat(&rest, &chat("d", Some(40))), 0);
+    }
+
+    #[test]
+    fn a_head_older_than_another_chat_stays_under_it() {
+        // The case a plain bump to index 0 got wrong: a held notice replayed
+        // after a history load advances its own conversation and is still
+        // older than the chat above it.
+        let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(10)))];
+        assert_eq!(slot_for_chat(&rest, &chat("d", Some(20))), 1);
+    }
+
+    /// Each entry holds a second full copy of the conversation, and nothing
+    /// but an account reset used to remove one: fifty long chats opened left
+    /// fifty histories resident.
+    #[test]
+    fn only_so_many_conversations_keep_their_rows() {
+        let mut cache: HashMap<String, MessageListCache> = HashMap::new();
+        for n in 0..MAX_CACHED_TIMELINES + 5 {
+            let jid = format!("{n}@s.whatsapp.net");
+            cache.insert(jid.clone(), timeline_of(&["m1", "m2"]));
+            evict_stale_timelines(&mut cache, &jid);
+        }
+        assert_eq!(cache.len(), MAX_CACHED_TIMELINES);
+        let newest = format!("{}@s.whatsapp.net", MAX_CACHED_TIMELINES + 4);
+        assert!(
+            cache.contains_key(&newest),
+            "the conversation on screen is never the one dropped"
+        );
+        assert!(
+            !cache.contains_key("0@s.whatsapp.net"),
+            "the oldest build goes first"
+        );
+    }
+
+    /// The catch-up case: an offline drain delivers conversations in whatever
+    /// order the socket had them, and a bump to index 0 per arrival left the
+    /// sidebar in arrival order — sorted only by the next history load, with
+    /// the rows jumping under the reader's finger.
+    #[test]
+    fn a_catch_up_arriving_out_of_order_still_lands_newest_first() {
+        let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(20)))];
+        // An older conversation catching up does not stand above a newer one.
+        assert_eq!(slot_for_chat(&rest, &chat("d", Some(25))), 1);
+        assert_eq!(slot_for_chat(&rest, &chat("d", Some(35))), 0);
+    }
+
+    #[test]
+    fn the_oldest_head_goes_last() {
+        let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(20)))];
+        assert_eq!(slot_for_chat(&rest, &chat("d", Some(10))), 2);
+    }
+
+    /// `None` is below every `Some`, so an empty conversation clears every
+    /// dated chat — but equally undated chats still order by JID descending,
+    /// the store's rule (`ChatStore::chats_page` ranks ties by `jid DESC`
+    /// and pages on with `jid < cursor.jid`).
+    #[test]
+    fn an_empty_conversation_sorts_after_every_dated_one() {
+        let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", None))];
+        assert_eq!(slot_for_chat(&rest, &chat("d", None)), 1);
+        assert_eq!(
+            slot_for_chat(&rest, &chat("a", None)),
+            2,
+            "the lower JID trails the tied chat it follows"
+        );
+    }
+
+    /// Ties break by JID descending, the store's rule: a tied head with the
+    /// higher JID stands above the incumbent rather than beneath it, which
+    /// is what keeps a page boundary from re-sorting rows the previous page
+    /// already drew.
+    #[test]
+    fn a_tied_head_sorts_by_descending_jid() {
+        let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(10)))];
+        assert_eq!(slot_for_chat(&rest, &chat("d", Some(30))), 0);
+        assert_eq!(slot_for_chat(&rest, &chat("a", Some(30))), 1);
+    }
+
+    /// The live slot keeps the pin grouping the merge sort maintains: a busy
+    /// unpinned chat must not stand above an older pinned one until the next
+    /// load, and a pinned one leads by pin time whatever its head says.
+    #[test]
+    fn live_slots_keep_the_pin_grouping() {
+        let rest = [
+            Arc::new(pinned_chat("p", 100, Some(10))),
+            Arc::new(chat("b", Some(30))),
+        ];
+        assert_eq!(
+            slot_for_chat(&rest, &chat("d", Some(40))),
+            1,
+            "newer but unpinned: below the pin, above the rest"
+        );
+        assert_eq!(
+            slot_for_chat(&rest, &pinned_chat("q", 200, Some(5))),
+            0,
+            "later pin leads the pinned block"
+        );
+        assert_eq!(
+            slot_for_chat(&rest, &pinned_chat("r", 50, Some(99))),
+            1,
+            "earlier pin trails it despite the newer head"
+        );
+    }
+}
+
+#[cfg(test)]
+mod decoded_image_budget {
+    use super::{DECODED_IMAGE_BUDGET, MAX_DECODED_IMAGES, MIN_DECODED_IMAGES, over_budget};
+
+    #[test]
+    fn entries_are_capped_whatever_they_weigh() {
+        assert!(over_budget(1, MAX_DECODED_IMAGES));
+        assert!(!over_budget(1, MAX_DECODED_IMAGES - 1));
+    }
+
+    #[test]
+    fn bytes_are_capped_above_the_floor() {
+        assert!(over_budget(
+            DECODED_IMAGE_BUDGET + 1,
+            MIN_DECODED_IMAGES + 1
+        ));
+        assert!(!over_budget(DECODED_IMAGE_BUDGET, MIN_DECODED_IMAGES + 1));
+    }
+
+    /// The property the floor exists for: a viewport whose pictures do not fit
+    /// is kept, rather than evicted one row at a time by the next row.
+    ///
+    /// Without it the loop empties the cache down to the one image that
+    /// triggered it, every row misses, and each miss copies its encoded bytes
+    /// and decodes them again — on every frame, for as long as the reader
+    /// looks at that part of the conversation.
+    #[test]
+    fn a_viewport_that_does_not_fit_is_kept_rather_than_thrashed() {
+        let far_over = DECODED_IMAGE_BUDGET * 100;
+        assert!(
+            !over_budget(far_over, MIN_DECODED_IMAGES),
+            "the byte budget must not evict a viewport's worth of images"
+        );
+        // And it still binds on the entry above the floor.
+        assert!(over_budget(far_over, MIN_DECODED_IMAGES + 1));
+    }
+}
+
+#[cfg(test)]
+mod linked_play_tests {
+    use super::*;
+
+    #[test]
+    fn live_authorless_group_play_never_claims_a_loaded_row() {
+        let mut chat = Chat::new("120363000000000001@g.us".into());
+        let mut incoming = ChatMessage::new_incoming(
+            "same-id".into(),
+            "5511000000002@s.whatsapp.net".into(),
+            "voice".into(),
+        );
+        incoming.status = MessageStatus::Read;
+        chat.messages.push(incoming);
+        assert_eq!(
+            advance_authorless_self_play(&mut chat, "120363000000000001@g.us", &["same-id".into()]),
+            0
+        );
+        assert_eq!(chat.messages[0].status, MessageStatus::Read);
+        assert_eq!(
+            advance_authorless_self_play(
+                &mut chat,
+                "5511000000002@s.whatsapp.net",
+                &["same-id".into()]
+            ),
+            1
+        );
+        assert_eq!(chat.messages[0].status, MessageStatus::Played);
+        assert_eq!(
+            advance_authorless_self_play(
+                &mut chat,
+                "5511000000002@s.whatsapp.net",
+                &["same-id".into()]
+            ),
+            0
+        );
+    }
+}

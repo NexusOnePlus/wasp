@@ -1,0 +1,3532 @@
+//! WhatsApp client wrapper for UI integration
+
+/// Profile-picture metadata, resolved on its own lifecycle.
+mod avatar;
+/// Voice calls, which are the one part of the session a page cannot run.
+mod calls;
+/// Display names for special chats, resolved on their own lifecycle.
+mod chat_names;
+#[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+pub use calls::{OutgoingAcceptCase, outgoing_accept_events};
+
+mod completion;
+/// A stored row and a composed quote, read as the other side's shape.
+mod convert;
+
+/// Pairing a companion device by phone-number code.
+mod auth;
+
+/// The inbound commit hook that makes the chat store the ack durability point.
+mod durability;
+
+/// Who is in a group, for the surfaces that name them.
+mod groups;
+mod membership;
+/// Mutations a front end asks the account to perform.
+mod mutations;
+/// Polls, profiles, contacts, channels, media fetch and history coverage.
+mod ops;
+mod profile;
+/// Sends a scriptable front end asks for, read from daemon-local paths.
+mod sends;
+
+/// Store rows read back as the chats a front end draws.
+mod history;
+/// Which events wait for which, and which never had to.
+mod lanes;
+mod shared_history;
+
+/// What a message's media is, for both the roads it arrives on.
+mod media;
+mod played;
+
+/// What a picked file becomes on the wire: its shape, and the message that
+/// carries it.
+mod outgoing;
+/// Native image conversion before an inline media upload.
+mod outgoing_image;
+/// Native video conversion before an inline media upload.
+mod outgoing_video;
+
+/// Pages, their cursors, and where a read stops.
+mod paging;
+mod ui_queue;
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests;
+
+#[cfg(all(test, target_family = "wasm"))]
+mod browser_tests;
+
+use calls::CallRegistry;
+use convert::{account_event, poll_of, quote_context};
+use durability::ChatStoreDurabilityHook;
+use lanes::EventLanes;
+use paging::{participant_keyed_chat, read_message_range};
+use ui_queue::Sender as UiEventSender;
+pub use ui_queue::{Receiver as UiEventReceiver, TryRecvError as UiEventTryRecvError};
+
+/// How far back a read receipt reaches: the last row a front end was shown,
+/// and the ids it is bounded by. Written in `paging`, beside the cursors.
+pub use groups::{
+    GroupDetails, GroupListEntry, GroupParticipantView, JoinGroupView, JoinRequestView,
+    ParticipantChange,
+};
+pub use ops::{
+    BackfillFile, BackfillReport, ChannelView, ContactCheckView, ContactView, HistoryCoverage,
+    PollView,
+};
+pub use outgoing::OutgoingFile;
+pub use paging::ReadBoundary;
+pub use profile::ProfileView;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use log::{debug, error, info, warn};
+use portable_atomic::{AtomicU64, Ordering};
+use tokio::sync::{Mutex, mpsc};
+use velo_chat_store::ChatStore;
+use whatsapp_rust::PresencePolicy;
+use whatsapp_rust::bot::Bot;
+use whatsapp_rust::client::Client;
+use whatsapp_rust::wacore::proto_helpers::MessageExt;
+// The same type either way; only the road to it differs. On a desktop the
+// library re-exports it, and in a browser that re-export is behind a default
+// feature the wasm build drops — so it is named at its own crate there.
+#[cfg(all(test, not(target_family = "wasm")))]
+use whatsapp_rust::store::SqliteStore;
+use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
+use whatsapp_rust::wacore::types::events::{
+    ChannelEventHandler, Event, EventHandler, EventInterest, EventKind,
+};
+use whatsapp_rust::wacore::types::presence::{ChatActivity, PresenceStatus, ReceiptType};
+use whatsapp_rust::wacore_binary::jid::{Jid, JidExt, observe_str};
+use whatsapp_rust::waproto::whatsapp as wa;
+#[cfg(all(test, target_family = "wasm"))]
+use whatsapp_rust_sqlite_storage::SqliteStore;
+
+use crate::exec::{Executor, Task};
+use velo_core::{
+    AccountId, Availability, CallVideoFrame, ChatMessage, ComposingKind, DownloadableMedia,
+    IncomingCall, MessageStatus, SystemNotice, UiEvent, VideoStream, fallback_chat_name,
+};
+
+use crate::names::NameBook;
+use crate::quoting::quoted_from;
+use crate::video::{self, CameraLost, PictureLost, VideoPublisher, VideoSenderSlot};
+use whatsapp_rust::voip::KeyframeUrgency;
+use whatsapp_rust::wacore::download::MediaType as DownloadMediaType;
+
+/// Configure the WhatsApp client as a persistent background companion.
+///
+/// Automatic presence matches a browser tab: it announces `available` on
+/// every connection. This process outlives every window, so that announcement
+/// would make WhatsApp route new-message attention away from the phone.
+fn persistent_companion<B, T, H, R>(
+    builder: whatsapp_rust::bot::BotBuilder<B, T, H, R>,
+) -> whatsapp_rust::bot::BotBuilder<B, T, H, R> {
+    builder.with_presence_policy(PresencePolicy::Manual)
+}
+
+/// Retract a stale `available` announcement left on the server by an older
+/// client version, as soon as each new connection is ready to send.
+async fn announce_background_presence(client: &Client) -> Result<(), whatsapp_rust::PresenceError> {
+    client.presence().set_unavailable().await
+}
+
+use crate::store::StoreRegistry;
+
+struct InterestedEventHandler {
+    inner: Arc<ChannelEventHandler>,
+    interest: EventInterest,
+}
+
+impl EventHandler for InterestedEventHandler {
+    /// Skip unused history copies before admitting events to this subscriber.
+    fn handle_event(&self, event: Arc<Event>) {
+        // Server-pushed history chunks are materialized by ChatStore's own
+        // subscription. The control consumer intentionally does nothing for
+        // them; sending the burst through its bounded mailbox can displace
+        // connection and call events before that no-op is reached. Preserve
+        // on-demand chunks, which trigger metadata revalidation below.
+        if let Event::HistorySync(history) = &*event
+            && history.peer_data_request_session_id().is_none()
+        {
+            return;
+        }
+        if let Event::RawNode(node) = &*event
+            && (node.get().tag != "call" || node.get().get_optional_child("accept").is_none())
+        {
+            return;
+        }
+        self.inner.handle_event(event);
+    }
+
+    fn interest(&self) -> EventInterest {
+        self.interest
+    }
+}
+
+fn interested_channel(
+    kinds: &[EventKind],
+    capacity: usize,
+) -> (
+    Arc<InterestedEventHandler>,
+    async_channel::Receiver<Arc<Event>>,
+    Arc<ChannelEventHandler>,
+) {
+    let (inner, receiver) = ChannelEventHandler::with_capacity(capacity);
+    let interest = EventInterest::of(kinds);
+    (
+        Arc::new(InterestedEventHandler {
+            inner: inner.clone(),
+            interest,
+        }),
+        receiver,
+        inner,
+    )
+}
+
+fn interested_unbounded_channel(
+    kinds: &[EventKind],
+) -> (
+    Arc<InterestedEventHandler>,
+    async_channel::Receiver<Arc<Event>>,
+    Arc<ChannelEventHandler>,
+) {
+    let (inner, receiver) = ChannelEventHandler::new();
+    let interest = EventInterest::of(kinds);
+    (
+        Arc::new(InterestedEventHandler {
+            inner: inner.clone(),
+            interest,
+        }),
+        receiver,
+        inner,
+    )
+}
+
+/// Durable data changes whose live projection keeps an open conversation
+/// current while the history reloader coalesces store invalidations.
+const CONTROL_EVENT_KINDS: &[EventKind] = &[
+    EventKind::PairingQrCode,
+    EventKind::PairingCode,
+    EventKind::PairSuccess,
+    EventKind::Connected,
+    EventKind::Disconnected,
+    EventKind::LoggedOut,
+    EventKind::SelfPushNameUpdated,
+    EventKind::IncomingCall,
+    EventKind::RawNode,
+    EventKind::MissedCall,
+    EventKind::CallEndedElsewhere,
+    EventKind::GroupUpdate,
+    // Post-sync repair for the name resolver: an offline drain or a history
+    // chunk can materialize a previously unknown group/channel after the
+    // Connected full-pass snapshot.
+    EventKind::OfflineSyncCompleted,
+    EventKind::HistorySync,
+    EventKind::DeleteChatUpdate,
+];
+
+/// App-state contacts carry the PN/LID pairs the protocol library leaves to
+/// its embedder. They have their own lossless ingress and batched worker: a
+/// full contact sync can be much larger than the latency-sensitive control
+/// mailbox, while these durable identity facts must not be dropped.
+const IDENTITY_EVENT_KINDS: &[EventKind] = &[EventKind::ContactUpdate];
+
+fn contact_identity_pair(
+    update: &whatsapp_rust::wacore::types::events::ContactUpdate,
+) -> Option<(String, String)> {
+    // Some app-state producers put one alias in the action and the other in
+    // the mutation key (`update.jid`). Prefer the explicit fields, then
+    // complete the pair from that key.
+    let explicit_lid = update
+        .action
+        .lid_jid
+        .as_deref()
+        .and_then(|value| value.parse::<Jid>().ok())
+        .filter(Jid::is_lid);
+    let explicit_pn = update
+        .action
+        .pn_jid
+        .as_deref()
+        .and_then(|value| value.parse::<Jid>().ok())
+        .filter(Jid::is_pn);
+    let lid = explicit_lid.or_else(|| update.jid.is_lid().then(|| update.jid.clone()));
+    let pn = explicit_pn.or_else(|| update.jid.is_pn().then(|| update.jid.clone()));
+    lid.zip(pn)
+        .map(|(lid, pn)| (lid.user.to_string(), pn.user.to_string()))
+}
+
+const DATA_EVENT_KINDS: &[EventKind] = &[
+    EventKind::Messages,
+    // A positive message ack is the first delivery state of an optimistic
+    // send. The store also persists it, but its history reloader waits for a
+    // quiet window that a continuous sync may not reach; carry the tick live
+    // as a Sent receipt.
+    EventKind::ServerAck,
+    EventKind::Receipt,
+    EventKind::ChatPresence,
+    EventKind::Presence,
+];
+
+/// Where the store lives on this platform. See [`crate::store`].
+pub use crate::store::{database_path as resolve_database_path, prepare as prepare_store};
+
+/// Delete the local session: device identity, Signal state and chat history
+/// all live in the one SQLite file.
+pub use crate::store::wipe as wipe_local_state;
+
+/// User-facing copy for a server-ended session. The server sometimes supplies
+/// its own text (account locks do); prefer it, and otherwise say plainly which
+/// refusal arrived, because every one of these needs the same fix — pair again.
+fn logout_message(event: &whatsapp_rust::types::events::LoggedOut) -> String {
+    use whatsapp_rust::wacore::types::events::ConnectFailureReason;
+
+    if let Some(msg) = &event.logout_message {
+        // header and subtext are separate strings on the wire; join whichever
+        // the server actually sent rather than picking one and dropping copy.
+        let parts: Vec<&str> = [msg.header.as_deref(), msg.subtext.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|t| !t.is_empty())
+            .collect();
+        if !parts.is_empty() {
+            return parts.join(" ");
+        }
+    }
+    match event.reason {
+        ConnectFailureReason::LoggedOut => "This device was unlinked from WhatsApp.".to_string(),
+        ConnectFailureReason::AccountLocked => {
+            "WhatsApp locked this account. Check the app on your phone.".to_string()
+        }
+        ConnectFailureReason::TempBanned => "WhatsApp temporarily banned this account.".to_string(),
+        ConnectFailureReason::ClientOutdated => {
+            "WhatsApp rejected this client as outdated.".to_string()
+        }
+        other => format!("WhatsApp ended the session ({other:?})."),
+    }
+}
+
+/// Where a UI event goes.
+///
+/// Live from construction rather than from `start`, and not an `Option`: the
+/// front end is attached before the session is, and a failure that happens in
+/// between — a send typed into a window whose session is still opening — is
+/// exactly the one it has to hear about. This used to be a slot filled by the
+/// session task, so those failures were sent to nobody and the optimistic
+/// bubble sat pending forever.
+/// Everything the session *is*, once it is up.
+///
+/// One value rather than four slots. The client, the history it is recorded
+/// in and the book that names people in it are opened together and go
+/// together, and every caller wants some pair of them: published separately,
+/// a send could hold a live client beside a chat store that was still `None`
+/// and go out on the wire with nothing recording it, and a teardown that took
+/// the store first left the same window open from the other end.
+pub(crate) struct Session {
+    /// The WhatsApp connection.
+    pub(crate) client: Arc<Client>,
+    /// Durable chat history — the same SQLite file as the device store.
+    pub(crate) chat_store: Arc<ChatStore>,
+    /// The session's one address book, so a live bubble, the row it lands in
+    /// and the typing line above it name the same person the same way.
+    pub(crate) names: Arc<NameBook>,
+    /// The name resolver signal used by outgoing writes as well as inbound
+    /// sightings, so a locally created special-chat row is not left nameless.
+    resolve_chat_names: chat_names::ChatNameResolveSignal,
+}
+
+/// Where the one session lives: `None` until it is open, and `None` again the
+/// moment it is let go. Nothing observable sits in between.
+pub(crate) type SessionSlot = Arc<Mutex<Option<Arc<Session>>>>;
+
+/// A handle for recording avatar descriptors from outside the session task.
+///
+/// The daemon fetches the bytes and the session owns the store, so the write
+/// that points a chat at those bytes has to cross that seam. This is the
+/// crossing: a cheap handle that reaches the one session, carries no session
+/// state of its own, and refuses quietly when there is nothing to write to.
+///
+/// Cloneable because the daemon's bridge holds one for the life of the
+/// process.
+#[derive(Clone)]
+pub struct AvatarRecorder {
+    session: SessionSlot,
+    resolve_avatars: AvatarResolveSignal,
+}
+
+impl AvatarRecorder {
+    /// A recorder with no session behind it.
+    ///
+    /// Every record is dropped, which is the honest answer when there is no
+    /// store: a test that folds an event without opening one, or a host that
+    /// built the daemon but never a session.
+    pub fn detached() -> Self {
+        Self {
+            session: Arc::new(Mutex::new(None)),
+            resolve_avatars: AvatarResolveSignal::new(),
+        }
+    }
+
+    /// Mark that an avatar's bytes have been successfully stored and cached.
+    pub fn on_ready(&self, jid: &str) {
+        self.resolve_avatars.on_ready(jid);
+    }
+
+    /// Mark that an avatar's download failed, allowing retry.
+    pub fn on_failed(&self, jid: &str) {
+        self.resolve_avatars.on_failed(jid);
+    }
+
+    /// Point `jid` at `picture_id`, whose bytes are cached under `cache_key`.
+    ///
+    /// Called only once the bytes have landed, and awaited: the descriptor
+    /// must be committed before the picture is published, or a reader can be
+    /// told about bytes the durable store does not yet point at. The writer
+    /// queue orders the write, and `flush` is what turns "queued" into
+    /// "committed".
+    ///
+    /// `seq` is the resolution's order, not the write's. It is what keeps two
+    /// rapid pictures from being stored backwards when their commits arrive
+    /// out of order; the store keeps the higher one.
+    ///
+    /// Answers whether the row committed. A caller publishes on `true` and
+    /// stays quiet on `false`, so a failed write is not announced as a
+    /// picture that will survive a restart.
+    pub async fn record(
+        &self,
+        jid: String,
+        picture_id: String,
+        cache_key: String,
+        seq: u64,
+    ) -> bool {
+        let Some(live) = self.session.lock().await.clone() else {
+            // No session to record into: an account change or a teardown
+            // raced the fetch. The bytes stay cached and the next connect
+            // rediscovers them; writing nothing is the honest answer.
+            return false;
+        };
+        let Ok(jid) = jid.parse::<Jid>() else {
+            warn!("cannot record an avatar against an unparseable address");
+            return false;
+        };
+        let store = &live.chat_store;
+        if let Err(e) = store.record_avatar(&jid, picture_id.clone(), cache_key.clone(), seq) {
+            warn!("could not publish the avatar descriptor: {e}");
+            return false;
+        }
+        match store.flush().await {
+            Ok(()) => store
+                .avatar_descriptors_for(&[jid.to_string()])
+                .await
+                .is_ok_and(|descriptors| {
+                    descriptors.iter().any(|descriptor| {
+                        descriptor.picture_id == picture_id && descriptor.cache_key == cache_key
+                    })
+                }),
+            Err(e) => {
+                warn!("the avatar descriptor did not commit: {e}");
+                false
+            }
+        }
+    }
+
+    /// Drop `jid`'s descriptor, because WhatsApp says it has no picture.
+    ///
+    /// Awaitable and ordered for the reason [`record`](Self::record) is: the
+    /// row must be gone before the removal is announced, and a removal must
+    /// not undo a picture resolved after it.
+    pub async fn clear(&self, jid: String, seq: u64) -> bool {
+        let Some(live) = self.session.lock().await.clone() else {
+            return false;
+        };
+        let Ok(jid) = jid.parse::<Jid>() else {
+            return false;
+        };
+        let store = &live.chat_store;
+        if let Err(e) = store.clear_avatar(&jid, seq) {
+            warn!("could not drop the avatar descriptor: {e}");
+            return false;
+        }
+        match store.flush().await {
+            Ok(()) => store
+                .avatar_descriptors_for(&[jid.to_string()])
+                .await
+                .is_ok_and(|descriptors| descriptors.is_empty()),
+            Err(e) => {
+                warn!("the avatar removal did not commit: {e}");
+                false
+            }
+        }
+    }
+}
+
+/// How long each phase of a cold start took, so the one line that reports
+/// it can be written after hydration rather than in the middle of it.
+struct ColdStart {
+    prepared: std::time::Duration,
+    opened: std::time::Duration,
+    materialized: std::time::Duration,
+    built: std::time::Duration,
+}
+
+/// What a caller can see of the session right now: whether the client, the
+/// history and the address book are each reachable.
+///
+/// Only the tests ask, and what they ask is whether the answer can ever be
+/// mixed. It cannot be here — there is one value, so the three bools are read
+/// off one `Option` — and that is the invariant, not an accident of this
+/// function: the shape it replaced filled four slots one at a time, and put
+/// back it answers `[false, true, true]` — a store and an address book with no
+/// client — for the whole of the build that follows.
+#[cfg(test)]
+pub(crate) async fn parts_visible(session: &SessionSlot) -> [bool; 3] {
+    let live = session.lock().await.clone();
+    // Each part reached on its own, so that staging the publish again is a
+    // change to this body and to nothing the test says.
+    [
+        live.as_ref().map(|live| live.client.clone()).is_some(),
+        live.as_ref().map(|live| live.chat_store.clone()).is_some(),
+        live.as_ref().map(|live| live.names.clone()).is_some(),
+    ]
+}
+
+/// What the session's own task shares with the handle that started it.
+///
+/// One struct rather than six parameters: every one of these is a handle the
+/// caller keeps a copy of, and a list of six is a list nobody can read.
+struct Shared {
+    stores: Arc<StoreRegistry>,
+    session: SessionSlot,
+    calls: CallRegistry,
+    shutdown: Arc<tokio::sync::Notify>,
+    reload: Arc<tokio::sync::Notify>,
+    /// Asks the avatar resolver for a pass. Its own signal rather than the
+    /// history reloader's: the two lifecycles are exactly what the split
+    /// exists to keep apart, and a receipt that asks for history must not
+    /// drag a profile-picture lookup behind it.
+    resolve_avatars: AvatarResolveSignal,
+    /// Asks the chat-name resolver for a pass. Its own signal for the same
+    /// reason: a receipt that asks for history must not drag a metadata
+    /// lookup behind it either.
+    resolve_chat_names: chat_names::ChatNameResolveSignal,
+    history_budget: Arc<ui_queue::HistoryBudget>,
+}
+
+/// Asking the avatar resolver for a pass.
+///
+/// Explicit state rather than one notification, because the three kinds of ask
+/// mean different things and a bare wake-up cannot carry which one it was. The
+/// flags are what coalesce: ten `request()` calls while a pass runs are one
+/// `full` bit, and demands are deduplicated by JID.
+///
+/// A new connection is a new generation. Resolution memory is cleared with it,
+/// which is what revalidates pictures that changed while the process was
+/// offline: a chat resolved against the previous socket must be looked at once
+/// more when demanded by the viewport.
+#[derive(Clone, Default)]
+pub(super) struct AvatarResolveSignal {
+    ask: Arc<tokio::sync::Notify>,
+    state: Arc<std::sync::Mutex<PendingResolve>>,
+    generation: Arc<AtomicU64>,
+}
+
+/// What asks are outstanding, under one lock so they are taken atomically.
+#[derive(Default)]
+struct PendingResolve {
+    /// A pass over the account's stored chat list (used in tests or manual full refreshes).
+    full: bool,
+    /// Forget what earlier passes resolved before the next pass.
+    reset: bool,
+    /// Demands requested by the viewport, header, or overscan.
+    demands: HashMap<String, velo_core::AvatarDemand>,
+    /// JIDs whose avatar bytes landed in the local cache.
+    ready: Vec<String>,
+    /// JIDs whose avatar download failed.
+    failed: Vec<String>,
+}
+
+impl AvatarResolveSignal {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// A connection was established: advance the generation counter.
+    ///
+    /// The generation bump alone is the revalidation: every chat's remembered
+    /// answer is from the previous socket and no longer counts, so future
+    /// demands will revalidate against the new connection.
+    pub(super) fn new_connection(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Ask for a pass over what is not yet known.
+    ///
+    /// Only a test asks directly.
+    #[cfg(test)]
+    pub(super) fn request(&self) {
+        self.set(|pending| pending.full = true);
+    }
+
+    /// Ask for a pass that forgets what is known, because its bytes are gone.
+    pub(super) fn reset(&self) {
+        self.set(|pending| {
+            pending.reset = true;
+        });
+    }
+
+    /// Notify that an avatar's bytes have been saved.
+    pub(super) fn on_ready(&self, jid: impl Into<String>) {
+        let jid = jid.into();
+        self.set(|pending| {
+            pending.ready.push(jid);
+        });
+    }
+
+    /// Notify that an avatar's download failed.
+    pub(super) fn on_failed(&self, jid: impl Into<String>) {
+        let jid = jid.into();
+        self.set(|pending| {
+            pending.failed.push(jid);
+        });
+    }
+
+    /// Ask about these chats specifically.
+    pub(super) fn request_named(&self, jids: impl IntoIterator<Item = String>) {
+        self.ensure(jids.into_iter().map(|jid| velo_core::AvatarDemand {
+            jid,
+            known_picture_id: None,
+            cache_key: None,
+            need_bytes: true,
+            cache_miss: false,
+        }));
+    }
+
+    /// Queue avatar demands from viewport or header.
+    pub(super) fn ensure(&self, items: impl IntoIterator<Item = velo_core::AvatarDemand>) {
+        self.set(|pending| {
+            for item in items {
+                pending
+                    .demands
+                    .entry(item.jid.clone())
+                    .and_modify(|existing| {
+                        if item.need_bytes {
+                            existing.need_bytes = true;
+                            existing.known_picture_id = None;
+                        } else {
+                            if item.known_picture_id.is_some()
+                                && existing.known_picture_id.is_none()
+                            {
+                                existing.known_picture_id = item.known_picture_id.clone();
+                            }
+                            if item.cache_key.is_some() && existing.cache_key.is_none() {
+                                existing.cache_key = item.cache_key.clone();
+                            }
+                        }
+                        existing.cache_miss |= item.cache_miss;
+                    })
+                    .or_insert(item);
+            }
+        });
+    }
+
+    fn set(&self, change: impl FnOnce(&mut PendingResolve)) {
+        {
+            let mut pending = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            change(&mut pending);
+        }
+        self.ask.notify_one();
+    }
+
+    /// The current connection generation, for a test that checks a bump.
+    #[cfg(test)]
+    pub(super) fn next_generation_for_test(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Wait for an ask, and take what it carried.
+    pub(super) async fn next(&self) -> ResolveRequest {
+        loop {
+            let taken = {
+                let mut pending = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let demands = pending.demands.drain().map(|(_, d)| d).collect();
+                let ready = std::mem::take(&mut pending.ready);
+                let failed = std::mem::take(&mut pending.failed);
+                let taken = ResolveRequest {
+                    full: pending.full,
+                    reset: pending.reset,
+                    demands,
+                    ready,
+                    failed,
+                    generation: self.generation.load(Ordering::SeqCst),
+                };
+                pending.full = false;
+                pending.reset = false;
+                taken
+            };
+            if taken.full
+                || taken.reset
+                || !taken.demands.is_empty()
+                || !taken.ready.is_empty()
+                || !taken.failed.is_empty()
+            {
+                return taken;
+            }
+            self.ask.notified().await;
+        }
+    }
+}
+
+/// One pass's worth of asks, taken from the signal together.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct ResolveRequest {
+    /// Cover the stored chat list.
+    pub(super) full: bool,
+    /// Forget what earlier passes resolved first.
+    pub(super) reset: bool,
+    /// Demands requested by viewport or explicit requests.
+    pub(super) demands: Vec<velo_core::AvatarDemand>,
+    /// JIDs whose avatars have landed in cache.
+    pub(super) ready: Vec<String>,
+    /// JIDs whose avatar download failed.
+    pub(super) failed: Vec<String>,
+    /// The connection this ask was made under.
+    pub(super) generation: u64,
+}
+
+/// WhatsApp client wrapper that manages the connection and provides
+/// a clean interface for UI operations.
+pub struct WhatsAppClient {
+    /// The local SQLite device row this session is allowed to use.
+    ///
+    /// It is captured before the executor starts and never changes while the
+    /// session is alive, so an async completion cannot accidentally write to a
+    /// different account after a front-end switch.
+    account_id: AccountId,
+    played_gate: Arc<std::sync::Mutex<HashSet<i64>>>,
+    /// Shared registry for the physical database and one chat migration run.
+    stores: Arc<StoreRegistry>,
+    /// Where the session's work runs: a runtime on a thread of its own on a
+    /// desktop, the page's event loop in a browser. See [`crate::exec`].
+    exec: Executor,
+    /// Where UI events go. See [`UiEventSender`].
+    ui_sender: UiEventSender,
+    /// The other end of it, until whoever starts the session takes it.
+    ///
+    /// This is also what "already started" *is*: the receiver is the token, so
+    /// the question cannot be answered one way by a flag and another way by
+    /// whether anybody is listening.
+    ui_events: Option<UiEventReceiver>,
+    /// Live/ringing calls
+    calls: CallRegistry,
+    /// Where a call's video frames are published, once somebody has asked
+    /// for them. Read per frame rather than captured, so a front end that
+    /// resubscribes mid-call does not leave the pumps talking to a receiver
+    /// that has gone.
+    ///
+    /// Its own channel rather than a `UiEvent`: an event is news that a
+    /// reader which missed one has missed for good, and this is a stream
+    /// whose newest frame is the only one worth having. It is also bounded,
+    /// while the UI event channel has its own admission and recovery policy.
+    video_tx: VideoSenderSlot,
+    /// Whether anybody is drawing what the cameras produce. See
+    /// [`Self::set_video_publishing`].
+    video_publishing: Arc<portable_atomic::AtomicBool>,
+    /// The client, the history and the address book, as one value. See
+    /// [`Session`].
+    session: SessionSlot,
+    /// Tears down `run_client` on retry: without it the replaced client's
+    /// loop would keep the executor and the SQLite pool alive forever
+    /// (bot.run() reconnects internally and never returns on its own).
+    shutdown: Arc<tokio::sync::Notify>,
+    /// Asks the history reloader for a full pass.
+    ///
+    /// The reloader is otherwise driven by store invalidations, which is right
+    /// while a front end is attached and wrong the moment one attaches: it has
+    /// no chats and nothing has changed, so nothing would arrive until the
+    /// next message did.
+    reload: Arc<tokio::sync::Notify>,
+    history_budget: Arc<ui_queue::HistoryBudget>,
+    /// Asks the avatar resolver for a pass, and whether it must forget first.
+    ///
+    /// Its own lifecycle, deliberately not the reloader's: a picture is
+    /// stable metadata, and running its lookup behind every store
+    /// invalidation is what made a receipt query WhatsApp for something that
+    /// had not moved. The flag is set by a media-cache clear, where the
+    /// metadata may be unchanged but the bytes it named are gone.
+    resolve_avatars: AvatarResolveSignal,
+    /// Asks the chat-name resolver for a pass.
+    ///
+    /// Its own lifecycle like the avatar one beside it, for the same
+    /// reason: a display name is stable metadata, and running its lookup
+    /// behind every store invalidation would couple a network round trip to
+    /// a local read. A connect asks for a full pass (a subject can change
+    /// while the process is offline); a live message in an unnamed special
+    /// chat asks for just that chat.
+    resolve_chat_names: chat_names::ChatNameResolveSignal,
+}
+
+fn live_content_fallback(message: &wa::Message, has_media: bool) -> String {
+    if has_media {
+        return String::new();
+    }
+
+    velo_chat_store::sticker_pack_text(message).unwrap_or_else(|| {
+        velo_chat_store::message_fallback(&velo_chat_store::MessageKind::of(message)).to_owned()
+    })
+}
+
+impl WhatsAppClient {
+    /// Create a new WhatsApp client wrapper. Errors when the executor cannot
+    /// be built — a desktop builds a runtime, which resource exhaustion can
+    /// refuse — so a retry can route to the error screen instead of panicking
+    /// the thread that asked.
+    pub fn new() -> std::io::Result<Self> {
+        Self::new_for_account(AccountId::LEGACY)
+    }
+
+    /// The one single-account construction, kept for [`Self::new`] and its
+    /// tests.
+    ///
+    /// Private on purpose: a multi-account caller must not reach for this,
+    /// because it would build a *second* `StoreRegistry` over the same file —
+    /// a second pool, a second migration runner and two writers that can
+    /// deadlock on a lock upgrade. Everything with more than one account goes
+    /// through [`Self::new_for_account_with_registry`] with the daemon's one
+    /// shared registry.
+    fn new_for_account(account_id: AccountId) -> std::io::Result<Self> {
+        let stores = Arc::new(StoreRegistry::new(crate::store::database_path()));
+        Self::new_for_account_with_registry(account_id, stores)
+    }
+
+    /// Create a session using the daemon's shared database registry.
+    pub fn new_for_account_with_registry(
+        account_id: AccountId,
+        stores: Arc<StoreRegistry>,
+    ) -> std::io::Result<Self> {
+        let reload = Arc::new(tokio::sync::Notify::new());
+        let resolve_avatars = AvatarResolveSignal::new();
+        let resolve_chat_names = chat_names::ChatNameResolveSignal::new();
+        let history_budget = Arc::new(ui_queue::HistoryBudget::new());
+        let (ui_sender, ui_events) = ui_queue::channel(reload.clone(), history_budget.clone());
+        Ok(Self {
+            account_id,
+            played_gate: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            stores,
+            exec: Executor::new()?,
+            ui_sender,
+            ui_events: Some(ui_events),
+            calls: CallRegistry::default(),
+            video_tx: Arc::new(std::sync::Mutex::new(None)),
+            // Closed until a window says otherwise: a daemon that starts with
+            // nobody attached has nobody to publish to.
+            video_publishing: Arc::new(portable_atomic::AtomicBool::new(false)),
+            session: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            reload,
+            history_budget,
+            resolve_avatars,
+            resolve_chat_names,
+        })
+    }
+
+    /// Stop the background run loop, so the executor and the SQLite handles
+    /// drop with it. Idempotent; a signal fired before the loop is up still
+    /// lands (notify_one stores a permit).
+    pub fn shutdown(&self) {
+        self.shutdown.notify_one();
+    }
+
+    /// Ask the session to stop, wait for it to finish closing, and let it go.
+    ///
+    /// The wait is what separates this from [`shutdown`](Self::shutdown): the
+    /// session still has to disconnect the socket and close SQLite, and a
+    /// caller that walks away without waiting can cut that short. Bounded, so
+    /// a wedged session delays a teardown rather than preventing it.
+    ///
+    /// Takes the client, because letting go of it is part of the answer and
+    /// is itself a platform question: on a desktop the executor owns a Tokio
+    /// runtime, and tokio refuses to drop one inside an async context. That
+    /// drop happens where the wait does, which on a desktop is a blocking
+    /// thread and on a page is here.
+    ///
+    /// Returns whether it finished within `grace`. On the ordinary path that
+    /// is only worth logging; on the "clear data and pair again" path it
+    /// decides whether anything may be deleted at all.
+    pub async fn close(mut self, grace: std::time::Duration) -> bool {
+        self.shutdown();
+        let finished = self.exec.join(grace).await;
+        if !finished {
+            warn!("session did not finish closing within {grace:?}");
+        }
+        let drained = self.drain_chat_store(grace).await;
+        crate::exec::let_go(self).await;
+        finished && drained
+    }
+
+    /// Commit whatever the chat store's writer is still holding.
+    ///
+    /// It is the one task the executor does not own. `ChatStore` spawns its
+    /// writer itself — that queue is the store's own ordering guarantee, not
+    /// the session's — so [`join`](crate::exec::Executor::join) above says
+    /// nothing about it.
+    ///
+    /// On a desktop that is invisible, because letting go of the client drops
+    /// the runtime the task was spawned on and the task goes with it. A page
+    /// has no runtime to drop: the writer lives on the browser's event loop
+    /// and outlives this call. And what follows this call on the one path
+    /// that matters is deleting the database — so an account reset could
+    /// unlink the store while the old account's writer was still draining
+    /// into it, which is the partial wipe the delete-the-whole-file rule
+    /// exists to prevent, arrived at from the other end.
+    ///
+    /// `ChatStore::close` is what is awaited rather than a flush, and the
+    /// difference is the whole point: a flush says the queue is caught up, and
+    /// the writer answers it and goes straight back to waiting with
+    /// `SharedSqlite` still open. A close does not come back — it answers
+    /// after the loop has broken and the handle is dropped — and an open
+    /// handle is exactly what the deletion cannot run against here, because
+    /// this store's browser VFS writes changed blocks *after* the commit and
+    /// a page still held could land behind the delete and put the file back.
+    /// Taking the handle is the other half: it drops the sender the session
+    /// held, so nothing enqueues anything after.
+    async fn drain_chat_store(&self, grace: std::time::Duration) -> bool {
+        // The whole session, not the store alone. Letting go is as much an
+        // ordering question as opening was: a client left behind in a slot
+        // its store had been taken out of is a send that still goes out on
+        // the wire with nothing left to record it — and, on the path that
+        // matters, an `Arc<Client>` still holding the pool over the database
+        // about to be deleted.
+        let Some(session) = self.session.lock().await.take() else {
+            return true;
+        };
+        match crate::exec::with_timeout(session.chat_store.close(), grace).await {
+            Some(Ok(())) => true,
+            // Answered, and that is what is being asked. A batch that rolled
+            // back is a write that never landed and a writer that panicked is
+            // one that will never write again; neither is a hand still on the
+            // database, so neither is a reason to refuse the wipe and leave
+            // the person unable to pair again.
+            Some(Err(e)) => {
+                warn!("the chat store did not close cleanly: {e}");
+                true
+            }
+            None => {
+                warn!("the chat store was still writing after {grace:?}");
+                false
+            }
+        }
+    }
+
+    /// Subscribe to the video of whatever call is up.
+    ///
+    /// Asked for rather than always produced: publishing costs a clone of
+    /// every access unit, and a caller with nowhere to draw one (a tray, a
+    /// notifier) should not pay for it. Calling this again replaces the
+    /// previous subscriber, which is what a reconnecting front end wants.
+    pub fn video_events(&mut self) -> mpsc::Receiver<CallVideoFrame> {
+        let (tx, rx) = mpsc::channel(video::PUBLISH_DEPTH);
+        *self.video_tx.lock().expect("video sender poisoned") = Some(tx);
+        rx
+    }
+
+    /// Where a camera's finished frames go.
+    ///
+    /// Unused where there is no camera: the callers are the call methods, and
+    /// a page's are refusals. The same is true of [`Self::camera_lost`] below.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    fn video_publisher(&self) -> VideoPublisher {
+        VideoPublisher {
+            sender: Arc::clone(&self.video_tx),
+            watched: Arc::clone(&self.video_publishing),
+        }
+    }
+
+    /// Publish frames, or stop: the daemon says when anybody is drawing.
+    ///
+    /// A call runs whether or not a window is open — the peer is receiving
+    /// our camera either way — so the pumps would otherwise go on copying
+    /// every access unit out of the encoder's buffer and handing it to a
+    /// daemon that discards it. The gate is read before the frame is built,
+    /// so what it saves is the copy as well as the hop.
+    ///
+    /// Not the sender itself, which the daemon owns and must not lose: this
+    /// is a door in front of it.
+    pub fn set_video_publishing(&self, on: bool) {
+        self.video_publishing
+            .store(on, portable_atomic::Ordering::Relaxed);
+    }
+
+    /// What to do when a camera stops being a camera.
+    ///
+    /// Built per call rather than held, because it is a closure over the two
+    /// things the teardown needs and a runtime to run it on — and because the
+    /// only caller is the one opening a device.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    fn camera_lost(&self) -> CameraLost {
+        let calls = self.calls.clone();
+        let ui_sender = self.ui_sender.clone();
+        // A spawner rather than the executor: this is reported from whichever
+        // thread noticed the device go, which is not one the executor knows
+        // about, so there is no ambient one to find.
+        let spawner = self.exec.spawner();
+        Arc::new(move |call_id: String, camera_id| {
+            let calls = calls.clone();
+            let ui_sender = ui_sender.clone();
+            spawner.spawn(async move {
+                // The device is already gone; what is left is to stop
+                // claiming otherwise — and to name the camera that died,
+                // because this runs on a spawned task and a user who turned
+                // video off and on again meanwhile must not have the
+                // replacement torn down by its predecessor's failure.
+                Self::stop_local_video(&calls, &ui_sender, &call_id, Some(camera_id)).await;
+            });
+        })
+    }
+
+    /// What to do when the peer's picture is dropped on this side.
+    ///
+    /// Built per call for the same reason [`Self::camera_lost`] is, and it
+    /// resolves the handle by id rather than closing over one: on the accept
+    /// path the camera is opened before there is a handle to close over.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    fn picture_lost(&self) -> PictureLost {
+        let calls = self.calls.clone();
+        // No spawner, unlike `camera_lost`: the request is fire-and-forget in
+        // the library and returns without awaiting anything, so a task to run
+        // it on would buy a hop and nothing else.
+        Arc::new(move |call_id: &str| {
+            calls.ask_peer_for_keyframe(call_id, KeyframeUrgency::Coalesced);
+        })
+    }
+
+    /// Start the WhatsApp client in a background thread
+    ///
+    /// Returns a receiver for UI events, or an error if already started
+    pub fn start(&mut self) -> Result<UiEventReceiver, &'static str> {
+        let ui_rx = self
+            .take_events()
+            .ok_or("WhatsApp client already started")?;
+
+        let ui_tx = self.ui_sender.clone();
+        let session = self.session.clone();
+        let calls = self.calls.clone();
+        let shutdown = self.shutdown.clone();
+        let reload = self.reload.clone();
+        let resolve_avatars = self.resolve_avatars.clone();
+        let resolve_chat_names = self.resolve_chat_names.clone();
+        let history_budget = self.history_budget.clone();
+        let account_id = self.account_id;
+        let stores = Arc::clone(&self.stores);
+
+        let started = self.exec.start("velo-session", async move {
+            Self::run_client(
+                account_id,
+                ui_tx,
+                Shared {
+                    stores,
+                    session,
+                    calls,
+                    shutdown,
+                    reload,
+                    resolve_avatars,
+                    resolve_chat_names,
+                    history_budget,
+                },
+            )
+            .await;
+        });
+        if started.is_err() {
+            // Hand the stream back, so a caller that routes the failure to an
+            // error screen and retries is starting a session again rather
+            // than being told it already has one.
+            self.ui_events = Some(ui_rx);
+            return Err("failed to start the WhatsApp session");
+        }
+
+        Ok(ui_rx)
+    }
+
+    /// Take the stream of UI events, if nobody has.
+    ///
+    /// The receiving half exists from construction, so events sent before the
+    /// session is up are not lost; taking it is what [`Self::start`] does with
+    /// it, and doing so is what makes a second start an error.
+    pub(crate) fn take_events(&mut self) -> Option<UiEventReceiver> {
+        self.ui_events.take()
+    }
+
+    /// Open the store, the history, the address book and the client, and
+    /// publish them as one [`Session`].
+    ///
+    /// A seam rather than the middle of `run_client`, because everything up to
+    /// here runs offline — `Bot::build` opens the store and connects nothing —
+    /// and the ordering it establishes is the session's whole invariant. A
+    /// test can drive it against an in-memory database and watch the slot
+    /// while it does.
+    ///
+    /// Returns the bot, which only the caller runs: `bot.run()` is the network
+    /// and the one thing a test cannot have.
+    async fn open_session(
+        stores: &StoreRegistry,
+        account_id: AccountId,
+        ui_tx: &UiEventSender,
+        session: &SessionSlot,
+        resolve_chat_names: chat_names::ChatNameResolveSignal,
+    ) -> Option<(Bot, Arc<Session>, ColdStart)> {
+        // `began` is this function's own, and the caller's total is the
+        // caller's: resolving where the database lives happens before this and
+        // is measured there, so no phase falls outside the line that reports
+        // them.
+        // A cold start is the phases below, with an `.await` between each
+        // pair — and on a page that is not the pause it looks like. A future
+        // that is already ready resolves inside the microtask it was polled
+        // in, and every await here is ready on that target: the asynchrony is
+        // the desktop runtime's, and SQLite in a page is synchronous. So the
+        // whole run lands as *one* block on the thread that draws. Measured on
+        // the published page: 342ms with not one frame in it, between a window
+        // that was animating before it and animating after.
+        //
+        // Hence a turn for the loop between phases, and a stopwatch on each.
+        // Neither makes the work cheaper — the totals are the same totals, and
+        // what would make them smaller is moving the session off the window's
+        // agent altogether. What this does is stop one freeze being the shape
+        // of it, and name where a page's first second goes at all: the module
+        // is stripped, so a flame graph of it names nothing. A turn is an
+        // *opportunity* to draw rather than a promise of one — the browser
+        // decides whether a rendering pass fits between two tasks — which is
+        // the honest claim and still the difference between five chances and
+        // none.
+        //
+        // What a turn does not open is a teardown racing this. It lets the
+        // bridge's loop run, so a `ForgetSession` can be accepted while the
+        // store is still opening — but that was already true at `prepare`,
+        // which really does await the browser, and what would make it
+        // dangerous is ordered elsewhere: `close` raises the shutdown and
+        // *joins the executor*, so a wipe waits for this future to return and
+        // the forget path is gated on whether it did.
+        let opening_began = wacore::time::Instant::now();
+        // Whatever this platform has to do before a database can be opened
+        // at all. Here rather than at the caller, because forgetting it is
+        // not a failure anybody would see: a browser without its VFS opens a
+        // database in memory quite happily and loses the account when the tab
+        // closes.
+        if let Err(e) = stores.prepare().await {
+            error!("Failed to prepare the store: {e}");
+            let _ = ui_tx.send(UiEvent::Error(format!("Database error: {e}")));
+            return None;
+        }
+        let prepared = opening_began.elapsed();
+        crate::exec::breathe().await;
+
+        let opening = wacore::time::Instant::now();
+        let backend = match stores.store(account_id).await {
+            Ok(store) => store,
+            Err(e) => {
+                // With the chain, not just the head. `StoreError`'s own
+                // Display is a category ("database connection error") and
+                // what went wrong is always in its source — which on a page
+                // is the only thing there is to go on, since there is no
+                // database file anybody can open afterwards and look at.
+                error!("Failed to create SQLite backend: {}", because(&e));
+                let _ = ui_tx.send(UiEvent::Error(format!("Database error: {}", e)));
+                return None;
+            }
+        };
+        let opened = opening.elapsed();
+        crate::exec::breathe().await;
+
+        let materializing = wacore::time::Instant::now();
+        if let Err(e) = stores.prepare_chat_schema(&backend).await {
+            error!("Failed to prepare chat store schema: {}", because(&e));
+            let _ = ui_tx.send(UiEvent::Error(format!("Database error: {e}")));
+            return None;
+        }
+        let chat_store = match ChatStore::new_prepared(&backend).await {
+            Ok(store) => store,
+            Err(e) => {
+                error!("Failed to open chat store: {}", because(&e));
+                let _ = ui_tx.send(UiEvent::Error(format!("Database error: {}", e)));
+                return None;
+            }
+        };
+        let materialized = materializing.elapsed();
+        crate::exec::breathe().await;
+
+        // Transport, HTTP client and runtime come from whichever platform
+        // this is: the library's default features on a desktop, `web-sys`
+        // bindings in a page. See `crate::net`.
+        //
+        // The version is not among them, and used to be: `sw.js` is
+        // unreachable from a page — no `Access-Control-Allow-Origin`, and its
+        // `Sec-Fetch-Site` gate is a header a browser will not let anyone set
+        // — so this side fetched the number from a CDN feed and announced it
+        // with `with_version`. The library resolves it per target now, off
+        // the Facebook JS SDK bundle where Meta publishes the same `www`
+        // revision cross-origin, so the answer belongs there again. Ours was
+        // worse than redundant: `with_version` is an override, and an
+        // override makes the library skip its own resolution *and* the
+        // day-long cache stamp behind it.
+        let building = wacore::time::Instant::now();
+        let builder = persistent_companion(crate::net::with_platform_plugins(Bot::builder()))
+            .with_backend(backend)
+            .with_inbound_durability_hook(ChatStoreDurabilityHook::new(chat_store.clone()));
+        let bot = match builder.build().await {
+            Ok(bot) => bot,
+            Err(e) => {
+                error!("Failed to build bot: {}", e);
+                let _ = ui_tx.send(UiEvent::Error(format!("Connection failed: {}", e)));
+                // The store is already open, and nothing published means
+                // nothing to take: `drain_chat_store` would find an empty slot
+                // and answer "drained" over a writer still holding the
+                // database — which is the wipe racing the writer that the
+                // whole close path exists to prevent, arrived at from a
+                // failure nobody expected to matter. Closed here instead.
+                if let Err(e) = chat_store.close().await {
+                    warn!("the chat store did not close cleanly: {e}");
+                }
+                return None;
+            }
+        };
+        let built = building.elapsed();
+
+        // The hook above writes this exact batch before the core dispatches its
+        // hook_committed event, so the event handler must not materialize it a
+        // second time. Event-only routes leave the marker unset and remain on
+        // the ordinary handler path.
+        chat_store.skip_hook_committed_batches(true);
+
+        // Give the client this platform's way onto a call's media wire, before
+        // anything can ring. Nothing on a desktop, where the library's own UDP
+        // dialler is the default and is right; on a page it is the whole
+        // reason a call can be placed at all. See `crate::relay`.
+        crate::relay::install(&bot.client());
+
+        // One publish, after everything it names exists. There is no order to
+        // get wrong here and no window to observe: what a caller finds is
+        // either no session at all or a client, the history it is recorded in
+        // and the book that names people in it, together. Four slots filled
+        // one at a time is what this replaced, and the gap between any two of
+        // them was a real one — a paged read that had the store but not the
+        // book, a send that had the client but nothing recording it.
+        let live = Arc::new(Session {
+            client: bot.client(),
+            chat_store: chat_store.clone(),
+            names: Arc::new(NameBook::new(Some(chat_store))),
+            resolve_chat_names,
+        });
+        *session.lock().await = Some(live.clone());
+        crate::exec::breathe().await;
+
+        Some((
+            bot,
+            live,
+            ColdStart {
+                prepared,
+                opened,
+                materialized,
+                built,
+            },
+        ))
+    }
+
+    /// Internal async function to run the client
+    async fn run_client(account_id: AccountId, ui_tx: UiEventSender, shared: Shared) {
+        let Shared {
+            stores,
+            session,
+            calls,
+            shutdown,
+            reload,
+            resolve_avatars,
+            resolve_chat_names,
+            history_budget,
+        } = shared;
+        let cold_start = wacore::time::Instant::now();
+        // Device store + durable chat history share one SQLite file (one pool,
+        // one WAL writer). The registry is owned by the daemon and its schema
+        // cell prevents concurrent account runtimes from rerunning migrations.
+        let resolving = cold_start.elapsed();
+        let Some((bot, live, cold)) = Self::open_session(
+            &stores,
+            account_id,
+            &ui_tx,
+            &session,
+            resolve_chat_names.clone(),
+        )
+        .await
+        else {
+            return;
+        };
+        let Session {
+            chat_store, names, ..
+        } = &*live;
+
+        // Hydrate the UI from durable history before the network is even up
+        // (bot.run() is what connects). The client is needed here so hydrated
+        // JIDs normalize through the same PN->LID mapping live events use.
+        let hydrating = wacore::time::Instant::now();
+        let mut hydrated = 0;
+        let (chat_limit, message_limit) = history_budget.limits();
+        match Self::load_history_before_connection(
+            chat_store,
+            &bot.client(),
+            names,
+            chat_limit,
+            message_limit,
+        )
+        .await
+        {
+            Ok(loaded) if !loaded.chats.is_empty() => {
+                hydrated = loaded.chats.len();
+                let _ = ui_tx.send(loaded.into_event());
+            }
+            Ok(_) => {}
+            Err(e) => warn!("Failed to load chat history: {e}"),
+        }
+        // One line rather than five, and at `info` because a cold start
+        // happens once: this is the only place the page's first second is
+        // attributable at all, and the numbers are what any change to it has
+        // to be argued against.
+        info!(
+            "cold start: path {resolving:?}, store {:?}, sqlite {:?}, chats {:?}, \
+             client {:?}, hydration {:?} ({hydrated} chats) — {:?} in total",
+            cold.prepared,
+            cold.opened,
+            cold.materialized,
+            cold.built,
+            hydrating.elapsed(),
+            cold_start.elapsed(),
+        );
+        crate::exec::breathe().await;
+
+        let (_local_over, local_stopping) = tokio::sync::watch::channel(());
+        Self::spawn_history_reloader(
+            chat_store.subscribe(),
+            chat_store.clone(),
+            &bot,
+            &ui_tx,
+            reload.clone(),
+            history_budget.clone(),
+            names.clone(),
+            local_stopping,
+        );
+
+        let _ = ui_tx.send(account_event(&bot.client()));
+        match chat_store.logout_message().await {
+            Ok(Some(message)) => {
+                let _ = ui_tx.send(UiEvent::LoggedOut(message));
+                shutdown.notified().await;
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = ui_tx.send(UiEvent::Error(format!(
+                    "Cannot read this account's recovery state: {error}"
+                )));
+                shutdown.notified().await;
+                return;
+            }
+        }
+
+        // The chat store materializes history straight off the event bus.
+        // detach: the store materializes for the whole session, so the
+        // subscription must outlive this scope rather than unregister on drop.
+        bot.client()
+            .subscribe_handler(chat_store.handler())
+            .detach();
+
+        // The UI observes only the event kinds handled below. Two bounded
+        // mailboxes reserve space for session and call control; committed
+        // ChatStore invalidations remain the recovery source for raw-event lag.
+        let (control_events, control_incoming, control_stats) =
+            interested_channel(CONTROL_EVENT_KINDS, 64);
+        let (identity_events, identity_incoming, _identity_stats) =
+            interested_unbounded_channel(IDENTITY_EVENT_KINDS);
+        let (data_events, data_incoming, data_stats) = interested_channel(DATA_EVENT_KINDS, 256);
+        // What tells this session's own tasks that it is over.
+        //
+        // A desktop session ends by dropping the runtime it was built on,
+        // which takes every task on it. A page has no such runtime: a
+        // `spawn_local` task is never cancelled by anything, so one that holds
+        // an `Arc<ChatStore>` or a client handle keeps them alive for the life
+        // of the tab — and "clear data and pair again" then deletes the
+        // database out from under a connection somebody still has open.
+        //
+        // Both long-lived children below watch this. A `watch` rather than a
+        // `Notify` because dropping the sender is itself the signal: whichever
+        // way `run_client` returns, including a panic on the way out, the
+        // children wake and stop. There is no notification for a task to have
+        // been too late to register for.
+        // Named, not `_`: a `_` binding drops at once, which would end the
+        // session before it began. This one is never sent on and never read —
+        // holding it until `run_client` returns is the whole of its job.
+        let (_session_over, stopping) = tokio::sync::watch::channel(());
+
+        let _call_advertisements = bot.client().acquire_raw_node_forwarding();
+        bot.client().subscribe_handler(control_events).detach();
+        bot.client().subscribe_handler(data_events).detach();
+        bot.client().subscribe_handler(identity_events).detach();
+        Self::spawn_contact_identity_learner(
+            bot.client(),
+            identity_incoming,
+            chat_store.clone(),
+            names.clone(),
+            reload.clone(),
+            stopping.clone(),
+        );
+        {
+            let client = bot.client();
+            let ui_tx = ui_tx.clone();
+            let calls = calls.clone();
+            let names = names.clone();
+            let reload = reload.clone();
+            let control_fault_ui = ui_tx.clone();
+            let avatar_signal = resolve_avatars.clone();
+            let names_signal = resolve_chat_names.clone();
+            let names_on_drop = resolve_chat_names.clone();
+            let logout_store = chat_store.clone();
+            let mut stopping = stopping.clone();
+            crate::exec::spawn_owned(async move {
+                // The dispatch loop's own handle. The one below is moved into
+                // the per-event closure, and what this asks the client is the
+                // PN/LID pairing that decides the lane.
+                let dispatch_client = client.clone();
+                let dispatch_names = names.clone();
+                let dispatch_calls = calls.clone();
+                let dispatch_ui = ui_tx.clone();
+                let mut lanes = EventLanes::new(
+                    move |event, epoch| {
+                        let client = client.clone();
+                        let ui_tx = ui_tx.clone();
+                        let calls = calls.clone();
+                        let names = names.clone();
+                        let reload = reload.clone();
+                        let resolve_avatars = avatar_signal.clone();
+                        let resolve_chat_names = names_signal.clone();
+                        let logout_store = logout_store.clone();
+                        async move {
+                            if let Event::LoggedOut(logged_out) = &*event {
+                                let message = logout_message(logged_out);
+                                if let Err(error) = logout_store.record_logout(message).await {
+                                    error!("could not persist the logged-out state: {error}");
+                                }
+                            }
+                            Self::handle_event(
+                                event,
+                                client,
+                                ui_tx,
+                                calls,
+                                names,
+                                Some(reload),
+                                Some(resolve_avatars),
+                                Some(resolve_chat_names),
+                                epoch,
+                            )
+                            .await;
+                        }
+                    },
+                    stopping.clone(),
+                    dispatch_calls,
+                    dispatch_ui,
+                );
+                let mut control_open = true;
+                let mut data_open = true;
+                let mut control_drops = 0;
+                let mut data_drops = 0;
+                loop {
+                    if !control_open && !data_open {
+                        break;
+                    }
+                    let event = tokio::select! {
+                        event = control_incoming.recv(), if control_open => match event {
+                            Ok(event) => Some(event),
+                            Err(_) => {
+                                control_open = false;
+                                None
+                            }
+                        },
+                        event = data_incoming.recv(), if data_open => match event {
+                            Ok(event) => Some(event),
+                            Err(_) => {
+                                data_open = false;
+                                None
+                            }
+                        },
+                        // The session has gone. Anything still queued belongs
+                        // to an account this task no longer speaks for.
+                        _ = stopping.changed() => break,
+                    };
+                    let Some(event) = event else { continue };
+                    let control_snapshot = control_stats.stats();
+                    if control_snapshot.dropped_full > control_drops {
+                        warn!(
+                            "dropping {} control WhatsApp event(s) from full mailbox",
+                            control_snapshot.dropped_full - control_drops
+                        );
+                        control_drops = control_snapshot.dropped_full;
+                        control_fault_ui.signal_control_overflow();
+                        // Connected and OfflineSyncCompleted are control
+                        // events. If either was among the dropped entries,
+                        // advance the name generation as well as requesting
+                        // a full durable pass, so changed subjects are not
+                        // skipped as already settled on the old socket.
+                        names_on_drop.new_connection();
+                    }
+                    let data_snapshot = data_stats.stats();
+                    if data_snapshot.dropped_full > data_drops {
+                        warn!(
+                            "dropping {} recoverable WhatsApp event(s) from full mailbox",
+                            data_snapshot.dropped_full - data_drops
+                        );
+                        data_drops = data_snapshot.dropped_full;
+                        // The store materializes these events independently,
+                        // but the session-side sighting can be the only name
+                        // trigger for a newly seen special chat. Re-cover
+                        // durable state after a mailbox overflow without
+                        // invalidating settled names or per-chat cooldowns;
+                        // run_pass's flush barrier waits for the store's
+                        // commit first.
+                        names_on_drop.request_full();
+                    }
+                    // The kind, and only the kind. It is `Copy`, carries no
+                    // payload and names the variant, which makes this the one
+                    // account of the event stream that can be pasted into an
+                    // issue: a `Debug` of the event itself would be somebody's
+                    // messages. Worth having at all because a session that
+                    // goes quiet is otherwise indistinguishable from one with
+                    // nothing to say — the arms below speak only for the
+                    // variants they handle.
+                    debug!("client event: {:?}", event.kind());
+                    let dropped = lanes
+                        .dispatch(&dispatch_client, &dispatch_names, event)
+                        .await;
+                    if dropped.dropped_recoverable {
+                        // A full lane drops only recoverable events. The
+                        // ChatStore still sees them, so a full metadata pass
+                        // recovers a name sighting we missed. Keep the exact
+                        // special-chat JIDs too: a new or unsubscribed
+                        // channel may be absent from list_subscribed and
+                        // needs the selective get_metadata fallback.
+                        names_on_drop.request_full();
+                        names_on_drop.request_named(dropped.special_chat_jids);
+                    }
+                }
+            });
+        }
+
+        shared_history::spawn(bot.client(), chat_store.clone(), stopping.clone());
+
+        // Re-hydrate the UI off the store's invalidation stream instead of raw
+        // client events: changes are emitted only after commit, so a reload can
+        // never observe pre-commit state (no flush barrier, no dispatch-order
+        // dependency), and the debounce coalesces history-sync bursts into one
+        // reload. HistoryLoaded merges, so re-sending is safe.
+
+        // The picture lifecycle, kept apart from history on purpose. It handles
+        // explicit demands from the viewport, overscan, active chat header, and
+        // named requests; Connected only advances its generation; chat-list paging
+        // does not enqueue resolution; and the resolver reads metadata while the
+        // daemon fetches avatar bytes.
+        Self::spawn_avatar_resolver(
+            bot.client(),
+            chat_store.clone(),
+            ui_tx.clone(),
+            resolve_avatars,
+            stopping.clone(),
+        );
+
+        // The chat-name lifecycle, kept apart from history for the same
+        // reason: a display name is server metadata, and looking it up
+        // behind a local read would delay every HistoryLoaded behind the
+        // network. Connected asks for a full pass; live traffic asks per
+        // sighted special chat; receipts and acks ask for nothing.
+        Self::spawn_chat_name_resolver(
+            bot.client(),
+            chat_store.clone(),
+            resolve_chat_names,
+            stopping,
+        );
+
+        // Notify UI that init is complete
+        let _ = ui_tx.send(UiEvent::InitComplete);
+
+        // bot.run() supervises reconnects and returns its classified completion.
+        // The shutdown signal also lets a replaced client's thread exit
+        // (letting block_on return drops the runtime + SQLite pool).
+        let client = bot.client();
+        tokio::select! {
+            // Said out loud, because this is a session ending. `run`
+            // reconnects internally, so it returns only when there is nothing
+            // left to try — and returning quietly left a window sitting on
+            // "Connecting to WhatsApp" with a console that had stopped saying
+            // anything at all, which reads as a hang rather than as a stop.
+            reason = bot.run() => {
+                info!("the WhatsApp session ended: {reason:?}");
+                // Stop the network workers before making retained history available.
+                drop(_session_over);
+                let mut retain_local = false;
+                if let Some(event) = completion::completion_event(&reason) {
+                    retain_local = matches!(event, UiEvent::LoggedOut(_));
+                    if let UiEvent::LoggedOut(message) = &event
+                        && let Err(error) = chat_store.record_logout(message.clone()).await
+                    {
+                        error!("could not persist the logged-out state: {error}");
+                    }
+                    let _ = ui_tx.send(event);
+                }
+                completion::report_shutdown(&client.shutdown().await);
+                if let Ok(Some(message)) = chat_store.logout_message().await {
+                    retain_local = true;
+                    let _ = ui_tx.send(UiEvent::LoggedOut(message));
+                }
+                if retain_local {
+                    shutdown.notified().await;
+                } else {
+                    // Other owners keep sender clones; an explicit close lets the
+                    // daemon drain the final event and restart this account.
+                    ui_tx.close();
+                }
+            },
+            _ = shutdown.notified() => {
+                // Graceful stop: flushes state and closes the transport. The
+                // dropped run future is not awaited out instead, because a
+                // shutdown() landing before run()'s first poll would be
+                // clobbered by run's own is_running swap.
+                completion::report_shutdown(&client.shutdown().await);
+            }
+        }
+    }
+
+    /// Whether a `<reject>` ends our side of the call: only a decision
+    /// does. `busy` is in another call and `enc` could not decrypt the
+    /// offer, and neither speaks for the callee — the dismiss path already
+    /// keeps the rest ringing for both, so ending here would hang up a call
+    /// the peer is still answering.
+    fn reject_ends_call(reason: Option<&str>) -> bool {
+        use whatsapp_rust::wacore::stanza::call::{REJECT_REASON_BUSY, REJECT_REASON_ENC};
+
+        !matches!(reason, Some(REJECT_REASON_BUSY) | Some(REJECT_REASON_ENC))
+    }
+
+    /// Consume app-state identity pairs losslessly and persist them in
+    /// batches. This is separate from the latency-sensitive event lanes: a
+    /// full contact sync can contain hundreds of updates, and persisting one
+    /// mapping at a time on the global lane both delayed connection events and
+    /// made a bounded ingress discard the tail of the sync.
+    fn spawn_contact_identity_learner(
+        client: Arc<Client>,
+        incoming: async_channel::Receiver<Arc<Event>>,
+        chat_store: Arc<ChatStore>,
+        names: Arc<NameBook>,
+        reload: Arc<tokio::sync::Notify>,
+        mut stopping: tokio::sync::watch::Receiver<()>,
+    ) {
+        crate::exec::spawn_owned(async move {
+            loop {
+                let first = tokio::select! {
+                    event = incoming.recv() => match event {
+                        Ok(event) => event,
+                        Err(_) => return,
+                    },
+                    _ = stopping.changed() => return,
+                };
+                let mut mappings = Vec::new();
+                if let Event::ContactUpdate(update) = &*first
+                    && let Some(pair) = contact_identity_pair(update)
+                {
+                    mappings.push(pair);
+                }
+                // Drain the already queued portion of a full sync into the
+                // client's durable batch API. New arrivals remain queued for
+                // the next pass; no fixed batch limit is needed because the
+                // event bus has already materialized this finite burst.
+                while let Ok(event) = incoming.try_recv() {
+                    if let Event::ContactUpdate(update) = &*event
+                        && let Some(pair) = contact_identity_pair(update)
+                    {
+                        mappings.push(pair);
+                    }
+                }
+                if mappings.is_empty() {
+                    continue;
+                }
+
+                loop {
+                    let learned = client.add_lid_pn_mappings(
+                        mappings.clone(),
+                        whatsapp_rust::lid_pn_cache::LearningSource::Other,
+                    );
+                    let result = tokio::select! {
+                        result = learned => result,
+                        _ = stopping.changed() => return,
+                    };
+                    match result {
+                        Ok(_) => break,
+                        Err(error) => {
+                            warn!("could not persist a batch of contact LID/PN mappings: {error}");
+                            tokio::select! {
+                                _ = crate::exec::sleep(std::time::Duration::from_secs(1)) => {}
+                                _ = stopping.changed() => return,
+                            }
+                        }
+                    }
+                }
+
+                // The writer may have already materialized the same author
+                // under both keys before this mapping became durable. Fold
+                // those legacy rows before consumers re-read the affected chats.
+                if let Err(error) = chat_store.reconcile_message_mappings(&mappings) {
+                    warn!("could not queue message identity reconciliation: {error}");
+                } else if let Err(error) = chat_store.flush().await {
+                    warn!("could not reconcile message identities after learning aliases: {error}");
+                }
+
+                // A previous read may have cached an honest mapping miss.
+                // Invalidate only after the batch is durable; the generation
+                // in NameBook prevents an older in-flight lookup from putting
+                // that miss back after this point.
+                names.forget();
+                reload.notify_one();
+            }
+        });
+    }
+
+    /// Handle events from the WhatsApp client
+    ///
+    /// Eight parameters because the dispatch closure threads every signal
+    /// the arms can ask on: the reload, the avatar pass and the chat-name
+    /// pass each own a signal, and bundling three of them to save one
+    /// parameter buys the repetition back as field access at every use.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_event(
+        event: Arc<Event>,
+        client: Arc<Client>,
+        ui_tx: UiEventSender,
+        calls: CallRegistry,
+        names: Arc<NameBook>,
+        reload: Option<Arc<tokio::sync::Notify>>,
+        resolve_avatars: Option<AvatarResolveSignal>,
+        resolve_chat_names: Option<chat_names::ChatNameResolveSignal>,
+        epoch: u64,
+    ) {
+        match &*event {
+            // The dispatch boundary already retired calls and published this
+            // before any older call lane can resume its asynchronous work.
+            Event::Disconnected(_) => {}
+            Event::RawNode(node) => calls.accept_advertisement(node).await,
+            Event::PairingQrCode(qr) => {
+                info!("QR code received");
+                let _ = ui_tx.send(UiEvent::QrCode {
+                    code: qr.code.clone(),
+                    timeout_secs: qr.timeout.as_secs(),
+                });
+            }
+            Event::PairingCode(pair) => {
+                info!("Pair code received");
+                let _ = ui_tx.send(UiEvent::PairCode {
+                    code: pair.code.clone(),
+                    timeout_secs: pair.timeout.as_secs(),
+                });
+            }
+            Event::SelfPushNameUpdated(update) => {
+                info!("Push name is now {:?}", update.new_name);
+                let _ = ui_tx.send(account_event(&client));
+            }
+            Event::PairSuccess(_) => {
+                info!("Pairing successful, syncing...");
+                let _ = ui_tx.send(UiEvent::PairSuccess);
+                let _ = ui_tx.send(account_event(&client));
+            }
+            Event::Connected(_) => {
+                info!("Connected to WhatsApp!");
+                // Manual policy prevents future automatic `available`
+                // announcements. Retract any presence left on the server by
+                // an older build or a previous connection as soon as this
+                // socket is ready.
+                if let Err(error) = announce_background_presence(&client).await {
+                    warn!("could not announce background presence: {error}");
+                }
+                if let Some(reload) = reload {
+                    reload.notify_one();
+                }
+                // The pictures, on their own signal and their own pass. A
+                // fresh connection is exactly when a metadata refresh is worth
+                // making: the durable descriptors already drew every known
+                // avatar from the cache, and this picks up whatever changed
+                // while the process was away. It also advances the resolution
+                // generation, so the previous socket's answers do not stand
+                // in for this one's.
+                if let Some(resolve) = resolve_avatars {
+                    resolve.new_connection();
+                }
+                // The names, on their own signal and their own pass, for
+                // the same reason: a subject can change while the process
+                // is offline, and the previous socket's answers say nothing
+                // about this one. The pass revalidates every stored special
+                // chat; a write that learned nothing broadcasts nothing.
+                // (The pass snapshots the store when it RUNS, not when it
+                // is queued — so a drain still materializing behind this
+                // event is covered, and `OfflineSyncCompleted` below
+                // re-asks once the backlog is fully in.)
+                if let Some(resolve) = resolve_chat_names {
+                    resolve.new_connection();
+                }
+                if !calls.connection_is_current(epoch) {
+                    return;
+                }
+                // Who this device is linked as. Read from the device store
+                // rather than remembered from pairing: a client attaching
+                // after a restart never saw that, and the account row was
+                // claiming "not linked" over a live session.
+                let _ = ui_tx.send(account_event(&client));
+            }
+            Event::LoggedOut(logged_out) => {
+                info!("Logged out from WhatsApp: {:?}", logged_out.reason);
+                // Not a Disconnected: reconnecting reuses the credentials the
+                // server just rejected, which is the 401 loop.
+                let _ = ui_tx.send(UiEvent::LoggedOut(logout_message(logged_out)));
+            }
+            Event::OfflineSyncCompleted(done) => {
+                // The backlog is fully materialized now: whatever the drain
+                // (and any history chunk behind it) created after the
+                // Connected snapshot is in the store, so re-ask for a full
+                // pass over what it holds. Coalesced by the signal — ten
+                // completions while a pass runs are one `full` bit — and a
+                // pass that learned nothing broadcasts nothing.
+                debug!("offline sync completed ({} messages)", done.count);
+                if let Some(resolve) = &resolve_chat_names {
+                    // A post-sync repair is a new durable snapshot, not just
+                    // another ask for rows already settled before the drain.
+                    // Advance the metadata generation so names overwritten by
+                    // late history are revalidated in this same connection.
+                    resolve.new_connection();
+                }
+            }
+            Event::HistorySync(history) if history.peer_data_request_session_id().is_some() => {
+                // On-demand history backfills arrive independently of the
+                // offline-drain completion. The store applies their
+                // conversation snapshots too, so revalidate metadata after
+                // the materialization rather than leaving a stale subject.
+                if let Some(resolve) = &resolve_chat_names {
+                    resolve.new_connection();
+                }
+            }
+            Event::HistorySync(_) => {
+                // Server-pushed offline chunks can arrive in many pieces;
+                // OfflineSyncCompleted is the single repair point once all
+                // of them have materialized.
+            }
+            Event::DeleteChatUpdate(update) => {
+                // A delete can retire a row after this generation already
+                // settled its metadata. The next message may recreate the
+                // row under the same JID, so force that address through a
+                // fresh metadata lookup rather than trusting the old answer.
+                if let Some(resolve) = &resolve_chat_names {
+                    resolve.request_forced([update.jid.to_non_ad_string()]);
+                }
+            }
+            Event::IncomingCall(call) => match &call.action {
+                CallAction::Offer {
+                    call_id, is_video, ..
+                } => {
+                    if call.offline {
+                        info!("Ignoring offline call {} (stale)", call_id);
+                        return;
+                    }
+                    let offer = Arc::new((**call).clone());
+                    if !calls.offer_in_epoch(call_id.clone(), offer.clone(), epoch) {
+                        return;
+                    }
+                    info!("Incoming call from {}", call.from.observe());
+                    // A call has to ring even when nobody can say which of
+                    // the caller's two addresses their chat is filed under:
+                    // the address as written is no worse than the one the
+                    // offer arrived under, and a card nobody sees is worse
+                    // than a card whose chat link misses.
+                    let caller_jid = names
+                        .chat_key(&client, &call.from)
+                        .await
+                        .unwrap_or_else(|| call.from.to_non_ad_string());
+                    let caller_name = call
+                        .notify
+                        .as_deref()
+                        .filter(|name| !name.trim().is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| fallback_chat_name(&call.from));
+                    let ui_call = IncomingCall::new(
+                        call_id.clone(),
+                        caller_name,
+                        caller_jid,
+                        *is_video,
+                        &offer,
+                    );
+                    calls.publish_offer(&offer, ui_call, epoch, &ui_tx);
+                }
+                CallAction::Accept { call_id, .. } => {
+                    info!("Call {} accepted by peer", call_id);
+                    calls.accepted(call, &ui_tx).await;
+                }
+                CallAction::Reject {
+                    call_id, reason, ..
+                } => {
+                    // One stale device must not end the call: its siblings
+                    // are still ringing, and the primary may yet answer.
+                    if !Self::reject_ends_call(reason.as_deref()) {
+                        return;
+                    }
+                    info!("Call {} rejected by peer", call_id);
+                    calls.ended_remotely(call_id);
+                    // Claimed, not assumed. The watcher parked on this call's
+                    // `wait_ended` publishes the same event when the hangup
+                    // above resolves, and either of the two can get there
+                    // first; whichever does is the one that says it.
+                    if calls.announce_ending(call_id) {
+                        let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
+                    }
+                }
+                CallAction::Terminate { call_id, .. } => {
+                    info!("Call {} terminated by peer", call_id);
+                    calls.ended_remotely(call_id);
+                    // Claimed, not assumed. The watcher parked on this call's
+                    // `wait_ended` publishes the same event when the hangup
+                    // above resolves, and either of the two can get there
+                    // first; whichever does is the one that says it.
+                    if calls.announce_ending(call_id) {
+                        let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
+                    }
+                }
+                _ => {}
+            },
+            Event::MissedCall(missed) => {
+                info!(
+                    "Missed call {} from {}",
+                    missed.call_id,
+                    missed.from.observe()
+                );
+                calls.ended_remotely(&missed.call_id);
+                // See the terminate arm.
+                if calls.announce_ending(&missed.call_id) {
+                    let _ = ui_tx.send(UiEvent::CallEnded(missed.call_id.clone()));
+                }
+            }
+            Event::CallEndedElsewhere(ended) => {
+                info!("Call {} handled on another device", ended.call_id);
+                // Unconditional, unlike the arms above: this is a different
+                // sentence from the watcher's `CallEnded` — it says *where* the
+                // call went — so it is not the same news said twice.
+                calls.ended_remotely(&ended.call_id);
+                let _ = ui_tx.send(UiEvent::CallEndedElsewhere(ended.call_id.clone()));
+            }
+            Event::Messages(batch) => {
+                // A drain is a backlog, not an arrival: fetching every
+                // picture in it before the first bubble reaches the window
+                // spends the whole reconnection on work the store has
+                // already materialized and hydration would redo from the
+                // thumbnail anyway.
+                let eager = matches!(
+                    batch.origin,
+                    whatsapp_rust::wacore::types::events::BatchOrigin::Live
+                );
+                // The first sighting of an unnamed special chat: a message
+                // creates its row nameless, and no restart should be needed
+                // for the name to arrive. Sightings are cheap — the resolver
+                // deduplicates per generation and skips chats the store
+                // already names. Live traffic asks per chat; the offline
+                // drain asks once per batch (its chats may postdate the
+                // Connected snapshot, and `OfflineSyncCompleted` below is
+                // the backstop that re-covers whatever is still unnamed).
+                // Keep the ask after materialization: the resolver has its
+                // own task and could otherwise snapshot the store before this
+                // message's independent ChatStore subscription is committed.
+                let sighted = resolve_chat_names.as_ref().map(|_| {
+                    batch
+                        .iter()
+                        .filter_map(|inbound| {
+                            let chat = &inbound.info.source.chat;
+                            (chat.is_group() || chat.is_newsletter())
+                                .then(|| chat.to_non_ad_string())
+                        })
+                        .collect::<Vec<_>>()
+                });
+                // Cache read frontiers per conversation for this offline batch.
+                // Already-read replays must keep their read flag even though
+                // offline batches cannot trigger alerts.
+                let mut offline_reads = HashMap::new();
+                if !eager {
+                    for inbound in batch
+                        .iter()
+                        .filter(|inbound| !inbound.info.source.is_from_me)
+                    {
+                        let key = inbound.info.source.chat.to_non_ad_string();
+                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                            offline_reads.entry(key)
+                        {
+                            let state = if let Some(store) = names.chat_store() {
+                                match store.message_read_state(&inbound.info.source.chat).await {
+                                    Ok(state) => Some(state),
+                                    Err(error) => {
+                                        warn!("could not read offline attention state: {error}");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            entry.insert(state);
+                        }
+                    }
+                }
+                for inbound in batch.iter() {
+                    let cached_read = offline_reads
+                        .get(&inbound.info.source.chat.to_non_ad_string())
+                        .map(|state| {
+                            state
+                                .as_ref()
+                                .map(|state| state.covers(&inbound.info.id, inbound.info.timestamp))
+                        });
+                    Self::handle_inbound_message_with_read(
+                        &inbound.message,
+                        &inbound.info,
+                        &client,
+                        &ui_tx,
+                        &names,
+                        eager,
+                        cached_read,
+                    )
+                    .await;
+                }
+                if let (Some(resolve), Some(sighted)) = (&resolve_chat_names, sighted)
+                    && !sighted.is_empty()
+                {
+                    resolve.request_named(sighted);
+                }
+            }
+            Event::ServerAck(ack) => {
+                // Acks cover every stanza class, and a nack is explicitly not
+                // a successful send. The chat store handles both durably; the
+                // live path only supplies the positive message transition the
+                // optimistic bubble can draw immediately.
+                if ack.class.as_deref() != Some("message") || ack.error.is_some() {
+                    return;
+                }
+                let Some(from) = &ack.from else {
+                    // A chatless ack can be resolved safely by the store
+                    // against its outgoing rows, but this stateless path
+                    // cannot guess which conversation owns the id.
+                    return;
+                };
+                let Some(chat_jid) = names.chat_key(&client, from).await else {
+                    warn!(
+                        "dropping sent acknowledgement for {}: the PN/LID pair behind it could not be read",
+                        from.observe()
+                    );
+                    return;
+                };
+
+                let _ = ui_tx.send(UiEvent::ReceiptReceived {
+                    chat_jid,
+                    message_ids: vec![ack.id.clone()],
+                    receipt_type: ReceiptType::Sent,
+                });
+            }
+            Event::Receipt(receipt) => {
+                // Delivered used to be dropped here, which is why the
+                // second tick never appeared: only Read and Played reached
+                // the UI, so a message went from one tick straight to blue.
+                let Some(dominated_type) = played::receipt_for_ui(&receipt.r#type) else {
+                    return;
+                };
+
+                debug!(
+                    "Receipt {:?} for {} message(s) in {}",
+                    dominated_type,
+                    receipt.message_ids.len(),
+                    receipt.source.chat.observe()
+                );
+
+                // A receipt marks rows a front end already has. Published
+                // under a key nobody could confirm, it lands on a second,
+                // PN-keyed copy of a conversation whose messages live under
+                // the LID — a read mark on the wrong thread, or on none. Say
+                // so and drop it: the next read of the mapping settles the
+                // pair, and every later receipt for the chat is keyed by it.
+                let Some(chat_jid) = names.chat_key(&client, &receipt.source.chat).await else {
+                    warn!(
+                        "dropping {:?} receipt for {}: the PN/LID pair behind it could not be read",
+                        dominated_type,
+                        receipt.source.chat.observe()
+                    );
+                    return;
+                };
+
+                let _ = ui_tx.send(UiEvent::ReceiptReceived {
+                    chat_jid,
+                    message_ids: receipt
+                        .message_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    receipt_type: dominated_type,
+                });
+            }
+            Event::ChatPresence(update) => {
+                // Our own composing state, echoed back from another of our
+                // devices, is not somebody typing *at* us.
+                if update.source.is_from_me {
+                    return;
+                }
+                let composing = match update.state {
+                    ChatActivity::Typing => Some(ComposingKind::Text),
+                    ChatActivity::RecordingAudio => Some(ComposingKind::Audio),
+                    ChatActivity::Idle => None,
+                    _ => return,
+                };
+                // Same rule as the receipt above: a typing line is drawn on
+                // a conversation somebody is looking at, and a guessed key
+                // draws it on a different one.
+                let Some(chat_jid) = names.chat_key(&client, &update.source.chat).await else {
+                    warn!(
+                        "dropping chat presence for {}: the PN/LID pair behind it could not be read",
+                        update.source.chat.observe()
+                    );
+                    return;
+                };
+                let sender = update.source.sender.clone();
+                // Keyed by the same JID whichever alias the event arrived
+                // under. The registry is a map, and `clear_composing` looks
+                // the entry up by this key: a composing under the PN with the
+                // paused under the LID left one nobody could find, so the line
+                // said they were typing until the TTL ran out — and alternating
+                // events listed the same person twice.
+                let identity = names.identity(&client, &sender).await;
+                // Named here rather than left to the front end: the typing
+                // line sits directly under this person's bubbles, and a name
+                // picked by a different rule is the same person twice.
+                let sender_name = match composing {
+                    Some(_) => names.known(&client, &sender, None).await,
+                    // Nobody draws the name of someone who stopped.
+                    None => None,
+                };
+                let _ = ui_tx.send(UiEvent::ChatPresence {
+                    chat_jid,
+                    sender_jid: identity.canonical_jid.clone(),
+                    sender_name,
+                    composing,
+                });
+            }
+            Event::Presence(update) => {
+                let availability = match update.status {
+                    PresenceStatus::Available => Availability::Online,
+                    PresenceStatus::Unavailable => update
+                        .last_seen
+                        .map_or(Availability::Unknown, Availability::LastSeen),
+                    _ => Availability::Unknown,
+                };
+                // Keyed like the receipt and chat-presence branches beside
+                // it: a chat whose JID was migrated from a phone number to a
+                // LID is keyed by the LID, so presence published under the PN
+                // alias would never reach it — and published under a key
+                // nobody could confirm it reaches a different chat instead.
+                let Some(jid) = names.chat_key(&client, &update.from).await else {
+                    warn!(
+                        "dropping presence for {}: the PN/LID pair behind it could not be read",
+                        update.from.observe()
+                    );
+                    return;
+                };
+                let _ = ui_tx.send(UiEvent::PresenceUpdated { jid, availability });
+            }
+            // Something happened *to* the group. Only the changes a member
+            // would notice become a row; the rest is bookkeeping, and a line
+            // for each would bury the conversation.
+            Event::GroupUpdate(update) => {
+                if let Some(mut event) = velo_core::GroupMembership::from_update(update) {
+                    // Identified notices come from the committed store, including
+                    // their first live projection. Anonymous notices have no safe
+                    // deduplication key and remain transient.
+                    if update.notification_id.as_deref().is_none_or(str::is_empty) {
+                        if let Some(store) = names.chat_store() {
+                            membership::resolve(&client, &names, store, &mut event).await;
+                        }
+                        let _ = ui_tx.send(UiEvent::SystemNotice {
+                            chat_jid: update.group_jid.to_string(),
+                            notice_id: format!(
+                                "group-anonymous-{}-{}",
+                                update.timestamp.timestamp_millis(),
+                                update.action_index
+                            ),
+                            at: update.timestamp,
+                            notice: SystemNotice::GroupMembership(Box::new(event)),
+                        });
+                    }
+                    return;
+                }
+                // A notice is a sentence about people who also have bubbles
+                // and a typing line on the same screen. Naming them from the
+                // stanza alone gave one person two names on one conversation:
+                // the push name here, the address-book name everywhere else.
+                let mut named = crate::group_notice::ResolvedNames::new();
+                if let Some(mut actor) = velo_core::NoticeParticipant::actor_of(update) {
+                    if let Some(store) = names.chat_store() {
+                        membership::resolve_person(
+                            &client,
+                            &names,
+                            store,
+                            &mut actor,
+                            &history::own_jids(&client),
+                        )
+                        .await;
+                    }
+                    let label = if actor.is_self {
+                        "You".to_owned()
+                    } else {
+                        actor.label()
+                    };
+                    named.insert(actor.jid.clone(), label);
+                }
+                let mentioned = update
+                    .participant
+                    .iter()
+                    .cloned()
+                    .chain(
+                        crate::group_notice::participants_of(&update.action)
+                            .iter()
+                            .map(|participant| participant.jid.clone()),
+                    )
+                    .collect::<Vec<_>>();
+                for jid in mentioned {
+                    let key = jid.to_string();
+                    if named.contains_key(&key) {
+                        continue;
+                    }
+                    // Resolved, or the same last resort every other surface
+                    // falls back to: a notice naming somebody by the digits of
+                    // a LID reads as a phone number that is not one.
+                    if let Some(name) = names.known(&client, &jid, None).await {
+                        named.insert(key, name);
+                    }
+                }
+                let actor = crate::group_notice::actor_name(
+                    update.participant.as_ref(),
+                    update.participant_username.as_deref(),
+                    &named,
+                );
+                if let Some(text) = crate::group_notice::describe(
+                    &update.action,
+                    actor.as_deref(),
+                    update.participant.as_ref(),
+                    &named,
+                ) {
+                    let _ = ui_tx.send(UiEvent::SystemNotice {
+                        chat_jid: update.group_jid.to_string(),
+                        // The stanza id plus the index within it: one
+                        // notification can carry several actions, and a
+                        // redelivery must not stack a second copy of any.
+                        notice_id: format!(
+                            "group-{}-{}",
+                            update
+                                .notification_id
+                                .clone()
+                                .unwrap_or_else(|| update.timestamp.timestamp_millis().to_string()),
+                            update.action_index
+                        ),
+                        at: update.timestamp,
+                        notice: SystemNotice::GroupChanged(text),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(test)]
+    async fn handle_inbound_message(
+        msg: &wa::Message,
+        info: &whatsapp_rust::wacore::types::message::MessageInfo,
+        client: &Arc<Client>,
+        ui_tx: &UiEventSender,
+        names: &NameBook,
+        eager: bool,
+    ) {
+        Self::handle_inbound_message_with_read(msg, info, client, ui_tx, names, eager, None).await;
+    }
+
+    /// One decrypted inbound message -> UiEvent (reaction or chat message).
+    async fn handle_inbound_message_with_read(
+        msg: &wa::Message,
+        info: &whatsapp_rust::wacore::types::message::MessageInfo,
+        client: &Arc<Client>,
+        ui_tx: &UiEventSender,
+        names: &NameBook,
+        eager: bool,
+        cached_read: Option<Option<bool>>,
+    ) {
+        // Use the shared store normalization for both ordinary envelopes and
+        // the nested wrappers it peels, so live and hydrated paths agree.
+        let base_msg = velo_chat_store::normalized_message(msg);
+
+        // Check if this is a reaction message
+        if let Some(reaction) = base_msg.reaction_message.as_option() {
+            if let Some(key) = reaction.key.as_option()
+                && let Some(target_id) = &key.id
+            {
+                let emoji = reaction.text.clone().unwrap_or_default();
+                debug!(
+                    "Reaction '{}' from {} on message {}",
+                    emoji,
+                    info.source.sender.observe(),
+                    target_id
+                );
+
+                // Use remote_jid from key if available, otherwise use chat
+                // from info. A `remote_jid` that will not even parse names no
+                // chat, so the envelope's own does.
+                let chat = key
+                    .remote_jid
+                    .as_deref()
+                    .and_then(|jid| jid.parse::<Jid>().ok())
+                    .unwrap_or_else(|| info.source.chat.clone());
+
+                // A reaction hangs off a row somebody already has, so it is
+                // dropped rather than guessed at, like the receipt above.
+                let Some(chat_jid) = names.chat_key(client, &chat).await else {
+                    warn!(
+                        "dropping reaction on {} in {}: the PN/LID pair behind it could not be read",
+                        target_id,
+                        chat.observe()
+                    );
+                    return;
+                };
+
+                // One person, one reaction. `ChatMessage::add_reaction` keys
+                // by this string and enforces one per sender — and a removal
+                // is an *empty* reaction matched the same way — so a react
+                // under the phone number and its replacement or removal under
+                // the LID were two different people: the first emoji stayed up
+                // and the second was counted beside it.
+                let reactor = names.identity(client, &info.source.sender).await;
+
+                let _ = ui_tx.send(UiEvent::ReactionReceived {
+                    chat_jid,
+                    message_id: target_id.clone(),
+                    sender: reactor.canonical_jid.clone(),
+                    emoji,
+                });
+            }
+            return;
+        }
+
+        // Revokes/edits and other protocol stubs carry no displayable body;
+        // the chat store materializes them durably (a reload shows the right
+        // state), so don't fabricate a "[Media]" bubble under their own id.
+        if base_msg.protocol_message.is_set() {
+            return;
+        }
+
+        // The same question the store asks, so a live conversation and a
+        // reloaded one agree. A poll update, an encrypted reaction or comment,
+        // a pin or a keep-in-chat carries nothing to draw: published live it
+        // is a `[Media]` bubble with an unread badge, and the store writes no
+        // row for it, so it vanishes at the next hydration having already
+        // raised a count nothing sent a receipt for.
+        if velo_chat_store::is_control_only(msg) || base_msg.message_history_notice.is_set() {
+            return;
+        }
+
+        // Try to extract media content
+        let media_result = media::media_now(base_msg, client, eager).await;
+
+        // A poll draws its question, not its absence of a body: creations
+        // carry neither text nor media, so without this a live poll is a
+        // `[Media]` bubble until the next reload rehydrates it from the
+        // store. Same extraction the stored path uses, so the two agree.
+        let poll = poll_of(base_msg);
+        let mut business = velo_chat_store::business_content(base_msg);
+
+        // Extract text content
+        let content = business
+            .as_ref()
+            .map(|b| b.body.clone())
+            .or_else(|| velo_chat_store::sticker_pack_text(base_msg))
+            .or_else(|| base_msg.text_content().map(str::to_owned))
+            .or_else(|| base_msg.get_caption().map(|s| s.to_string()))
+            .or_else(|| velo_chat_store::shared_contacts_text(base_msg))
+            .or_else(|| poll.as_ref().map(|poll| poll.question.clone()))
+            .unwrap_or_else(|| live_content_fallback(base_msg, media_result.is_some()));
+
+        // A mention arrives as `@` plus the user part — the digits of a LID
+        // where the peer is LID-addressed — and a phone draws the contact's
+        // name there. Rewritten here, so the live bubble, the chat preview
+        // and the reloaded bubble agree rather than each deciding alone. The
+        // caption goes through the same pairs: the list preview reads it
+        // rather than the body. The sender's own push name goes along for
+        // their self-mention: the bubble label below already uses it, and
+        // without it an unknown sender reads named over their bubble and
+        // raw inside their `@`.
+        let mention_names = crate::mentions::resolve_for(
+            client,
+            names,
+            Some(base_msg),
+            Some((&info.source.sender, info.push_name.as_str())),
+        )
+        .await;
+        let content = crate::mentions::apply_to(&mention_names, content);
+        if let Some(business) = business.as_mut() {
+            crate::mentions::apply_business_to(&mention_names, business, &content);
+        }
+        let media_result = media_result.map(|mut media| {
+            if let Some(caption) = media.caption.take() {
+                media.caption = Some(crate::mentions::apply_to(&mention_names, caption));
+            }
+            media
+        });
+
+        let mut chat_message = ChatMessage {
+            id: info.id.to_string(),
+            sender: info.source.sender.to_string(),
+            sender_name: None, // Will be set in handle_message_received for groups
+            content,
+            is_text: velo_chat_store::message_kind(base_msg) == "text",
+            timestamp: info.timestamp,
+            is_from_me: info.source.is_from_me,
+            is_read: false,
+            media: None,
+            reactions: std::collections::HashMap::new(),
+            // Our own message echoed back has by definition reached the
+            // server; someone else's carries no send state of ours.
+            status: if info.source.is_from_me {
+                MessageStatus::Sent
+            } else {
+                MessageStatus::default()
+            },
+            quoted: quoted_from(base_msg),
+            revoked: false,
+            edited: false,
+            system: None,
+            poll,
+            business,
+        };
+
+        if let Some(media) = media_result {
+            chat_message.media = Some(media);
+        }
+
+        // The quote bar draws the nested original verbatim, mentions and all:
+        // its own mention list gets the same rewrite the body just got, or
+        // the reply arrives naming contacts while its quote still dials them.
+        let quoted_names = crate::mentions::resolve_quoted_for(client, names, base_msg).await;
+        if !quoted_names.is_empty()
+            && let Some(quoted) = chat_message.quoted.as_mut()
+        {
+            quoted.preview =
+                crate::mentions::apply_to(&quoted_names, std::mem::take(&mut quoted.preview));
+        }
+
+        Self::hydrate_quoted_authors(client, names, std::slice::from_mut(&mut chat_message)).await;
+
+        // Keyed by the LID where the pair is known, so the same user doesn't
+        // appear as two chats when messages come from PN vs LID. Unlike the
+        // annotations above, this bubble is the only place its content will
+        // ever appear: an unreadable mapping falls back to the address the
+        // message arrived under — which is the chat it would have been filed
+        // in before any of this existed — rather than dropping it.
+        let chat_jid = match names.chat_key(client, &info.source.chat).await {
+            Some(key) => key,
+            None => {
+                warn!(
+                    "filing a message in {} by the address it arrived under: the PN/LID pair behind it could not be read",
+                    info.source.chat.observe()
+                );
+                info.source.chat.to_non_ad_string()
+            }
+        };
+
+        // One person, one row in the status feed. The broadcast is grouped by
+        // sender, and the same contact reaches it under a phone number on
+        // some updates and their LID on others — which splits their ring,
+        // their unseen count and their playback run in two until a reload.
+        // Hydration canonicalizes these (`hydrate_sender_names`); the live
+        // path shipped whatever the envelope said, so the split came back
+        // with every update that arrived under the other alias.
+        if info.source.chat.is_status_broadcast() {
+            chat_message.sender = names
+                .identity(client, &info.source.sender)
+                .await
+                .canonical_jid
+                .clone();
+        }
+
+        // The push name is what the sender calls themselves; the address
+        // book is what this account's owner calls them, and that is the one
+        // the phone shows. Resolving here rather than shipping the raw push
+        // name is what stops one person appearing as two — the reloaded
+        // bubble under the name you saved, the live one under theirs.
+        let sender_name = if info.source.is_from_me {
+            None
+        } else {
+            names
+                .known(
+                    client,
+                    &info.source.sender,
+                    Some(info.push_name.as_str()).filter(|name| !name.is_empty()),
+                )
+                .await
+        };
+
+        // The inbound durability hook commits a live batch before this event
+        // is dispatched, so the store is the authority even for its *first*
+        // message. GUI hydration is paged and can lag this event (or omit an
+        // archived chat entirely); its in-memory Chat cannot decide mute or
+        // archive policy. Offline drains are history, not new attention.
+        // Explicit mentions only affect the title. Muted conversations never
+        // alert, including when a message mentions this account.
+        let mentions_me = info.source.chat.is_group()
+            && !info.source.is_from_me
+            && crate::mentions::mentions_own_account(Some(msg), &history::own_jids(client));
+        let (
+            mut notification_allowed,
+            mut notification_title,
+            mut notification_archived,
+            chat_name,
+            mut chat_muted_until_ms,
+        ) = if let Some(store) = names.chat_store() {
+            match store.notification_metadata(&info.source.chat).await {
+                Ok(Some(metadata)) => {
+                    // The wire flag is the notification invariant, not a
+                    // copy of the chat policy: self echoes are displayed
+                    // as outgoing bubbles and must never ask a front end
+                    // to alert, even when their chat is otherwise eligible.
+                    // Offline drains are not new attention, but they still
+                    // need the durable archive bit: an archived chat is
+                    // absent from the active page, so a front end receiving
+                    // its message before hydration must not recreate it in
+                    // the inbox.
+                    let allowed = eager
+                        && allows_desktop_notification(
+                            info.source.is_from_me,
+                            metadata.muted,
+                            metadata.archived,
+                            mentions_me,
+                        );
+                    let identity = names.identity(client, &info.source.chat).await;
+                    let (resolved_name, priority) = names
+                        .resolve(
+                            store,
+                            &info.source.chat,
+                            metadata.name.as_deref(),
+                            &identity,
+                        )
+                        .await;
+                    let chat_name = (priority > 0).then_some(resolved_name.clone());
+                    let title = if allowed {
+                        if mentions_me {
+                            let group = if priority > 0 {
+                                resolved_name.as_str()
+                            } else {
+                                "group"
+                            };
+                            Some(format!("Mentioned in {group}"))
+                        } else {
+                            (priority > 0).then_some(resolved_name)
+                        }
+                    } else {
+                        None
+                    };
+                    (
+                        allowed,
+                        title,
+                        Some(metadata.archived),
+                        chat_name,
+                        metadata.muted_until_ms,
+                    )
+                }
+                Ok(None) => (false, None, None, None, None),
+                Err(error) => {
+                    warn!("could not read chat notification policy: {error}");
+                    (false, None, None, None, None)
+                }
+            }
+        } else {
+            (false, None, None, None, None)
+        };
+
+        // Delivery ACKs describe transport, not whether this user read the
+        // message on another device. A live replay may already be covered by
+        // a durable self-read verdict even though it is not an offline batch.
+        // Resolve this after all notification/name I/O, immediately before
+        // publication. Offline drains reuse their per-chat batch snapshot.
+        let already_read = if info.source.is_from_me {
+            None
+        } else if let Some(read) = cached_read {
+            read
+        } else {
+            if let Some(store) = names.chat_store() {
+                match store
+                    .message_is_read(&info.source.chat, &info.id, info.timestamp)
+                    .await
+                {
+                    Ok(read) => Some(read),
+                    Err(error) => {
+                        warn!("could not read message attention state: {error}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        chat_message.is_read = already_read == Some(true);
+
+        // Name/identity lookups above may await network I/O. A linked-device
+        // mute committed while those ran must win before we publish attention.
+        if let Some(store) = names.chat_store() {
+            match store.notification_metadata(&info.source.chat).await {
+                Ok(Some(metadata)) => {
+                    notification_archived = Some(metadata.archived);
+                    chat_muted_until_ms = metadata.muted_until_ms;
+                    notification_allowed = eager
+                        && allows_desktop_notification(
+                            info.source.is_from_me,
+                            metadata.muted,
+                            metadata.archived,
+                            mentions_me,
+                        );
+                    notification_title = if notification_allowed {
+                        if mentions_me {
+                            Some(format!(
+                                "Mentioned in {}",
+                                chat_name.as_deref().unwrap_or("group")
+                            ))
+                        } else {
+                            chat_name.clone()
+                        }
+                    } else {
+                        None
+                    };
+                }
+                Ok(None) | Err(_) => {
+                    notification_allowed = false;
+                    notification_title = None;
+                }
+            }
+        }
+        let notification_allowed = notification_allowed && already_read == Some(false);
+
+        let _ = ui_tx.send(UiEvent::MessageReceived {
+            chat_jid,
+            message: Box::new(chat_message),
+            sender_name,
+            chat_name,
+            notification_allowed,
+            notification_title,
+            notification_archived,
+            chat_muted_until_ms,
+        });
+    }
+
+    /// Send a text message to a chat.
+    ///
+    /// The returned handle completes when the send has run to its conclusion,
+    /// successful or not. A caller that only fires and forgets can drop it;
+    /// one that has to bound how much work it has outstanding (the daemon,
+    /// driven by a program rather than by a person clicking) needs to know
+    /// when the work it asked for is over.
+    pub fn send_message(
+        &self,
+        jid_str: &str,
+        content: &str,
+        local_id: String,
+        quoted: Option<velo_core::QuotedMessage>,
+    ) -> Task<()> {
+        let session = self.session.clone();
+        let ui_sender = self.ui_sender.clone();
+        let jid_str = jid_str.to_string();
+        let content = content.to_string();
+
+        self.exec.spawn(async move {
+            let jid: Jid = match jid_str.parse() {
+                Ok(j) => j,
+                Err(e) => {
+                    error!("Invalid JID {}: {}", observe_str(&jid_str), e);
+                    // The optimistic bubble still carries its local id;
+                    // without this it would sit unsent with no indicator.
+                    notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string());
+                    return;
+                }
+            };
+
+            // Clone the `Arc` and release the mutex: a slow network call
+            // here must not queue every other client action behind it. What
+            // is cloned is the whole session, so the client that sends and
+            // the store that records the send are the same session's.
+            let live = session.lock().await.clone();
+            if let Some(live) = live {
+                let client = &live.client;
+                // A reply is the same send with a quote attached, which the
+                // wire carries as an extended text message: a bare
+                // `conversation` has nowhere to put the context.
+                let message = match &quoted {
+                    Some(quoted) => {
+                        let mut constructed: wa::Message = Default::default();
+                        constructed.extended_text_message =
+                            whatsapp_rust::buffa::MessageField::some({
+                                let mut constructed: wa::message::ExtendedTextMessage =
+                                    Default::default();
+                                constructed.text = Some(content.clone());
+                                constructed.context_info =
+                                    whatsapp_rust::buffa::MessageField::some(quote_context(quoted));
+                                constructed
+                            });
+                        constructed
+                    }
+                    None => {
+                        let mut constructed: wa::Message = Default::default();
+                        constructed.conversation = Some(content.clone());
+                        constructed
+                    }
+                };
+
+                // Record BEFORE sending: the server ack event fires during
+                // send_message, so a row recorded after it would stay
+                // Pending forever (the ack precedes it in writer order).
+                let msg_id = client.generate_message_id();
+                // Receipts/reactions arrive keyed by this id; rename the
+                // optimistic bubble before they can race it.
+                notify_message_id(&ui_sender, &jid_str, local_id, msg_id.as_str());
+                if let Err(error) = record_outgoing(
+                    &live.chat_store,
+                    &jid,
+                    msg_id.as_str(),
+                    &message,
+                    &live.resolve_chat_names,
+                ) {
+                    notify_send_failed(&ui_sender, &jid_str, msg_id.as_str(), error);
+                    return;
+                }
+                let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
+                match client
+                    .send(whatsapp_rust::SendRequest::new(&jid, message).with_options(options))
+                    .await
+                {
+                    Ok(result) => {
+                        info!("Message sent successfully: {}", result.message_id);
+                    }
+                    Err(e) => {
+                        error!("Failed to send message {}: {}", msg_id, e);
+                        mark_send_failed(&live.chat_store, &jid, msg_id.as_str());
+                        notify_send_failed(&ui_sender, &jid_str, msg_id.as_str(), e.to_string());
+                    }
+                }
+            } else {
+                error!("Client not available for sending message");
+                // The bubble still carries its local id (no rename ran)
+                notify_send_failed(
+                    &ui_sender,
+                    &jid_str,
+                    &local_id,
+                    "client not available".to_string(),
+                );
+            }
+        })
+    }
+
+    /// Download media using DownloadableMedia info
+    /// Returns a oneshot receiver that will contain the result
+    pub fn download_downloadable_media(
+        &self,
+        downloadable: DownloadableMedia,
+    ) -> tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let session = self.session.clone();
+
+        self.exec.spawn(async move {
+            // Clone the `Arc` and release the mutex: a slow network call
+            // here must not queue every other client action behind it. What
+            // is cloned is the whole session, so the client that sends and
+            // the store that records the send are the same session's.
+            let live = session.lock().await.clone();
+            if let Some(live) = live {
+                let client = &live.client;
+                info!(
+                    "Downloading media: {} bytes expected",
+                    downloadable.file_length
+                );
+                match client
+                    .download(
+                        &downloadable,
+                        if downloadable.is_channel_preview_candidate() {
+                            crate::net::channel_image_limits(if downloadable.is_thumbnail {
+                                DownloadableMedia::CHANNEL_THUMBNAIL_BYTES
+                            } else {
+                                DownloadableMedia::CHANNEL_PREVIEW_BYTES
+                            })
+                        } else {
+                            whatsapp_rust::download::DownloadLimits::default()
+                        },
+                    )
+                    .await
+                {
+                    Ok(data) => {
+                        info!("Media downloaded successfully: {} bytes", data.len());
+                        let _ = tx.send(Ok(data));
+                    }
+                    Err(e) => {
+                        error!("Failed to download media: {}", e);
+                        let _ = tx.send(Err(e.to_string()));
+                    }
+                }
+            } else {
+                let _ = tx.send(Err("Client not available".to_string()));
+            }
+        });
+
+        rx
+    }
+
+    /// Send a PTT audio message to a chat
+    /// Returns a handle that completes when the send has run its course; see
+    /// [`WhatsAppClient::send_message`] for why.
+    pub fn send_audio_message(
+        &self,
+        jid_str: &str,
+        audio_data: Vec<u8>,
+        duration_secs: u32,
+        waveform: Vec<u8>,
+        local_id: String,
+        quoted: Option<velo_core::QuotedMessage>,
+    ) -> Task<()> {
+        let session = self.session.clone();
+        let ui_sender = self.ui_sender.clone();
+        let jid_str = jid_str.to_string();
+
+        self.exec.spawn(async move {
+            let jid: Jid = match jid_str.parse() {
+                Ok(j) => j,
+                Err(e) => {
+                    error!("Invalid JID {}: {}", observe_str(&jid_str), e);
+                    // The optimistic bubble still carries its local id;
+                    // without this it would sit unsent with no indicator.
+                    notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string());
+                    return;
+                }
+            };
+
+            // Clone the `Arc` and release the mutex: a slow network call
+            // here must not queue every other client action behind it. What
+            // is cloned is the whole session, so the client that sends and
+            // the store that records the send are the same session's.
+            let live = session.lock().await.clone();
+            if let Some(live) = live {
+                let client = &live.client;
+                let upload_result = match client
+                    .upload(audio_data, DownloadMediaType::Audio, Default::default())
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        error!("Failed to upload audio: {}", e);
+                        // Bubble still carries the local id at this point.
+                        notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string());
+                        return;
+                    }
+                };
+
+                info!("Audio uploaded successfully");
+
+                let audio_message = {
+                    let mut constructed: wa::message::AudioMessage = Default::default();
+                    constructed.url = Some(upload_result.url);
+                    constructed.direct_path = Some(upload_result.direct_path);
+                    constructed.media_key = Some(upload_result.media_key.to_vec());
+                    constructed.file_sha256 = Some(upload_result.file_sha256.to_vec());
+                    constructed.file_enc_sha256 = Some(upload_result.file_enc_sha256.to_vec());
+                    constructed.file_length = Some(upload_result.file_length);
+                    constructed.mimetype = Some("audio/ogg; codecs=opus".to_string());
+                    constructed.seconds = Some(duration_secs);
+                    // This marks it as a voice message
+                    constructed.ptt = Some(true);
+                    constructed.waveform = Some(waveform);
+                    constructed
+                };
+
+                // Quoted the same way the text path does it, because a voice
+                // note answering a message is a reply — the recipient should
+                // see the quote bar over it, not a bare note.
+                let message = match &quoted {
+                    Some(quoted) => {
+                        let mut constructed: wa::Message = Default::default();
+                        constructed.audio_message = whatsapp_rust::buffa::MessageField::some({
+                            let mut constructed: wa::message::AudioMessage = audio_message;
+                            constructed.context_info =
+                                whatsapp_rust::buffa::MessageField::some(quote_context(quoted));
+                            constructed
+                        });
+                        constructed
+                    }
+                    None => {
+                        let mut constructed: wa::Message = Default::default();
+                        constructed.audio_message =
+                            whatsapp_rust::buffa::MessageField::some(audio_message);
+                        constructed
+                    }
+                };
+
+                // Same ordering as the text path: record before sending so
+                // the ack can't precede the row in the writer queue.
+                let msg_id = client.generate_message_id();
+                notify_message_id(&ui_sender, &jid_str, local_id, msg_id.as_str());
+                if let Err(error) = record_outgoing(
+                    &live.chat_store,
+                    &jid,
+                    msg_id.as_str(),
+                    &message,
+                    &live.resolve_chat_names,
+                ) {
+                    notify_send_failed(&ui_sender, &jid_str, msg_id.as_str(), error);
+                    return;
+                }
+                let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
+                match client
+                    .send(whatsapp_rust::SendRequest::new(&jid, message).with_options(options))
+                    .await
+                {
+                    Ok(result) => {
+                        info!("Audio message sent successfully: {}", result.message_id);
+                    }
+                    Err(e) => {
+                        error!("Failed to send audio message {}: {}", msg_id, e);
+                        mark_send_failed(&live.chat_store, &jid, msg_id.as_str());
+                        notify_send_failed(&ui_sender, &jid_str, msg_id.as_str(), e.to_string());
+                    }
+                }
+            } else {
+                error!("Client not available for sending audio message");
+                // The bubble still carries its local id (no rename ran)
+                notify_send_failed(
+                    &ui_sender,
+                    &jid_str,
+                    &local_id,
+                    "client not available".to_string(),
+                );
+            }
+        })
+    }
+
+    /// Send a file somebody picked: a photo, a video, a document.
+    ///
+    /// The same three acts as [`Self::send_audio_message`] — upload, record,
+    /// send — and one more before them: a picked file is only bytes and a
+    /// name, so what the recipient needs in order to *draw* it before
+    /// downloading anything is worked out here. See [`outgoing`].
+    ///
+    /// Returns a handle the way every other send does, so a queue in front of
+    /// it stays a queue — and what the handle covers is the *ordering*, not
+    /// the work: the shaping goes to [`crate::exec::unblock`] because it is a
+    /// decode, and the upload is I/O. Neither runs on this task, and both are
+    /// awaited by it.
+    pub fn send_media_message(
+        &self,
+        jid_str: &str,
+        file: OutgoingFile,
+        local_id: String,
+        quoted: Option<velo_core::QuotedMessage>,
+    ) -> Task<()> {
+        let session = self.session.clone();
+        let ui_sender = self.ui_sender.clone();
+        let jid_str = jid_str.to_string();
+
+        self.exec.spawn(async move {
+            let jid: Jid = match jid_str.parse() {
+                Ok(jid) => jid,
+                Err(e) => {
+                    error!("Invalid JID {}: {}", observe_str(&jid_str), e);
+                    // The optimistic bubble still carries its local id;
+                    // without this it would sit unsent with no indicator.
+                    notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string());
+                    return;
+                }
+            };
+
+            // Clone the `Arc` and release the mutex: a slow network call
+            // here must not queue every other client action behind it.
+            let live = session.lock().await.clone();
+            let Some(live) = live else {
+                error!("No session available for sending media");
+                // The bubble still carries its local id (no rename ran).
+                notify_send_failed(
+                    &ui_sender,
+                    &jid_str,
+                    &local_id,
+                    "client not available".to_string(),
+                );
+                return;
+            };
+
+            // Before the upload, not after it: a picture that cannot be
+            // decoded is still sent, and one that can costs a decode either
+            // way — paying it first means a failed upload has not also been
+            // paid for.
+            //
+            // And off this thread. Shaping a picture is a decode and a
+            // scale-down of up to fifty megapixels, which is CPU-bound work
+            // measured in hundreds of millions of operations: run inline it
+            // holds a runtime worker — and in a page, the only thread there
+            // is — while every other connection and send waits. `unblock` is
+            // the seam that answers for both, a pool on the desktop and a
+            // call in a page, which is the honest answer where there is
+            // nowhere to hand work to.
+            //
+            // The file goes in and comes back out for two reasons: the
+            // shaping only borrows it, so moving it is free where cloning the
+            // bytes to look at them is not — and it may not be the same file
+            // coming back, because a picture in a format the recipient will
+            // not draw is re-encoded there.
+            let (shape, mut file) =
+                match crate::exec::unblock(move || outgoing::prepare_for_send(file)).await {
+                    Ok(Ok(prepared)) => prepared,
+                    Ok(Err(reason)) => {
+                        warn!("that file could not be prepared: {reason}");
+                        notify_send_failed(&ui_sender, &jid_str, &local_id, reason);
+                        return;
+                    }
+                    Err(e) => {
+                        // The executor is going away, which is the session
+                        // shutting down. Reported rather than dropped: the bubble
+                        // is drawn and only an answer resolves it.
+                        error!("that file could not be prepared: {e}");
+                        notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string());
+                        return;
+                    }
+                };
+
+            // Moved out rather than cloned: the upload takes the bytes and
+            // everything after it wants only what the file *is*. A copy here
+            // would be a second whole file in the process holding the account,
+            // which in a page is a linear memory with a ceiling.
+            let data = std::mem::take(&mut file.data);
+            let client = &live.client;
+            let (media_type, options) = file.upload_options();
+            let uploaded = match client.upload(data, media_type, options).await {
+                Ok(response) => outgoing::Uploaded::from(response),
+                Err(e) => {
+                    error!("Failed to upload {}: {}", file.mime_type, e);
+                    notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string());
+                    return;
+                }
+            };
+            info!(
+                "{} uploaded successfully ({} bytes)",
+                file.mime_type, uploaded.file_length
+            );
+
+            let message = outgoing::message(&file, shape, uploaded, quoted.as_ref());
+
+            // Same ordering as the text path: record before sending so
+            // the ack can't precede the row in the writer queue.
+            let msg_id = client.generate_message_id();
+            notify_message_id(&ui_sender, &jid_str, local_id, msg_id.as_str());
+            if let Err(error) = record_outgoing(
+                &live.chat_store,
+                &jid,
+                msg_id.as_str(),
+                &message,
+                &live.resolve_chat_names,
+            ) {
+                notify_send_failed(&ui_sender, &jid_str, msg_id.as_str(), error);
+                return;
+            }
+            let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
+            match client
+                .send(whatsapp_rust::SendRequest::new(&jid, message).with_options(options))
+                .await
+            {
+                Ok(result) => {
+                    info!("Media message sent successfully: {}", result.message_id);
+                }
+                Err(e) => {
+                    error!("Failed to send media message {}: {}", msg_id, e);
+                    mark_send_failed(&live.chat_store, &jid, msg_id.as_str());
+                    notify_send_failed(&ui_sender, &jid_str, msg_id.as_str(), e.to_string());
+                }
+            }
+        })
+    }
+
+    /// Send "composing" chat state (typing indicator)
+    pub fn send_composing(&self, jid_str: &str) {
+        let session = self.session.clone();
+        let jid_str = jid_str.to_string();
+
+        self.exec.spawn(async move {
+            let jid: Jid = match jid_str.parse() {
+                Ok(j) => j,
+                Err(e) => {
+                    error!("Invalid JID {}: {}", observe_str(&jid_str), e);
+                    return;
+                }
+            };
+
+            let client = session
+                .lock()
+                .await
+                .as_ref()
+                .map(|live| live.client.clone());
+            if let Some(client) = client
+                && let Err(e) = client.chatstate().send_composing(&jid).await
+            {
+                warn!("Failed to send composing state: {}", e);
+            }
+        });
+    }
+
+    /// Send "paused" chat state (stopped typing)
+    pub fn send_paused(&self, jid_str: &str) {
+        let session = self.session.clone();
+        let jid_str = jid_str.to_string();
+
+        self.exec.spawn(async move {
+            let jid: Jid = match jid_str.parse() {
+                Ok(j) => j,
+                Err(e) => {
+                    error!("Invalid JID {}: {}", observe_str(&jid_str), e);
+                    return;
+                }
+            };
+
+            let client = session
+                .lock()
+                .await
+                .as_ref()
+                .map(|live| live.client.clone());
+            if let Some(client) = client
+                && let Err(e) = client.chatstate().send_paused(&jid).await
+            {
+                warn!("Failed to send paused state: {}", e);
+            }
+        });
+    }
+
+    /// Send read receipts to mark messages as read
+    ///
+    /// # Arguments
+    /// * `chat_jid_str` - The JID of the chat (e.g., "123456@s.whatsapp.net")
+    /// * `messages` - List of (message_id, sender_jid_string) tuples
+    ///
+    /// Returns a handle that completes when the receipts have gone out; see
+    /// [`WhatsAppClient::send_message`] for why.
+    pub fn send_read_receipts(
+        &self,
+        chat_jid_str: &str,
+        messages: Vec<(String, String)>,
+    ) -> Task<()> {
+        let session = self.session.clone();
+        let chat_jid_str = chat_jid_str.to_string();
+
+        self.exec.spawn(async move {
+            // Inside the task, not before it: the caller gets a handle it can
+            // await either way, rather than having to special-case nothing to
+            // do.
+            if messages.is_empty() {
+                return;
+            }
+
+            let chat_jid: Jid = match chat_jid_str.parse() {
+                Ok(j) => j,
+                Err(e) => {
+                    error!("Invalid chat JID {}: {}", observe_str(&chat_jid_str), e);
+                    return;
+                }
+            };
+
+            let parsed_messages: Vec<(String, Jid)> = messages
+                .into_iter()
+                .filter_map(|(msg_id, sender_str)| {
+                    sender_str
+                        .parse::<Jid>()
+                        .inspect_err(|e| {
+                            warn!("Invalid sender JID {}: {}", observe_str(&sender_str), e)
+                        })
+                        .ok()
+                        .map(|jid| (msg_id, jid))
+                })
+                .collect();
+
+            if parsed_messages.is_empty() {
+                return;
+            }
+
+            // Only group/broadcast receipts carry a participant (matches
+            // whatsmeow/WA Web); a plain DM receipt must not.
+            let needs_participant = participant_keyed_chat(&chat_jid);
+
+            // Clone the `Arc` and release the mutex: a slow network call
+            // here must not queue every other client action behind it. What
+            // is cloned is the whole session, so the client that sends and
+            // the store that records the send are the same session's.
+            let live = session.lock().await.clone();
+            if let Some(live) = live {
+                let client = &live.client;
+                let mut by_sender: HashMap<Jid, Vec<String>> = HashMap::new();
+                for (msg_id, sender) in parsed_messages {
+                    by_sender.entry(sender).or_default().push(msg_id);
+                }
+                for (sender, msg_ids) in by_sender {
+                    let id_refs: Vec<&str> = msg_ids.iter().map(String::as_str).collect();
+                    if let Err(e) = client
+                        .mark_as_read(&chat_jid, needs_participant.then_some(&sender), &id_refs)
+                        .await
+                    {
+                        warn!("Failed to mark messages as read: {}", e);
+                    }
+                }
+            } else {
+                error!("Client not available for sending read receipts");
+            }
+        })
+    }
+
+    /// Ask for a full history reload.
+    ///
+    /// For a front end that has just attached: nothing in the store has
+    /// changed, so the invalidation stream has nothing to say, and without
+    /// this the new arrival would sit empty until the next message arrived.
+    pub fn reload_history(&self) {
+        self.reload.notify_one();
+    }
+
+    /// A handle for recording avatar descriptors from outside the session.
+    ///
+    /// The daemon fetches the bytes; the session owns the store. This is the
+    /// handle that lets the first tell the second, which is what keeps the
+    /// descriptor write behind the byte write.
+    pub fn avatar_recorder(&self) -> AvatarRecorder {
+        AvatarRecorder {
+            session: self.session.clone(),
+            resolve_avatars: self.resolve_avatars.clone(),
+        }
+    }
+
+    /// Drop every resolved picture and ask for a fresh pass.
+    ///
+    /// For a cleared media cache: the metadata may not have moved, but the
+    /// bytes it named are gone, so a cache key has to be rediscovered rather
+    /// than trusted.
+    pub fn reset_avatar_cache(&self) {
+        self.resolve_avatars.reset();
+    }
+
+    /// Ensure profile pictures for avatar demands.
+    pub fn ensure_avatars(&self, items: Vec<velo_core::AvatarDemand>) {
+        self.resolve_avatars.ensure(items);
+    }
+
+    /// Ask the avatar resolver about these chats specifically.
+    ///
+    /// The resolver deduplicates, so a chat it has already resolved costs nothing.
+    pub fn request_avatar_resolve_for(&self, jids: impl IntoIterator<Item = String>) {
+        self.resolve_avatars.request_named(jids);
+    }
+
+    /// Remember that these status updates have been watched.
+    ///
+    /// Local, and deliberately so: WhatsApp's own answer is a status read
+    /// receipt, which is a privacy setting the library does not expose. What
+    /// this buys is the honest half — the ring stops claiming there is
+    /// something new here, and it stays stopped across a restart, which is
+    /// what a front end's own memory of it could not do.
+    ///
+    /// The broadcast's unread cursor is not that answer: it counts one chat
+    /// carrying everybody's updates, so clearing it would watch every
+    /// contact's run at once.
+    ///
+    /// Returns a handle that answers whether the row reached the store. The
+    /// caller waits for it: a view is the whole point of the request and
+    /// there is no retry — the window has already drawn the ring as watched —
+    /// so "accepted" has to mean "written", not "queued behind a teardown
+    /// that may cancel it".
+    ///
+    /// A row that moves invalidates its chat, so the reloader republishes the
+    /// broadcast and every attached front end learns about the view through
+    /// the history it already knows how to recover. Nothing has to be told
+    /// separately, and nothing is lost if a client is behind.
+    pub fn mark_status_watched(&self, message_ids: Vec<String>) -> Task<bool> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                warn!("no session yet; a watched status update was not recorded");
+                return false;
+            };
+            let store = &live.chat_store;
+            let Ok(broadcast) = velo_core::STATUS_BROADCAST_JID.parse::<Jid>() else {
+                warn!("the status broadcast address does not parse");
+                return false;
+            };
+            // Enqueued and then awaited: the write goes through the same
+            // ordered queue as the insert that created the row it targets,
+            // and `flush` is what turns "queued" into "committed", which is
+            // what the caller is waiting to hear.
+            let written = match store.mark_status_watched(&broadcast, message_ids) {
+                Ok(()) => store.flush().await,
+                Err(e) => Err(e),
+            };
+            match written {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!("failed to record watched status updates: {e}");
+                    false
+                }
+            }
+        })
+    }
+
+    /// Synchronize a bounded read action so newer messages remain unread.
+    ///
+    /// Returns a handle that completes when the action has run; see
+    /// [`WhatsAppClient::send_message`] for why.
+    pub fn mark_chat_read(
+        &self,
+        chat_jid_str: &str,
+        last_displayed: Option<ReadBoundary>,
+    ) -> Task<()> {
+        let session = self.session.clone();
+        let chat_jid_str = chat_jid_str.to_string();
+
+        self.exec.spawn(async move {
+            let chat_jid: Jid = match chat_jid_str.parse() {
+                Ok(j) => j,
+                Err(e) => {
+                    error!("Invalid chat JID {}: {}", observe_str(&chat_jid_str), e);
+                    return;
+                }
+            };
+            let Some(live) = session.lock().await.clone() else {
+                error!("No session available for marking chat read");
+                return;
+            };
+            let client = &live.client;
+            let range = last_displayed.map(|boundary| read_message_range(&chat_jid, boundary));
+            if let Err(e) = client
+                .chat_actions()
+                .mark_chat_as_read(&chat_jid, true, range)
+                .await
+            {
+                warn!("Failed to mark chat {} as read: {}", chat_jid.observe(), e);
+            }
+        })
+    }
+}
+
+/// Keep the notification bit's wire invariant in one place: outgoing echoes
+/// never alert, and a mute applies to mentions as well as ordinary messages.
+fn allows_desktop_notification(
+    is_from_me: bool,
+    muted: bool,
+    archived: bool,
+    mentions_me: bool,
+) -> bool {
+    !is_from_me && !muted && (!archived || mentions_me)
+}
+
+/// Tell the UI which real id a just-sent optimistic bubble got.
+fn notify_message_id(
+    ui_sender: &UiEventSender,
+    chat_jid: &str,
+    local_id: String,
+    message_id: &str,
+) {
+    let _ = ui_sender.send(UiEvent::MessageIdAssigned {
+        chat_jid: chat_jid.to_string(),
+        local_id,
+        message_id: message_id.to_string(),
+    });
+}
+
+/// Tell the UI a send failed so the bubble doesn't sit pending forever.
+///
+/// It reaches the front end whether or not a session is up: the bubble is
+/// already drawn, and a send refused before the client exists is precisely the
+/// one nothing else will ever fail.
+fn notify_send_failed(ui_sender: &UiEventSender, chat_jid: &str, message_id: &str, reason: String) {
+    let _ = ui_sender.send(UiEvent::SendFailed {
+        chat_jid: chat_jid.to_string(),
+        message_id: message_id.to_string(),
+        reason,
+    });
+}
+
+/// Admit the outgoing row before sending under the same id. Refusal must
+/// stop the send; admission preserves writer order but is not a commit barrier.
+fn record_outgoing(
+    store: &ChatStore,
+    jid: &Jid,
+    message_id: &str,
+    message: &wa::Message,
+    resolve_chat_names: &chat_names::ChatNameResolveSignal,
+) -> Result<(), String> {
+    store
+        .record_outgoing(
+            jid,
+            message_id,
+            message,
+            whatsapp_rust::wacore::time::now_utc(),
+        )
+        .map_err(|error| {
+            // ChatStoreError's outer Display only says "storage error". Preserve
+            // the admission reason so the caller can distinguish a full queue
+            // from a stopped writer.
+            let reason = match error {
+                velo_chat_store::ChatStoreError::Store(source) => source.to_string(),
+                error => error.to_string(),
+            };
+            format!("message was not sent: {reason}")
+        })?;
+    if jid.is_group() || jid.is_newsletter() {
+        // Outgoing traffic creates its row through the same writer as
+        // inbound traffic, but it does not produce an inbound Messages event
+        // on this device. Queue the sighting after the write so a newly
+        // created group/channel is resolved without waiting for a reconnect.
+        resolve_chat_names.request_named([jid.to_non_ad_string()]);
+    }
+    Ok(())
+}
+
+/// Best-effort failure mark on the durable row a client-side send error
+/// orphans at Pending (no server nack will come to fail it), so a restart
+/// hydrates the bubble with its failure indicator instead of grey ticks.
+fn mark_send_failed(store: &ChatStore, jid: &Jid, message_id: &str) {
+    if let Err(e) = store.mark_send_failed(jid, message_id) {
+        warn!("Failed to mark send {} as failed: {e}", message_id);
+    }
+}
+
+impl Drop for WhatsAppClient {
+    fn drop(&mut self) {
+        let stats = self.ui_sender.stats();
+        if stats.dropped_recoverable != 0
+            || stats.dropped_ephemeral != 0
+            || stats.dropped_control != 0
+            || stats.control_faults != 0
+        {
+            warn!(
+                "UI event queue overflow: {} recoverable, {} ephemeral, {} control drops ({} failover faults)",
+                stats.dropped_recoverable,
+                stats.dropped_ephemeral,
+                stats.dropped_control,
+                stats.control_faults
+            );
+        }
+        // A dropped wrapper can never be shut down explicitly anymore; free
+        // its loop instead of leaking the executor + DB pool.
+        self.shutdown.notify_one();
+    }
+}
+
+/// An error and everything under it, on one line.
+///
+/// The store's errors are categories with the cause hung off `source`, and a
+/// browser has no database file to open afterwards and inspect — so a report
+/// that stops at the category is a report nobody can act on.
+fn because(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        use std::fmt::Write as _;
+        let _ = write!(text, ": {cause}");
+        source = cause.source();
+    }
+    text
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod notification_policy_tests {
+    use super::allows_desktop_notification;
+
+    #[test]
+    fn self_echoes_never_cross_the_notification_wire() {
+        assert!(!allows_desktop_notification(true, false, false, false));
+        assert!(!allows_desktop_notification(true, false, true, true));
+        assert!(allows_desktop_notification(false, false, false, false));
+        assert!(!allows_desktop_notification(false, true, false, true));
+        assert!(!allows_desktop_notification(false, true, true, true));
+        assert!(allows_desktop_notification(false, false, true, true));
+        assert!(!allows_desktop_notification(false, false, true, false));
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod outgoing_admission_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refusing_an_outgoing_send_preserves_previously_admitted_rows() {
+        let backend = SqliteStore::open(&format!(
+            "file:session-outgoing-admission-{}?mode=memory&cache=shared",
+            std::process::id()
+        ))
+        .await
+        .unwrap();
+        backend
+            .database()
+            .provision_device(backend.device_id())
+            .await
+            .unwrap();
+        let store = ChatStore::new(&backend).await.unwrap();
+        let chat: Jid = "559900000001@s.whatsapp.net".parse().unwrap();
+        let names = chat_names::ChatNameResolveSignal::new();
+        let message = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.conversation = Some("synthetic pending send".to_string());
+            constructed
+        };
+        // No await inside the loop: the current-thread writer cannot drain
+        // its bounded channel before this producer reaches admission refusal.
+        let (rejected, error) = (0..4096)
+            .find_map(|index| {
+                record_outgoing(&store, &chat, &format!("QUEUED-{index}"), &message, &names)
+                    .err()
+                    .map(|error| (index, error))
+            })
+            .expect("the outgoing queue must be bounded");
+        assert!(rejected > 0, "some earlier rows were admitted");
+        assert!(error.contains("writer queue full"), "{error}");
+        assert!(error.contains("message was not sent"), "{error}");
+        // Overflow is visible to the barrier too, but the accepted prefix is
+        // still materialized. The refused send has no row to acknowledge.
+        assert!(store.flush().await.is_err());
+        store.flush().await.unwrap();
+        assert!(
+            store
+                .own_message(&chat, "QUEUED-0")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .own_message(&chat, &format!("QUEUED-{}", rejected - 1))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .own_message(&chat, &format!("QUEUED-{rejected}"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store.close().await.unwrap();
+        let stopped = record_outgoing(&store, &chat, "STOPPED", &message, &names).unwrap_err();
+        assert!(stopped.contains("writer stopped"), "{stopped}");
+    }
+}

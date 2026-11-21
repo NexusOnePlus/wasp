@@ -1,0 +1,71 @@
+# Tagged release. Same build path as nightly; only the packaging differs.
+name: Release
+
+on:
+  # Manual only: releases are published from a Windows machine with
+  # packaging/windows/build-release.ps1, and nothing here may create,
+  # replace or delete a release (or a site) on a push.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build a release for
+        required: true
+        type: string
+
+# Read for everything by default; the publish job below raises its own to
+# `contents: write`, which is the only thing here that needs it.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ inputs.tag || github.ref_name }}
+      # The tag itself, not the ref this run was launched from. A tag push
+      # is already sitting on it; a `workflow_dispatch` naming an existing
+      # tag is launched from a branch, and without this the archives would
+      # be that branch's code uploaded over the tagged release's assets.
+      ref: ${{ inputs.tag || github.ref_name }}
+    # Only the signing secrets, by name, rather than `inherit`: the build
+    # job has no business seeing anything else this repository holds.
+    secrets:
+      WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+      WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+      WINDOWS_SIGNING_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_THUMBPRINT }}
+
+  # The client as a page, packaged so it can be hosted without being built.
+  web:
+    uses: ./.github/workflows/web-bundle.yml
+    with:
+      version: ${{ inputs.tag || github.ref_name }}
+      ref: ${{ inputs.tag || github.ref_name }}
+
+  publish:
+    needs: [build, web]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          (cd artifacts && sha256sum velo-* > checksums.sha256)
+          # Create on first run, upload on a re-run of the same tag.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            for asset in $(gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null || true); do
+              gh release delete-asset "$TAG" "$asset" --yes 2>/dev/null || true
+            done
+            gh release upload "$TAG" artifacts/* --clobber
+          else
+            gh release create "$TAG" artifacts/* --title "$TAG" --generate-notes
+          fi

@@ -1,0 +1,759 @@
+//! LID/PN peer-identity resolution for chat keys.
+//!
+//! A 1:1 peer has two interchangeable wire identities — phone number
+//! (`@s.whatsapp.net`) and LID (`@lid`) — and traffic for one thread can
+//! arrive under either, independent of which key its rows were stored under.
+//! WA Web reconciles the two at lookup time
+//! (`WAWebDBBulkGetRootMsgs.fixMsgKeysWithPnMapping`,
+//! `WAWebLidMigrationUtils.getAlternateMsgKey`) and routes inbound 1:1
+//! traffic to the existing thread whichever identity addressed it
+//! (`WAWebMessageProcessUtils.selectChatForOneOnOneMessage`): legacy chat ids
+//! stay stable, only brand-new chats are keyed by LID.
+//!
+//! Two questions here look like one and are not. A *chat key* is where rows
+//! live, and it is decided by [`route_chat_key`] with WA Web parity: an
+//! existing thread keeps the key it already has, whichever identity addressed
+//! it, so a legacy conversation stays under its phone number forever. A
+//! *person's* canonical identity is the other question, answered in
+//! `session/names.rs`, which prefers the LID whenever the pair is known. They
+//! disagree on purpose, and neither is the other's answer: `canonical_jid`
+//! must never be used to key a chat, and a chat key says nothing about who
+//! somebody is. What makes the disagreement harmless is that every read here
+//! resolves both halves of the pair.
+//!
+//! The device store's `lid_pn_mapping` table lives in the same database file
+//! and is bidirectional, so both candidate keys of a peer are always
+//! derivable — it already is the alias index WA Web keeps as the chat table's
+//! `accountLid` column, and the chat-store needs no schema of its own.
+
+use diesel::prelude::*;
+use diesel::sql_types::{Integer, Text};
+use std::collections::HashMap;
+use wacore_binary::{Jid, Server};
+
+use crate::schema;
+use crate::store::ChangeSet;
+
+/// Bare 1:1 user chat key — the only namespace with a PN/LID alias. Hosted
+/// and interop namespaces alias differently and are left alone.
+///
+/// A device-suffixed input normalizes rather than being rejected: a peer's
+/// companion device addresses traffic as `user:48@lid`, and every row of that
+/// thread is keyed by the bare identity, so the device must not decide
+/// whether a chat resolves.
+fn user_chat(chat: &str) -> Option<Jid> {
+    let jid: Jid = chat.parse().ok()?;
+    (jid.integrator == 0 && matches!(jid.server, Server::Pn | Server::Lid))
+        .then(|| jid.into_non_ad())
+}
+
+/// The key rows are actually filed under, for anything else left alone.
+///
+/// [`user_chat`]'s normalization applied to a string: the one shape every
+/// entry point here has to agree on, since a device-suffixed address reaches
+/// this module from receipts.
+fn chat_key(chat: &str) -> String {
+    user_chat(chat).map_or_else(|| chat.to_string(), |jid| jid.to_string())
+}
+
+/// The peer's other identity for a wire key, or `None` when the key is not a
+/// 1:1 user chat.
+pub(crate) fn counterpart_chat_key(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+) -> QueryResult<Option<String>> {
+    let Some(jid) = user_chat(chat) else {
+        return Ok(None);
+    };
+    counterpart_of(conn, device_id, &jid)
+}
+
+/// The peer's other identity, from the device store's mapping table. PN
+/// resolves to its most recently updated LID (the same rule as
+/// `SqliteStore::get_pn_mapping`); LID resolves straight to its PN.
+fn counterpart_of(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    jid: &Jid,
+) -> QueryResult<Option<String>> {
+    use schema::lid_pn_mapping::dsl;
+    let user = jid.user.as_str();
+    if jid.is_lid() {
+        return Ok(crate::point_lookup::First(
+            dsl::lid_pn_mapping
+                .filter(dsl::device_id.eq(device_id).and(dsl::lid.eq(user)))
+                .select(dsl::phone_number),
+        )
+        .get_result::<String>(conn)
+        .optional()?
+        .map(|pn| Jid::new(pn, Server::Pn).to_string()));
+    }
+    Ok(crate::point_lookup::First(
+        dsl::lid_pn_mapping
+            .filter(dsl::device_id.eq(device_id).and(dsl::phone_number.eq(user)))
+            // The lid tiebreak keeps routing stable when updated_at ties —
+            // flapping between counterpart keys would re-split the thread.
+            .order((dsl::updated_at.desc(), dsl::lid.desc()))
+            .select(dsl::lid),
+    )
+    .get_result::<String>(conn)
+    .optional()?
+    .map(|lid| Jid::new(lid, Server::Lid).to_string()))
+}
+
+/// Every key the peer's rows may live under: the given key, its PN, and all
+/// LIDs proven to map to that PN. Historical LIDs remain valid chat keys even
+/// after a newer LID becomes the routing counterpart.
+pub(crate) fn chat_key_candidates(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+) -> QueryResult<Vec<String>> {
+    use schema::lid_pn_mapping::dsl;
+
+    let Some(jid) = user_chat(chat) else {
+        return Ok(vec![chat.to_string()]);
+    };
+    let mut keys = vec![jid.to_string()];
+    let pn = if jid.is_lid() {
+        counterpart_of(conn, device_id, &jid)?
+    } else {
+        Some(Jid::new(jid.user.clone(), Server::Pn).to_string())
+    };
+    let Some(pn) = pn else {
+        return Ok(keys);
+    };
+    if !keys.contains(&pn) {
+        keys.push(pn.clone());
+    }
+    let pn_user = pn.parse::<Jid>().expect("constructed PN JID").user;
+    let lids: Vec<String> = dsl::lid_pn_mapping
+        .filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::phone_number.eq(pn_user.as_str())),
+        )
+        .order((dsl::updated_at.desc(), dsl::lid.desc()))
+        .select(dsl::lid)
+        .load(conn)?;
+    for lid in lids {
+        let key = Jid::new(lid, Server::Lid).to_string();
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    Ok(keys)
+}
+
+/// [`chat_key_candidates`] for many chats using a bounded number of batch
+/// queries.
+///
+/// A batched read exists to stop paying a permit, a blocking task and a
+/// snapshot per chat; asking the mapping table per chat inside it puts a
+/// statement per chat straight back, and an attaching front end names a
+/// hundred of them.
+pub(crate) fn chat_key_candidates_batch(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chats: &[String],
+) -> QueryResult<HashMap<String, Vec<String>>> {
+    use schema::lid_pn_mapping::dsl;
+
+    let parsed: Vec<(String, Option<Jid>)> = chats
+        .iter()
+        .map(|chat| (chat.clone(), user_chat(chat)))
+        .collect();
+    let mut users: Vec<String> = parsed
+        .iter()
+        .filter_map(|(_, jid)| jid.as_ref().map(|jid| jid.user.to_string()))
+        .collect();
+    users.sort();
+    users.dedup();
+
+    // First collect mappings touching any requested JID. For LID inputs this
+    // finds their PN; for PN inputs it also finds every historical LID.
+    let mut mappings = Vec::new();
+    for page in users.chunks(crate::queries::BIND_CHUNK) {
+        mappings.extend(
+            dsl::lid_pn_mapping
+                .filter(
+                    dsl::device_id
+                        .eq(device_id)
+                        .and(dsl::lid.eq_any(page).or(dsl::phone_number.eq_any(page))),
+                )
+                .select((dsl::lid, dsl::phone_number, dsl::updated_at))
+                .load::<(String, String, i64)>(conn)?,
+        );
+    }
+    let mut phone_numbers: Vec<String> = mappings
+        .iter()
+        .map(|(_, pn, _)| pn.clone())
+        .chain(parsed.iter().filter_map(|(_, jid)| {
+            jid.as_ref()
+                .filter(|jid| jid.is_pn())
+                .map(|jid| jid.user.to_string())
+        }))
+        .collect();
+    phone_numbers.sort();
+    phone_numbers.dedup();
+
+    // An LID input only touched its own row above; fetch its PN's other LIDs
+    // in batches so reads and routing see the same complete alias component.
+    for page in phone_numbers.chunks(crate::queries::BIND_CHUNK) {
+        mappings.extend(
+            dsl::lid_pn_mapping
+                .filter(
+                    dsl::device_id
+                        .eq(device_id)
+                        .and(dsl::phone_number.eq_any(page)),
+                )
+                .select((dsl::lid, dsl::phone_number, dsl::updated_at))
+                .load::<(String, String, i64)>(conn)?,
+        );
+    }
+    mappings.sort();
+    mappings.dedup();
+
+    let mut pn_to_lids: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    let mut lid_to_pn: HashMap<String, String> = HashMap::new();
+    for (lid, pn, updated_at) in mappings {
+        lid_to_pn.insert(lid.clone(), pn.clone());
+        pn_to_lids.entry(pn).or_default().push((updated_at, lid));
+    }
+    for lids in pn_to_lids.values_mut() {
+        lids.sort_by(|left, right| right.cmp(left));
+    }
+
+    Ok(parsed
+        .into_iter()
+        .map(|(chat, jid)| {
+            let Some(jid) = jid else {
+                return (chat.clone(), vec![chat]);
+            };
+            let mut keys = vec![jid.to_string()];
+            let pn = if jid.is_lid() {
+                lid_to_pn.get(jid.user.as_str()).cloned()
+            } else {
+                Some(jid.user.to_string())
+            };
+            if let Some(pn) = pn {
+                let pn_key = Jid::new(pn.clone(), Server::Pn).to_string();
+                if !keys.contains(&pn_key) {
+                    keys.push(pn_key);
+                }
+                if let Some(lids) = pn_to_lids.get(&pn) {
+                    for (_, lid) in lids {
+                        let lid_key = Jid::new(lid.clone(), Server::Lid).to_string();
+                        if !keys.contains(&lid_key) {
+                            keys.push(lid_key);
+                        }
+                    }
+                }
+            }
+            (chat, keys)
+        })
+        .collect())
+}
+
+/// Storage key for a chat addressed as `wire_chat`, WA Web
+/// `selectChatForOneOnOneMessage` parity: an existing thread keeps its key
+/// whichever identity addressed it; a brand-new chat with a known LID is
+/// keyed by the LID. Rows split across both keys (the state receipts dropped
+/// under the wrong identity leave behind) are merged before routing. A
+/// device-suffixed input is normalized even when no counterpart is known, so
+/// a companion device can never materialize a thread of its own.
+pub(crate) fn route_chat_key(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    wire_chat: &str,
+    cs: &mut ChangeSet,
+) -> QueryResult<String> {
+    let Some(jid) = user_chat(wire_chat) else {
+        return Ok(wire_chat.to_string());
+    };
+    let key = jid.to_string();
+    let candidates = chat_key_candidates(conn, device_id, &key)?;
+    if candidates.len() == 1 {
+        return Ok(key);
+    }
+    let present: std::collections::HashSet<String> = {
+        use schema::chats::dsl;
+        dsl::chats
+            .filter(
+                dsl::device_id
+                    .eq(device_id)
+                    .and(dsl::jid.eq_any(candidates.clone())),
+            )
+            .select(dsl::jid)
+            .load(conn)?
+            .into_iter()
+            .collect()
+    };
+    let existing: Vec<String> = candidates
+        .into_iter()
+        .filter(|candidate| present.contains(candidate))
+        .collect();
+    if existing.is_empty() {
+        let Some(alt) = counterpart_of(conn, device_id, &jid)? else {
+            return Ok(key);
+        };
+        return Ok(lid_side(&key, &alt).to_string());
+    }
+    let mut destination = existing[0].clone();
+    for source in existing.iter().skip(1) {
+        destination = merge_split_chat(conn, device_id, &destination, source, cs)?;
+    }
+    Ok(destination)
+}
+
+/// Repair known PN/LID chat splits when a prepared account is reopened. A PN
+/// can have more than one historical LID in the mapping ledger, so reconcile
+/// each complete, proven alias component rather than pairing only the newest
+/// LID with its PN.
+pub(crate) fn reconcile_known_chats(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    cs: &mut ChangeSet,
+) -> QueryResult<()> {
+    use schema::chats::dsl as chats;
+    use schema::lid_pn_mapping::dsl as mapping;
+
+    let chats: Vec<String> = chats::chats
+        .filter(chats::device_id.eq(device_id))
+        .select(chats::jid)
+        .load(conn)?;
+    let existing: std::collections::HashSet<String> = chats.into_iter().collect();
+    let mappings: Vec<(String, String)> = mapping::lid_pn_mapping
+        .filter(mapping::device_id.eq(device_id))
+        .select((mapping::phone_number, mapping::lid))
+        .load(conn)?;
+    let mut aliases_by_pn: HashMap<String, Vec<String>> = HashMap::new();
+    for (pn, lid) in mappings {
+        let pn_key = Jid::new(pn.clone(), Server::Pn).to_string();
+        let aliases = aliases_by_pn.entry(pn).or_default();
+        if !aliases.contains(&pn_key) {
+            aliases.push(pn_key);
+        }
+        aliases.push(Jid::new(lid, Server::Lid).to_string());
+    }
+    for aliases in aliases_by_pn.values_mut() {
+        aliases.sort();
+        aliases.dedup();
+        let mut present: Vec<String> = aliases
+            .iter()
+            .filter(|key| existing.contains(*key))
+            .cloned()
+            .collect();
+        if present.len() < 2 {
+            continue;
+        }
+        let mut destination = present.remove(0);
+        for source in present {
+            destination = merge_split_chat(conn, device_id, &destination, &source, cs)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reconcile the alias components touched by a newly persisted mapping batch.
+/// Historical LIDs for each PN are included, but unrelated chats are never
+/// visited.
+pub(crate) fn reconcile_known_chats_for(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    mappings: &[(String, String)],
+    cs: &mut ChangeSet,
+) -> QueryResult<()> {
+    use schema::chats::dsl as chats;
+    use schema::lid_pn_mapping::dsl as ledger;
+
+    let mut phone_numbers: Vec<String> = mappings.iter().map(|(_, pn)| pn.clone()).collect();
+    phone_numbers.sort();
+    phone_numbers.dedup();
+    let mut aliases_by_pn: HashMap<String, Vec<String>> = phone_numbers
+        .into_iter()
+        .map(|pn| {
+            let key = Jid::new(pn.clone(), Server::Pn).to_string();
+            (pn, vec![key])
+        })
+        .collect();
+    let mut phone_numbers: Vec<String> = aliases_by_pn.keys().cloned().collect();
+    phone_numbers.sort();
+    for page in phone_numbers.chunks(crate::queries::BIND_CHUNK) {
+        let rows: Vec<(String, String)> = ledger::lid_pn_mapping
+            .filter(
+                ledger::device_id
+                    .eq(device_id)
+                    .and(ledger::phone_number.eq_any(page)),
+            )
+            .select((ledger::lid, ledger::phone_number))
+            .load(conn)?;
+        for (lid, pn) in rows {
+            aliases_by_pn
+                .entry(pn)
+                .or_default()
+                .push(Jid::new(lid, Server::Lid).to_string());
+        }
+    }
+    let mut all_keys = Vec::new();
+    for aliases in aliases_by_pn.values_mut() {
+        aliases.sort();
+        aliases.dedup();
+        all_keys.extend(aliases.iter().cloned());
+    }
+    all_keys.sort();
+    all_keys.dedup();
+    let mut present = std::collections::HashSet::new();
+    for page in all_keys.chunks(crate::queries::BIND_CHUNK) {
+        present.extend(
+            chats::chats
+                .filter(chats::device_id.eq(device_id).and(chats::jid.eq_any(page)))
+                .select(chats::jid)
+                .load::<String>(conn)?,
+        );
+    }
+    for aliases in aliases_by_pn.values() {
+        let existing: Vec<String> = aliases
+            .iter()
+            .filter(|key| present.contains(*key))
+            .cloned()
+            .collect();
+        if existing.len() < 2 {
+            continue;
+        }
+        let mut destination = existing[0].clone();
+        for source in existing.iter().skip(1) {
+            destination = merge_split_chat(conn, device_id, &destination, source, cs)?;
+        }
+    }
+    Ok(())
+}
+
+fn lid_side<'a>(a: &'a str, b: &'a str) -> &'a str {
+    if a.ends_with("@lid") { a } else { b }
+}
+
+fn newest_message_ts(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+) -> QueryResult<Option<i64>> {
+    use schema::messages::dsl;
+    dsl::messages
+        .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(chat)))
+        .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
+        .select(dsl::timestamp_ms)
+        .first(conn)
+        .optional()
+}
+
+/// Fold a peer's split PN/LID pair into one thread and return the surviving
+/// key. Destination is the side with the newer message activity — that is the
+/// thread the peer is living in — with ties (and the empty/empty case) going
+/// to the LID side, the canonical identity going forward. Idempotent: with
+/// nothing under the source key this is a no-op.
+pub(crate) fn merge_split_chat(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    a: &str,
+    b: &str,
+    cs: &mut ChangeSet,
+) -> QueryResult<String> {
+    // Normalized here rather than trusted from the caller, the same way
+    // `route_chat_key` does it. A device-suffixed key (`user:48@lid`, the
+    // form receipts carry) names nothing in the store, so the early return
+    // below fired and the reconciliation that was asked for silently did not
+    // happen.
+    let (a, b) = (chat_key(a), chat_key(b));
+    let (a, b) = (a.as_str(), b.as_str());
+    if a == b {
+        return Ok(a.to_string());
+    }
+    let ts_a = newest_message_ts(conn, device_id, a)?;
+    let ts_b = newest_message_ts(conn, device_id, b)?;
+    let (src, dest) = match (ts_a, ts_b) {
+        (Some(ta), Some(tb)) if ta > tb => (b, a),
+        (Some(ta), Some(tb)) if ta < tb => (a, b),
+        (Some(_), None) => (b, a),
+        (None, Some(_)) => (a, b),
+        _ => {
+            let dest = lid_side(a, b);
+            if dest == a { (b, a) } else { (a, b) }
+        }
+    };
+    let src_has_chat_row = {
+        use schema::chats::dsl;
+        dsl::chats
+            .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(src)))
+            .select(dsl::jid)
+            .first::<String>(conn)
+            .optional()?
+            .is_some()
+    };
+    let src_ts = if src == a { ts_a } else { ts_b };
+    // Nothing lives under the source key: already reconciled (or never split).
+    if !src_has_chat_row && src_ts.is_none() {
+        return Ok(dest.to_string());
+    }
+
+    // Fold only copies with the same proven author. A stanza id reused by a
+    // different participant is a separate message and must survive the chat
+    // merge as a separate row.
+    crate::store::message_identity::reconcile_chat(conn, device_id, src, cs)?;
+    crate::store::message_identity::reconcile_chat(conn, device_id, dest, cs)?;
+    use schema::messages::dsl;
+    let source_rows: Vec<(i64, String, String, bool)> = dsl::messages
+        .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(src)))
+        .select((dsl::id, dsl::msg_id, dsl::sender_jid, dsl::from_me))
+        .load(conn)?;
+    for (source_id, msg_id, sender, from_me) in source_rows {
+        let destination_rows: Vec<(i64, String, bool)> = dsl::messages
+            .filter(
+                dsl::device_id
+                    .eq(device_id)
+                    .and(dsl::chat_jid.eq(dest))
+                    .and(dsl::msg_id.eq(&msg_id)),
+            )
+            .select((dsl::id, dsl::sender_jid, dsl::from_me))
+            .load(conn)?;
+        let mut ids = vec![source_id];
+        for (id, destination_sender, destination_from_me) in destination_rows {
+            if crate::store::message_identity::authors_match(
+                conn,
+                device_id,
+                from_me,
+                &sender,
+                destination_from_me,
+                &destination_sender,
+            )? {
+                ids.push(id);
+            }
+        }
+        if ids.len() > 1 {
+            crate::store::message_identity::merge_rows(
+                conn, device_id, &msg_id, dest, &ids, from_me,
+            )?;
+        }
+    }
+    // Preserve unmatched rows if a pre-existing uniqueness conflict prevents
+    // movement; the alias-aware readers still see them, and a later identity
+    // resolution can safely repair them. IDs remain stable and the update
+    // keeps the FTS external-content index in step.
+    diesel::sql_query(
+        "UPDATE OR IGNORE messages SET chat_jid = ? WHERE device_id = ? AND chat_jid = ?",
+    )
+    .bind::<Text, _>(dest)
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .execute(conn)?;
+    // Satellites: the newest reaction per (msg, sender) and the highest
+    // receipt per (msg, user) win across the pair, matching their live-path
+    // monotonic rules — drop the losing destination rows, then move.
+    //
+    // Reaction timestamps are whole seconds, so adding and removing inside
+    // one second ties, and a strict comparison kept the emoji and threw the
+    // tombstone away: the removal came back undone. A tie goes to the
+    // tombstone instead.
+    //
+    // A heuristic, not a proof, and worth saying so. The live path settles a
+    // tie by arrival (`ts_ms <= ts_ms`), and across a split pair there is no
+    // arrival order to consult: a row is updated in place, so its id is
+    // when the row was created rather than when its value was applied. The
+    // case this gets wrong is a same-second add, remove and re-add split
+    // across the two identities, where the re-add is dropped. That needs
+    // three actions inside one second landing on both sides; the case it
+    // fixes needs two. Settling it properly means recording when a value was
+    // applied, which is a column this schema does not have.
+    diesel::sql_query(
+        "DELETE FROM reactions WHERE device_id = ?1 AND chat_jid = ?3 AND EXISTS \
+         (SELECT 1 FROM reactions s WHERE s.device_id = ?1 AND s.chat_jid = ?2 \
+          AND s.msg_id = reactions.msg_id AND s.sender_jid = reactions.sender_jid \
+          AND (s.ts_ms > reactions.ts_ms \
+               OR (s.ts_ms = reactions.ts_ms AND s.emoji = '' AND reactions.emoji <> '')))",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .bind::<Text, _>(dest)
+    .execute(conn)?;
+    // The peer's own identity is being unified too, and a reaction names the
+    // person who left it. One person reacting under their phone number and
+    // taking it back under their LID — a removal is a reaction with an empty
+    // emoji — left two rows that no longer look like the same reactor: the
+    // tombstone is filtered out by `reactions_for`, so the reaction it
+    // retracts stayed on screen for good, and two different emojis put the
+    // same person in the list twice. Newest wins, the rule the live path
+    // holds, and a same-second tie goes to the removal — the rule the
+    // statement above settles the same-sender case with, and the one this
+    // fold is most likely to meet: a reaction and its withdrawal are what
+    // land under two identities inside one tick. `emoji = ''` is 1 for the
+    // tombstone and 0 for a reaction, so it outranks. Only past that does
+    // the identity break the tie, so a tie leaves exactly one row standing
+    // rather than none.
+    //
+    // `?1` device_id, `?2` src, `?3` dest, as below.
+    diesel::sql_query(
+        "DELETE FROM reactions \
+         WHERE device_id = ?1 AND chat_jid IN (?2, ?3) AND sender_jid IN (?2, ?3) \
+           AND EXISTS (SELECT 1 FROM reactions s \
+                        WHERE s.device_id = ?1 AND s.chat_jid IN (?2, ?3) \
+                          AND s.sender_jid IN (?2, ?3) AND s.msg_id = reactions.msg_id \
+                          AND (s.ts_ms, s.emoji = '', s.chat_jid, s.sender_jid) \
+                              > (reactions.ts_ms, reactions.emoji = '', \
+                                 reactions.chat_jid, reactions.sender_jid))",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .bind::<Text, _>(dest)
+    .execute(conn)?;
+    diesel::sql_query(
+        "UPDATE OR IGNORE reactions SET sender_jid = ?3 \
+         WHERE device_id = ?1 AND chat_jid IN (?2, ?3) AND sender_jid = ?2",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .bind::<Text, _>(dest)
+    .execute(conn)?;
+    // Past that rename, still naming `src` is proof of a collision `OR IGNORE`
+    // skipped, and the fold above already settled which row wins.
+    diesel::sql_query(
+        "DELETE FROM reactions WHERE device_id = ?1 AND chat_jid IN (?2, ?3) AND sender_jid = ?2",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .bind::<Text, _>(dest)
+    .execute(conn)?;
+
+    diesel::sql_query(
+        "UPDATE OR IGNORE reactions SET chat_jid = ? WHERE device_id = ? AND chat_jid = ?",
+    )
+    .bind::<Text, _>(dest)
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .execute(conn)?;
+    diesel::sql_query("DELETE FROM reactions WHERE device_id = ? AND chat_jid = ?")
+        .bind::<Integer, _>(device_id)
+        .bind::<Text, _>(src)
+        .execute(conn)?;
+
+    // Receipts, unlike reactions, get no "keep the furthest state" pass: they
+    // are keyed per state, so a side holding `read` and a side holding
+    // `delivered` are two facts about one message rather than two candidates
+    // for one row. What the merge has to settle instead is that both the chat
+    // key and the *peer's identity* are being unified at once — a 1:1's receipt
+    // names whoever the peer sent from, which is independent of the key the row
+    // was filed under, so one person can be spread across four combinations of
+    // (chat, user). Self receipts never reach here, so the peer is the only
+    // user a 1:1 row can name.
+    //
+    // Every statement below binds `?1` device_id, `?2` src, `?3` dest.
+    //
+    // Fold the instants first, over all four combinations at once. Doing it
+    // before anything is moved or renamed means the passes that follow are
+    // discarding exact duplicates rather than deciding between them: whichever
+    // row survives already carries the earliest time that state was reported.
+    // Neither identity is automatically the earlier one — the merge direction
+    // is chosen by chat activity, which says nothing about who saw it first.
+    diesel::sql_query(
+        "UPDATE message_receipts SET ts_ms = (SELECT MIN(s.ts_ms) FROM message_receipts s \
+          WHERE s.device_id = message_receipts.device_id \
+            AND s.chat_jid IN (?2, ?3) AND s.user_jid IN (?2, ?3) \
+            AND s.msg_id = message_receipts.msg_id \
+            AND s.receipt_type = message_receipts.receipt_type) \
+         WHERE device_id = ?1 AND chat_jid IN (?2, ?3) AND user_jid IN (?2, ?3)",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .bind::<Text, _>(dest)
+    .execute(conn)?;
+
+    // Now the identity, on both sides: a receipt addressed to the surviving
+    // thread can still name the retiring one.
+    diesel::sql_query(
+        "UPDATE OR IGNORE message_receipts SET user_jid = ?3 \
+         WHERE device_id = ?1 AND chat_jid IN (?2, ?3) AND user_jid = ?2",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .bind::<Text, _>(dest)
+    .execute(conn)?;
+    // Past that rename, naming `src` is proof of a collision: the only rows
+    // still doing so are the ones `OR IGNORE` skipped because their renamed
+    // form already existed. Their instants are folded in, so every one of them
+    // is a pure duplicate — and both chat keys need sweeping, not just `dest`.
+    // A survivor under `src` would otherwise be carried to `dest` intact by the
+    // chat rename below, and one under `dest` is beyond that rename's reach
+    // entirely. Either way it outlives the merge still naming the retired
+    // identity: one peer read back as two users, the exact failure this
+    // reconciliation exists to prevent.
+    diesel::sql_query(
+        "DELETE FROM message_receipts \
+         WHERE device_id = ?1 AND chat_jid IN (?2, ?3) AND user_jid = ?2",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .bind::<Text, _>(dest)
+    .execute(conn)?;
+
+    diesel::sql_query(
+        "UPDATE OR IGNORE message_receipts SET chat_jid = ?3 WHERE device_id = ?1 AND chat_jid = ?2",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .bind::<Text, _>(dest)
+    .execute(conn)?;
+    diesel::sql_query("DELETE FROM message_receipts WHERE device_id = ?1 AND chat_jid = ?2")
+        .bind::<Integer, _>(device_id)
+        .bind::<Text, _>(src)
+        .execute(conn)?;
+
+    crate::store::merge_chat_metadata(conn, device_id, src, dest)?;
+
+    cs.chats = true;
+    cs.message_chats.insert(src.to_string());
+    cs.message_chats.insert(dest.to_string());
+    Ok(dest.to_string())
+}
+
+#[cfg(test)]
+mod point_lookup_tests {
+    use super::*;
+    use diesel::connection::SimpleConnection;
+
+    #[test]
+    fn counterpart_preserves_accounts_absence_and_latest_lid_ties() {
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        conn.batch_execute(
+            "CREATE TABLE lid_pn_mapping(device_id INTEGER NOT NULL,lid TEXT NOT NULL,phone_number TEXT NOT NULL,updated_at BIGINT NOT NULL,PRIMARY KEY(lid,device_id));\
+             INSERT INTO lid_pn_mapping VALUES(1,'100','500',1),(1,'200','500',2),(1,'300','500',2),(2,'100','900',9),(2,'400','500',9)",
+        ).unwrap();
+        // Repeated reads also exercise cached statements with different binds.
+        for _ in 0..3 {
+            for (account, input, expected) in [
+                (1, "100@lid", Some("500@s.whatsapp.net")),
+                (2, "100@lid", Some("900@s.whatsapp.net")),
+                (1, "500@s.whatsapp.net", Some("300@lid")),
+                (2, "500@s.whatsapp.net", Some("400@lid")),
+                (1, "400@lid", None),
+                (1, "999@s.whatsapp.net", None),
+                (3, "100@lid", None),
+            ] {
+                let jid = input.parse::<Jid>().unwrap();
+                assert_eq!(
+                    counterpart_of(&mut conn, account, &jid).unwrap().as_deref(),
+                    expected
+                );
+            }
+        }
+        assert_eq!(
+            counterpart_chat_key(&mut conn, 1, "100:5@lid")
+                .unwrap()
+                .as_deref(),
+            Some("500@s.whatsapp.net")
+        );
+        assert_eq!(
+            counterpart_chat_key(&mut conn, 1, "123@g.us").unwrap(),
+            None
+        );
+    }
+}

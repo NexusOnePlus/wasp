@@ -1,0 +1,626 @@
+//! What the window draws text with, where the platform has none of its own.
+//!
+//! A desktop has a font database — `gpui_platform` builds its text system
+//! over font-kit and the system's own families answer for `.SystemUIFont`. A
+//! page has nothing of the sort: `CosmicTextSystem::new_without_system_fonts`
+//! is what the web backend constructs, and a browser exposes no font files to
+//! wasm, so the database starts empty and stays that way until somebody fills
+//! it. Filling it is the application's job, and this is where it is done.
+//!
+//! It used to be gpui's. `gpui_web` bundled IBM Plex Sans and Lilex and added
+//! them to the text system as it built the platform; a revision bump took
+//! that out with the note "applications must add fonts through
+//! `gpui::App::text_system` before opening a window", and this file is that
+//! sentence answered. The failure it fixes is not subtle in the log and is
+//! total on screen: `resolve_font` *panics* when neither the asked-for family
+//! nor one of the fallbacks resolves, so the first frame trapped, and — since
+//! a wasm trap unwinds nothing — every `RefCell` gpui held across that frame
+//! stayed borrowed for the life of the page. The console filled with
+//! "RefCell already borrowed" from a window that never drew a pixel, while
+//! the session behind it connected, hydrated and synced perfectly.
+//!
+//! Which two families, and not some others, is decided upstream rather than
+//! by taste: `gpui::font_name_with_fallbacks` maps `.ZedSans` to "IBM Plex
+//! Sans" and `.ZedMono` to "Lilex", and the web platform passes "IBM Plex
+//! Sans" as the name `.SystemUIFont` resolves to. Those three names are the
+//! whole of what a page asks for by default — the theme's own mono family is
+//! "DejaVu Sans Mono" here, which no page has either, so it reaches Lilex
+//! through gpui's fallback stack — so these are the files that were bundled,
+//! at the revision they were bundled from.
+//!
+//! Persian coverage is loaded only after a missing Arabic-script grapheme is
+//! reported. The same-origin asset is verified and cached separately from WASM;
+//! see `on_demand`. Shaping stays in cosmic-text.
+//!
+//! The current web backend also has a browser Canvas fallback for eligible
+//! emoji, with optional independent horizontal CJK support. That path uses
+//! browser fonts without loading their bytes into cosmic-text. It does not
+//! cover contextual Arabic-script shaping. See vendor/gpui-fast-web/src/.
+//!
+//! The downloaded monochrome emoji face remains available to cosmic-text
+//! when the Canvas path cannot replace a grapheme. The restrictions on swash
+//! colour-font formats apply to this native rasterization path, not Canvas.
+//!
+//! And it is fetched, not embedded. A browser can cache that file separately,
+//! so the bundle does not grow and a build with no emoji font next to it
+//! still runs. The file is copied into `dist` by `web/index.html`; nothing in
+//! the document trunk emits names it, so `cargo xtask bundle check` carries
+//! it in `REQUIRED` and a bundle without it fails there rather than in a
+//! browser.
+
+#[cfg(any(target_family = "wasm", test))]
+mod on_demand;
+
+/// Give the text system something to resolve, where the platform hands it
+/// nothing.
+///
+/// Called before the window opens, because the first frame is what resolves
+/// a font and a frame that cannot is a panic rather than a blank page.
+pub fn fonts(cx: &mut gpui::App) {
+    imp::fonts(cx);
+}
+
+/// Fetch what could not be embedded, then start.
+///
+/// Startup currently waits for the download to reduce first-frame fallback.
+/// This is a startup policy, not a cache limitation: gpui-fast 0.1.13
+/// invalidates cached font resolution and line layouts after `add_fonts`.
+/// A loader that installs fonts later must also request a window refresh.
+///
+/// A deadline is what keeps that from being a page that never draws: the
+/// window opens either way, and a fetch that fails or hangs costs the emoji
+/// rather than the client. On a desktop there is nothing to wait for and
+/// `start` is called where it stands.
+pub fn with_downloaded_fonts(start: impl FnOnce() + 'static) {
+    imp::with_downloaded_fonts(start);
+}
+
+/// The name the web backend resolves `.SystemUIFont` to, and so the family
+/// the page has to be able to answer with.
+///
+/// Written down here rather than read from gpui, which does not export it:
+/// `gpui_web` passes it to `CosmicTextSystem::new_without_system_fonts`.
+#[cfg(test)]
+const WEB_SYSTEM_FONT: &str = "IBM Plex Sans";
+
+/// Base UI families, registered before the first frame. Script fonts are assets
+/// loaded by `on_demand`, never bytes embedded in the production WASM.
+#[cfg(any(target_family = "wasm", test))]
+const BUNDLED: &[(&str, &[u8])] = &[
+    (
+        "IBMPlexSans-Regular",
+        include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"),
+    ),
+    (
+        "IBMPlexSans-Italic",
+        include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf"),
+    ),
+    (
+        "IBMPlexSans-SemiBold",
+        include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf"),
+    ),
+    (
+        "IBMPlexSans-SemiBoldItalic",
+        include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf"),
+    ),
+    (
+        "Lilex-Regular",
+        include_bytes!("../../assets/fonts/lilex/Lilex-Regular.ttf"),
+    ),
+    (
+        "Lilex-Bold",
+        include_bytes!("../../assets/fonts/lilex/Lilex-Bold.ttf"),
+    ),
+    (
+        "Lilex-Italic",
+        include_bytes!("../../assets/fonts/lilex/Lilex-Italic.ttf"),
+    ),
+    (
+        "Lilex-BoldItalic",
+        include_bytes!("../../assets/fonts/lilex/Lilex-BoldItalic.ttf"),
+    ),
+];
+
+/// The face the page fetches, once it has arrived.
+///
+/// A `OnceLock` because `fonts` is handed the `App` and the download is not:
+/// the fetch finishes before `gpui::Application::run` is called at all, so
+/// there is no context to hand it to and nothing to hand it to one with.
+#[cfg(target_family = "wasm")]
+static DOWNLOADED: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+/// What the emoji face is called in `dist`, and what the page asks for.
+///
+/// Relative, like every other asset in the bundle: the deployment lives in a
+/// directory under a domain that is not ours, so a name from the origin root
+/// would be fetched from that domain's root. `web/index.html` is what copies
+/// the file in under this name.
+#[cfg(any(target_family = "wasm", test))]
+const EMOJI: &str = "NotoEmoji-Regular.ttf";
+
+/// The family the interface is set in: the operating system's own.
+///
+/// The way the Mac and Windows messengers do it — San Francisco on macOS,
+/// Segoe UI on Windows — so Velo's text renders, hints and scales exactly
+/// like the rest of the desktop, and nothing is bundled. On Windows 11 the
+/// variable Segoe UI is named outright, because `.SystemUIFont` resolves to
+/// the older static Segoe UI; elsewhere the system font is asked for by its
+/// virtual name and gpui resolves it (SF on macOS, the desktop's sans on
+/// Linux). Scripts the face lacks — emoji, Devanagari, Arabic, CJK — fall
+/// through to the platform's own font fallback.
+///
+/// Apple's San Francisco may only be used on Apple platforms, which is why
+/// this is "the system's font" rather than one face shipped everywhere.
+pub fn ui_family(cx: &gpui::App) -> gpui::SharedString {
+    const SEGOE_VARIABLE: &str = "Segoe UI Variable Text";
+    if cfg!(windows)
+        && cx
+            .text_system()
+            .all_font_names()
+            .iter()
+            .any(|name| name == SEGOE_VARIABLE)
+    {
+        return SEGOE_VARIABLE.into();
+    }
+    ".SystemUIFont".into()
+}
+
+#[cfg(not(target_family = "wasm"))]
+mod imp {
+    /// Nothing to add: the system's own families are what the platform text
+    /// system reads, emoji included.
+    pub(super) fn fonts(_cx: &mut gpui::App) {}
+
+    /// Nothing to wait for either.
+    pub(super) fn with_downloaded_fonts(start: impl FnOnce() + 'static) {
+        start();
+    }
+}
+
+#[cfg(target_family = "wasm")]
+mod imp {
+    use std::borrow::Cow;
+    use std::time::Duration;
+    use wasm_bindgen::JsCast as _;
+    use wasm_bindgen_futures::JsFuture;
+
+    /// How long the window waits for the emoji face before opening without
+    /// it.
+    ///
+    /// Generous, because it is spent on a same-origin file the browser has
+    /// usually already cached and it is reached only after the application
+    /// module has arrived over the same connection. Short enough that a
+    /// host answering nothing costs a visitor a pause rather than the page.
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    /// A failure here is a window that cannot draw, so it is said out loud —
+    /// but it is not a refusal to start: the panic it precedes names the
+    /// family and the fallbacks, and a page that reached that panic with this
+    /// line above it in the console is one whose report says which of the two
+    /// went wrong.
+    ///
+    /// Downloaded fallbacks are allowed to be missing. The emoji face
+    /// is fetched rather than embedded. If unavailable, native monochrome
+    /// fallback is lost; eligible Canvas emoji may still render.
+    pub(super) fn fonts(cx: &mut gpui::App) {
+        let fonts: Vec<Cow<'static, [u8]>> = super::BUNDLED
+            .iter()
+            .map(|(_, bytes)| Cow::Borrowed(*bytes))
+            .chain(
+                super::DOWNLOADED
+                    .get()
+                    .map(|bytes| Cow::Borrowed(bytes.as_slice())),
+            )
+            .collect();
+        if let Err(error) = cx.text_system().add_fonts(fonts) {
+            log::error!("the page's own fonts could not be loaded: {error:#}");
+        }
+        super::on_demand::install(cx);
+    }
+
+    /// Fetch the emoji face, then start the window whether it arrived or not.
+    pub(super) fn with_downloaded_fonts(start: impl FnOnce() + 'static) {
+        wasm_bindgen_futures::spawn_local(async move {
+            // `velo_platform` rather than a timer of this module's own:
+            // a wait is armed in one place, which /clippy.toml enforces.
+            match velo_platform::with_timeout(emoji(), DEADLINE).await {
+                Some(Ok(face)) => {
+                    // The only writer, and it runs before the window opens,
+                    // so a refusal is impossible rather than tolerated.
+                    let _ = super::DOWNLOADED.set(face);
+                }
+                Some(Err(why)) => {
+                    log::warn!(
+                        "monochrome emoji fallback {} was not loaded: {why}",
+                        super::EMOJI
+                    )
+                }
+                None => log::warn!(
+                    "monochrome emoji fallback {} did not arrive within {DEADLINE:?}",
+                    super::EMOJI
+                ),
+            }
+            start();
+        });
+    }
+
+    /// The face itself, off the origin that served the page.
+    async fn emoji() -> Result<Vec<u8>, String> {
+        let window =
+            web_sys::window().ok_or_else(|| "there is no window to fetch from".to_string())?;
+        let response = JsFuture::from(window.fetch_with_str(super::EMOJI))
+            .await
+            .map_err(js)?;
+        let response: web_sys::Response = response
+            .dyn_into()
+            .map_err(|_| "the fetch did not answer with a response".to_string())?;
+        if !response.ok() {
+            return Err(format!("the server answered {}", response.status()));
+        }
+        let buffer = JsFuture::from(response.array_buffer().map_err(js)?)
+            .await
+            .map_err(js)?;
+        // JS to wasm, which is the direction that is allowed to be a copy and
+        // the only one that is allowed at all: the module is built with
+        // `--shared-memory`, so a view *into* wasm memory is what the browser
+        // refuses. `Uint8Array::new` wraps the JS-owned buffer and `to_vec`
+        // copies out of it.
+        Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+    }
+
+    /// A thrown `JsValue`, in a form a log line can carry.
+    fn js(error: wasm_bindgen::JsValue) -> String {
+        error.as_string().unwrap_or_else(|| format!("{error:?}"))
+    }
+}
+
+/// The page's text system, reproduced on the host.
+///
+/// Not a stand-in: `gpui::TextSystem` over a
+/// `CosmicTextSystem::new_without_system_fonts` matches the native half of the
+/// web backend, excluding its Canvas emoji/CJK replacement. It uses the same name behind
+/// `.SystemUIFont`. So a font a page cannot resolve is a font this cannot
+/// resolve either, which is the only way to hold a browser-only failure with
+/// a `cargo test`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+    use std::sync::Arc;
+
+    fn a_page_without_fonts() -> gpui::TextSystem {
+        gpui::TextSystem::new(Arc::new(
+            gpui_wgpu::CosmicTextSystem::new_without_system_fonts(WEB_SYSTEM_FONT),
+        ))
+    }
+
+    /// A `WindowTextSystem` rather than the `TextSystem` under it, because
+    /// shaping is a window's half of the pair — `layout_line` is where the
+    /// line layout cache lives — and it derefs to the other, so every test
+    /// that only resolves a family reads the same.
+    fn a_page_with_its_fonts() -> gpui::WindowTextSystem {
+        let text_system = a_page_without_fonts();
+        text_system
+            .add_fonts(
+                BUNDLED
+                    .iter()
+                    .map(|(_, bytes)| Cow::Borrowed(*bytes))
+                    .collect(),
+            )
+            .expect("the bundled faces load");
+        gpui::WindowTextSystem::new(Arc::new(text_system))
+    }
+
+    /// The face a page fetches, read from the file the bundle copies.
+    ///
+    /// The one `include_bytes!` of it in the tree, and deliberately under
+    /// `cfg(test)`: what ships is the file itself, next to `index.html`, and
+    /// embedding it here would put 878 KB in the module the page downloads
+    /// for the sake of an assertion. Reading it from the same path the copy
+    /// is made from is what keeps the tested face and the served one the
+    /// same file.
+    const EMOJI_FACE: &[u8] = include_bytes!("../../assets/fonts/noto-emoji/NotoEmoji-Regular.ttf");
+
+    const ARABIC_FACE: &[u8] = include_bytes!(
+        "../../assets/fonts/noto-sans-arabic/NotoSansArabic-Regular.ceea25b464a656dc.ttf"
+    );
+
+    fn a_page_with_downloaded_fonts() -> gpui::WindowTextSystem {
+        let text_system = a_page_with_its_fonts();
+        text_system
+            .add_fonts(vec![Cow::Borrowed(EMOJI_FACE), Cow::Borrowed(ARABIC_FACE)])
+            .expect("the emoji face loads");
+        text_system
+    }
+
+    /// What a line of chat shapes to: the glyph ids, in order.
+    ///
+    /// Glyph 0 is `.notdef` — the tofu box — so this is the whole assertion
+    /// both emoji tests make. Shaped through `.SystemUIFont`, which is the
+    /// family the theme sets and so the one every one of those chat titles
+    /// went through.
+    fn glyphs(text_system: &gpui::WindowTextSystem, text: &str) -> Vec<u32> {
+        let runs = [gpui::TextRun {
+            len: text.len(),
+            font: gpui::font(".SystemUIFont"),
+            color: gpui::Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }];
+        text_system
+            .layout_line(text, gpui::px(16.0), &runs, None)
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.id.0))
+            .collect()
+    }
+
+    #[test]
+    fn persian_and_mixed_chat_text_have_no_missing_glyphs() {
+        let text_system = a_page_with_downloaded_fonts();
+        for text in [
+            "سلام فارسی پ چ ژ گ ک ی",
+            "می\u{200c}روم، پیام شما؟ ۱۲۳۴۵۶۷۸۹۰",
+            "Hello سلام 123 ۱۲۳ 🧪 ✅",
+        ] {
+            let drawn = glyphs(&text_system, text);
+            assert!(
+                !drawn.is_empty() && drawn.iter().all(|&id| id != 0),
+                "{text:?} contains missing glyphs: {drawn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn arabic_fallback_does_not_change_latin_or_emoji() {
+        let without_arabic = a_page_without_fonts();
+        without_arabic
+            .add_fonts(
+                BUNDLED
+                    .iter()
+                    .map(|(_, bytes)| Cow::Borrowed(*bytes))
+                    .chain([Cow::Borrowed(EMOJI_FACE)])
+                    .collect(),
+            )
+            .unwrap();
+        let without_arabic = gpui::WindowTextSystem::new(Arc::new(without_arabic));
+        let with_arabic = a_page_with_downloaded_fonts();
+        for text in ["Notes/Save 12:34", "🧪 ✅"] {
+            assert_eq!(glyphs(&without_arabic, text), glyphs(&with_arabic, text));
+        }
+    }
+
+    #[test]
+    fn shaped_persian_glyphs_rasterize_to_visible_pixels() {
+        use gpui::PlatformTextSystem as _;
+
+        let backend = Arc::new(gpui_wgpu::CosmicTextSystem::new_without_system_fonts(
+            WEB_SYSTEM_FONT,
+        ));
+        backend
+            .add_fonts(
+                BUNDLED
+                    .iter()
+                    .map(|(_, bytes)| Cow::Borrowed(*bytes))
+                    .collect(),
+            )
+            .unwrap();
+        backend.add_fonts(vec![Cow::Borrowed(ARABIC_FACE)]).unwrap();
+        let text_system =
+            gpui::WindowTextSystem::new(Arc::new(gpui::TextSystem::new(backend.clone())));
+        let text = "سلام";
+        let runs = [gpui::TextRun {
+            len: text.len(),
+            font: gpui::font(".SystemUIFont"),
+            color: gpui::Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }];
+        let line = text_system.layout_line(text, gpui::px(16.0), &runs, None);
+        assert!(!line.runs.is_empty());
+        for run in &line.runs {
+            for glyph in &run.glyphs {
+                assert_ne!(glyph.id.0, 0);
+                let params = gpui::RenderGlyphParams {
+                    font_id: run.font_id,
+                    glyph_id: glyph.id,
+                    font_size: gpui::px(16.0),
+                    subpixel_variant: gpui::point(0, 0),
+                    scale_factor: 1.0,
+                    is_emoji: glyph.is_emoji,
+                    subpixel_rendering: false,
+                    dilation: 0,
+                };
+                let bounds = backend.glyph_raster_bounds(&params).unwrap();
+                let (_, pixels) = backend.rasterize_glyph(&params, bounds).unwrap();
+                assert!(pixels.iter().any(|&value| value != 0));
+            }
+        }
+    }
+
+    /// Every family the page asks for by default, resolved without falling
+    /// off the end of the stack. `.SystemUIFont` is what the theme sets,
+    /// `.ZedSans` and `.ZedMono` are what gpui's own fallback stack names,
+    /// and "DejaVu Sans Mono" is gpui-component's default mono family here —
+    /// which no page has, so it is the one that proves the fallback chain
+    /// still lands somewhere rather than panicking.
+    #[test]
+    fn the_families_a_page_asks_for_all_resolve() {
+        let text_system = a_page_with_its_fonts();
+        for family in [".SystemUIFont", ".ZedSans", ".ZedMono", "DejaVu Sans Mono"] {
+            // `resolve_font` panics when nothing in the stack answers, which
+            // is the production failure itself rather than a proxy for it.
+            text_system.resolve_font(&gpui::font(family));
+        }
+    }
+
+    /// The other half, and the reason the module exists: with nothing added,
+    /// the very first family the window asks for takes the frame down. A
+    /// browser has no fonts to fall back to and gpui no longer brings any.
+    #[test]
+    #[should_panic(expected = "failed to resolve font")]
+    fn a_page_that_adds_no_fonts_cannot_draw_at_all() {
+        a_page_without_fonts().resolve_font(&gpui::font(".SystemUIFont"));
+    }
+
+    /// The failure in the screenshot, held as a test: a page carrying only
+    /// the two text families shapes an emoji to `.notdef`, which is the box
+    /// that was drawn where a chat's name had one.
+    #[test]
+    fn without_the_emoji_face_an_emoji_is_a_tofu_box() {
+        let drawn = glyphs(&a_page_with_its_fonts(), "\u{1f9ea}");
+        assert!(
+            drawn.iter().all(|&id| id == 0),
+            "IBM Plex Sans and Lilex are not supposed to cover emoji, but shaped {drawn:?}"
+        );
+    }
+
+    /// And the fix. Nothing configures a fallback for it: cosmic-text's own
+    /// iterator ends by walking every face in the database — the script and
+    /// common lists are empty on a target that is neither unix, macOS nor
+    /// Windows — so a face that is *loaded* is a face that answers.
+    #[test]
+    fn the_fetched_face_is_what_draws_an_emoji() {
+        let text_system = a_page_with_downloaded_fonts();
+        // A test tube, a flag (two regional indicators), a document and a
+        // tick: the four shapes the reported window had a box for.
+        for emoji in ["\u{1f9ea}", "\u{1f1e7}\u{1f1f7}", "\u{1f4c4}", "\u{2705}"] {
+            let drawn = glyphs(&text_system, emoji);
+            assert!(
+                !drawn.is_empty() && drawn.iter().all(|&id| id != 0),
+                "{emoji:?} still shapes to {drawn:?}"
+            );
+        }
+    }
+
+    /// The text around them is still Plex, which is the risk of a last-resort
+    /// fallback that covers punctuation and digits of its own: a face added
+    /// for emoji must not start answering for the Latin the page is written
+    /// in.
+    #[test]
+    fn the_fetched_face_does_not_take_over_ordinary_text() {
+        let plain = "Notes/Save 12:34";
+        assert_eq!(
+            glyphs(&a_page_with_its_fonts(), plain),
+            glyphs(&a_page_with_downloaded_fonts(), plain),
+            "the emoji face changed how ordinary text shapes"
+        );
+    }
+
+    /// The name the page fetches is the name the bundle copies in. Nothing
+    /// else connects the two: `web/index.html` names the file, trunk copies
+    /// it flat, and this string is what asks for it back.
+    #[test]
+    fn the_page_asks_for_the_file_the_bundle_carries() {
+        let index = include_str!("../../../../web/index.html");
+        assert!(
+            index.contains(EMOJI),
+            "web/index.html no longer copies {EMOJI} into the bundle"
+        );
+    }
+
+    /// Each file is a font, and each is the face its name claims: an empty or
+    /// truncated asset loads as a database with nothing in it, which the two
+    /// tests above would not notice as long as another bundled face was intact.
+    #[test]
+    fn every_bundled_face_is_a_font_on_its_own() {
+        for (name, bytes) in BUNDLED {
+            assert!(bytes.len() > 1024, "{name} is too small to be a font");
+            let text_system = a_page_without_fonts();
+            text_system
+                .add_fonts(vec![Cow::Borrowed(*bytes)])
+                .unwrap_or_else(|e| panic!("{name} did not load: {e}"));
+            let family = if name.starts_with("Lilex") {
+                "Lilex"
+            } else {
+                "IBM Plex Sans"
+            };
+            text_system.resolve_font(&gpui::font(family));
+        }
+    }
+    #[test]
+    fn downloaded_font_refreshes_cached_persian_and_preserves_context() {
+        use gpui::PlatformTextSystem as _;
+        #[derive(Default)]
+        struct Sink(std::sync::Mutex<Vec<gpui::MissingGlyph>>);
+        impl gpui::MissingGlyphSink for Sink {
+            fn report(&self, glyphs: Vec<gpui::MissingGlyph>) {
+                self.0.lock().unwrap().extend(glyphs);
+            }
+        }
+        let sink = Arc::new(Sink::default());
+        let backend = Arc::new(gpui_wgpu::CosmicTextSystem::new_without_system_fonts(
+            WEB_SYSTEM_FONT,
+        ));
+        backend.set_missing_glyph_sink(Some(sink.clone()));
+        let system = gpui::TextSystem::new(backend);
+        system
+            .add_fonts(BUNDLED.iter().map(|(_, b)| Cow::Borrowed(*b)).collect())
+            .unwrap();
+        let window = gpui::WindowTextSystem::new(Arc::new(system));
+        let text = "سلام فارسی";
+        assert!(glyphs(&window, text).contains(&0));
+        assert!(glyphs(&window, text).contains(&0));
+        let runs = [gpui::TextRun {
+            len: text.len(),
+            font: gpui::font(".SystemUIFont"),
+            ..Default::default()
+        }];
+        let wrapped_before = window
+            .shape_text(
+                text.into(),
+                gpui::px(16.0),
+                &runs,
+                Some(gpui::px(60.0)),
+                None,
+            )
+            .unwrap();
+        assert!(
+            wrapped_before
+                .iter()
+                .flat_map(|line| line.runs())
+                .flat_map(|run| &run.glyphs)
+                .any(|glyph| glyph.id.0 == 0)
+        );
+        let reported = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|g| g.grapheme().to_owned())
+            .collect::<Vec<_>>();
+        assert!(reported.iter().any(|g| g == "س"));
+        window.add_fonts(vec![Cow::Borrowed(ARABIC_FACE)]).unwrap();
+        let after = glyphs(&window, text);
+        assert!(!after.is_empty() && after.iter().all(|g| *g != 0));
+        let wrapped_after = window
+            .shape_text(
+                text.into(),
+                gpui::px(16.0),
+                &runs,
+                Some(gpui::px(60.0)),
+                None,
+            )
+            .unwrap();
+        assert!(
+            wrapped_after
+                .iter()
+                .flat_map(|line| line.runs())
+                .flat_map(|run| &run.glyphs)
+                .all(|glyph| glyph.id.0 != 0 && text.is_char_boundary(glyph.index))
+        );
+        println!("missing reports: {reported:?}; cached line after install: {after:?}");
+        let joined = glyphs(&window, "سلام");
+        let isolated = "سلام"
+            .chars()
+            .flat_map(|c| glyphs(&window, &c.to_string()))
+            .collect::<Vec<_>>();
+        println!("whole run {joined:?}; isolated letters {isolated:?}");
+        assert_ne!(
+            joined, isolated,
+            "independent characters must not substitute contextual shaping"
+        );
+    }
+}

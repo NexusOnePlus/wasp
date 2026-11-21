@@ -1,0 +1,360 @@
+# The web front end, built to a static bundle and published to GitHub Pages.
+#
+# The bundle needs no server to be *hosted*: it either attaches to an
+# `velod` the visitor runs themselves, or runs the whole client — session,
+# store and window — in the page.
+#
+# Two things are published from one branch, `gh-pages`:
+#
+#   /            main, the live site
+#   /pr/<n>/     one preview per open pull request, removed when it closes
+#
+# A preview shares the site's *origin*: an `Origin` is scheme, host and port,
+# and a path is none of those. That used to cost little, because the page held
+# nothing — the daemon's admission check is a token, and a token reaches a
+# page only by somebody pasting it, which is the same act as deciding to trust
+# that page.
+#
+# It costs more now. A page that runs its own session keeps the account in
+# origin-scoped storage, and origin-scoped storage does not know about
+# directories: code served under `/pr/<n>/` can read the deployed site's
+# database directly, credentials included, with no token anywhere in the way.
+# The published bundle refuses to *start* a session unless asked
+# (`#preview-session`), and that is worth having — but it is a guard against
+# somebody wandering in, not a boundary: a preview is built from its own
+# branch's source, so that branch's code is free to skip the check.
+#
+# What actually bounds it is who can publish one. Previews are same-repository
+# only (see the condition below), and opening such a branch already requires
+# push access — so preview code is written by someone who could put it on
+# `main`. Anyone who wants the two genuinely apart wants a second Pages site,
+# which is a second origin; a second directory can never be one.
+#
+# A branch rather than the Pages *artifact* deployment, because an artifact
+# replaces the whole site and there is no way to put a preview beside it. That
+# is a repository setting: Settings → Pages → Build and deployment → Deploy
+# from a branch → `gh-pages` / `(root)`.
+#
+# The branch is where the writing is decided; it is not where the *serving*
+# is. The publisher pushes and then sees the push through to what Pages
+# actually serves — see `--settle` and the note over `publish`.
+name: Pages
+
+on:
+  # Manual only: releases are published from a Windows machine with
+  # packaging/windows/build-release.ps1, and nothing here may create,
+  # replace or delete a release (or a site) on a push.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: Build
+    # A closed pull request has nothing to build; it only has a preview to
+    # take down.
+    if: github.event.action != 'closed' && github.event.action != 'converted_to_draft'
+    runs-on: ubuntu-latest
+    # On this job and not on the workflow, which is the distinction the note
+    # over `publish` is about. Cancelling a *build* costs nothing anyone
+    # wanted: a second push to a branch has already made the first bundle
+    # obsolete, and the run that would have published it is one `publish`
+    # stands down from anyway, by asking whether the head has moved. What must
+    # never be cancelled is `take-down`, which a pull request fires exactly
+    # once and which is the only thing that removes a preview — and it does not
+    # depend on this job, so nothing here can reach it.
+    #
+    # Worth the guard rather than left to the still-current check downstream:
+    # this build rebuilds `std` with `-Z build-std`
+    # and then optimizing a 28 MiB module, which is the longest single job in
+    # the repository. Finding out at the end that it was superseded four
+    # minutes in is a runner held for nothing, on the one job in this
+    # repository where "nothing" is measured in double-digit minutes.
+    concurrency:
+      group: pages-build-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Stable runs xtask. Only its shared-memory build child uses nightly:
+      # build-std and wasm_thread still require unstable features.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.100.0"
+      - name: Install nightly for the shared-memory web bundle
+        run: rustup toolchain install nightly-2026-10-29 --profile minimal --component rust-src --target wasm32-unknown-unknown
+
+      # The build script that embeds gpui-component's icons runs on the host,
+      # and `waproto` generates code with protoc — both are host builds even
+      # though the artifact is wasm.
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: protoc,trunk@0.22.1
+
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          # A separate cache from CI's: a different target, a different
+          # toolchain and a rebuilt std share nothing worth restoring.
+          # The root manifest's hash, for the reason spelled out over the
+          # `Check` job: the profiles live there, a profile decides every
+          # dependency's fingerprint, and rust-cache's automatic key does not
+          # hash that file.
+          key: pages-wasm-${{ hashFiles('Cargo.toml') }}
+          cache-on-failure: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Where this build will be served from, which the generated glue has to
+      # be told or it fetches the wasm from the account root and gets a 404.
+      # A preview lives one directory deeper than the site.
+      #
+      # One task for both jobs that ask it: this was the same `if`/`else`
+      # written twice, with one output key different between them.
+      - name: Work out where this will be served from
+        id: where
+        env:
+          PR_NUMBER: ${{ github.event.number }}
+        run: cargo xtask pages where
+
+      - name: Build the bundle
+        env:
+          PUBLIC_URL: ${{ steps.where.outputs.public_url }}
+        run: cargo xtask web build
+
+      # Proof the artifact is the one the page will ask for: trunk rewrites
+      # `index.html` to point at hashed file names, and a mismatch is a blank
+      # page rather than a failed build.
+      - name: Check the bundle is complete
+        run: cargo xtask bundle check web/dist
+
+      # The number a regression shows up in. Everything above proves the
+      # bundle is *complete*; nothing proved it was not twice the size it was
+      # last week, and a module a visitor downloads before the first pixel is
+      # the one measurement this build can take for free.
+      #
+      # Printed to the step summary rather than asserted against a threshold:
+      # a build that fails because a legitimate feature cost 200 KB teaches
+      # people to raise the number, and the useful signal is the trend beside
+      # the diff that caused it.
+      - name: Say how big it came out
+        run: cargo xtask bundle size web/dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bundle
+          path: web/dist
+          # Failed-job reruns reuse the original build's upload. Keep it long
+          # enough for recovery; after expiry rerun all jobs to rebuild it.
+          retention-days: 14
+          if-no-files-found: error
+
+  # No concurrency group, deliberately. Actions concurrency is not a queue:
+  # `cancel-in-progress: false` protects the job that is running, and a third
+  # member joining cancels the one that was pending — which for a preview's
+  # single close event means it is never taken down at all. The serialization
+  # lives in `xtask pages` instead, as a `--force-with-lease` against the tip
+  # it read, retried against the new one. Two publishes racing cost a
+  # retry; none of them cost a lost update, and nothing is ever cancelled for
+  # having waited.
+  #
+  # What that leaves — and what `--settle` below is about — is that a write to
+  # the branch is not a deployment. Every push starts a run of GitHub's own
+  # `pages build and deployment`, which is not in this repository and refuses
+  # to create a deployment while another is in flight ("Deployment request
+  # failed ... due to in progress deployment"). Two writers landing seconds
+  # apart is the ordinary case here — a pull request closing takes its preview
+  # down while the merge that closed it publishes the site — so the second one
+  # is refused, and the branch is then carrying a tree nothing will ever
+  # serve. Re-running that run does not put it right and makes the log worse:
+  # its build job uploads a second `github-pages` artifact into the same run
+  # and the deploy job then refuses with "Multiple artifacts named
+  # github-pages were unexpectedly found", one step removed from the collision
+  # underneath it.
+  publish:
+    name: Publish
+    needs: build
+    # Same-repository only. A pull request from a fork is given a read-only
+    # token, and the way around that — `pull_request_target` — runs the base
+    # branch's workflow with write access against the fork's code, which is
+    # how a preview becomes a supply-chain hole. A fork's build still runs;
+    # it just has nowhere to publish to.
+    if: |
+      github.event.action != 'closed' &&
+      !github.event.pull_request.draft &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name == 'pull_request' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    # `pages: write` on top of the push, and it is not a second way to
+    # deploy. A write to `gh-pages` is picked up by GitHub's own
+    # `pages build and deployment` run, which is not in this repository and
+    # refuses to create a deployment while another is in flight — the
+    # ordinary case here, since the lease is exactly what puts two writers'
+    # pushes seconds apart. This is what lets `--settle` ask that pipeline
+    # whether it served us, and ask it for a build when it did not.
+    permissions:
+      contents: write
+      pages: write
+    steps:
+      # From the revision being published, and pinning it to the base branch
+      # would not buy what it looks like it buys.
+      #
+      # This job holds `contents: write` and the code it runs comes from the
+      # pull request — but so does *this file*. A `pull_request` run uses the
+      # workflow from the merge ref, so anyone who could rewrite the publisher
+      # to ignore its target could equally rewrite the job that calls it; that
+      # is the whole reason `pull_request_target` exists and the whole reason
+      # it is not used here. Pinning it to the base would move the problem,
+      # not close it, and it also cannot work: code added *by* a pull request
+      # is not on the base branch yet, which is exactly how this was found.
+      #
+      # What bounds it is who can open such a branch. A fork can be opened by
+      # anyone, gets a read-only token, and is refused by the guard above; a
+      # same-repository branch already required push access, which is the
+      # ability to change this file directly and without a pull request.
+      #
+      # Only the publisher, too: this job builds nothing of the client, and a
+      # full checkout would just be another tree to keep out of the way of the
+      # branch it is about to rewrite. That `xtask/` alone is enough to build
+      # is why it carries its own `[workspace]` and no dependencies — a member
+      # of the root workspace would make cargo resolve eight git dependencies
+      # before it could compile a binary that needs none of them.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: xtask
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.100.0"
+
+      - name: Work out where this goes
+        id: where
+        env:
+          PR_NUMBER: ${{ github.event.number }}
+        run: cargo run --quiet --manifest-path xtask/Cargo.toml -- pages where
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle
+          path: bundle
+
+      # `--check still-current` is "is this still worth publishing?", asked
+      # again before every attempt at the branch.
+      #
+      # Two different questions hide in it and both need asking more than
+      # once. Builds run in parallel, so the order two runs reach this job is
+      # the order their *builds* finished rather than the order their commits
+      # were pushed — a slower older build would otherwise replace the live
+      # site. And a pull request can close while a publish is in flight, in
+      # which case the preview has already been taken down and this run would
+      # put it back. A step that answered once could not close either window:
+      # the gap is between the answer and the push, which is why the question
+      # lives inside the retry loop rather than in front of it.
+      - name: Publish to gh-pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          cargo run --quiet --manifest-path xtask/Cargo.toml -- pages publish \
+            --target '${{ steps.where.outputs.target }}' \
+            --ordinal '${{ github.run_number }}' \
+            --check still-current \
+            --settle
+
+      # If the pull request closed or became draft while publishing, undo it.
+      #
+      # The check above runs before every attempt at the branch, and that
+      # still leaves one gap it cannot close: a preview being published for
+      # the *first* time has nothing on `gh-pages` yet, so the close job finds
+      # nothing to remove and exits without touching the branch — which means
+      # it does not invalidate our lease either, and the push that follows
+      # publishes a preview for a pull request nobody will ever close again.
+      #
+      # A lease cannot help there, because the two jobs are not both writing.
+      # So this is a compensation rather than a guard: publish, ask again, and
+      # take it back down if the answer changed. Either order converges — if
+      # the close job runs after us it finds the preview and removes it, and
+      # if it ran before us we remove it here. The three-way reading that
+      # decides — open, superseded, closed — and the refusal to read a broken
+      # check as any of them are in `xtask`, where they are a `match` on an
+      # enum rather than a `case` on an exit code.
+      - name: Take it down again if the pull request closed or became draft
+        id: undone
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          cargo run --quiet --manifest-path xtask/Cargo.toml -- pages undo-if-closed \
+            --target '${{ steps.where.outputs.target }}' \
+            --ordinal '${{ github.run_number }}' \
+            --settle
+
+      - name: Say where it is
+        if: github.event_name == 'pull_request' && steps.undone.outputs.removed != 'true'
+        run: |
+          {
+            echo "### Web preview"
+            echo ""
+            echo "${{ steps.where.outputs.url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # A preview is only worth having if it goes away. The directory is removed
+  # when the pull request closes or returns to draft.
+  take-down:
+    name: Take the preview down
+    # Same-repository only, matching `publish` above: a fork's pull request
+    # never had a preview to remove, and a fork-triggered job is handed a
+    # read-only token — so this would spend its retries pushing a branch it
+    # cannot write and end red on somebody else's contribution closing. The
+    # removal claims its ordinal whether or not it finds a directory, which
+    # makes the push unconditional and this condition load-bearing rather
+    # than tidy.
+    if: |
+      github.event_name == 'pull_request' &&
+      (github.event.action == 'closed' || github.event.action == 'converted_to_draft') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    # `pages: write` for the same reason as `publish`, and it matters most
+    # here: a pull request closes once. A removal whose deployment is refused
+    # has no second event to put it right, and the preview stays live for
+    # good — which is what `--settle` is for.
+    permissions:
+      contents: write
+      pages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: xtask
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.100.0"
+
+      # `--check still-closed` is re-asked before every attempt at the branch,
+      # exactly as publication re-asks the opposite. A pull request reopened
+      # while this job is still running has a `reopened` run publishing its
+      # preview behind us, and an unconditional removal would then delete a
+      # preview that is wanted — with no further event left to put it back.
+      - name: Remove the preview
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.number }}
+        run: |
+          cargo run --quiet --manifest-path xtask/Cargo.toml -- pages remove \
+            --target 'pr/${{ github.event.number }}' \
+            --ordinal '${{ github.run_number }}' \
+            --check still-closed \
+            --settle

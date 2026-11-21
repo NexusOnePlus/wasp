@@ -1,0 +1,53 @@
+[package]
+name = "velo-core"
+description = "Front-end-agnostic domain types: chats, messages, calls, UI events"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Synthetic chats and messages for the tests of the crates above this one.
+# Additive and off by default: it adds a module and changes no existing type,
+# which is what keeps this crate publishable to its embedders.
+fixtures = []
+
+[dependencies]
+async-trait = { workspace = true }
+
+# Only for the call-state transitions, which refuse a second offer and say so.
+log = { workspace = true }
+# `serde` on chrono: message and chat timestamps cross the daemon socket.
+chrono = { workspace = true, features = ["std", "clock", "serde"] }
+# These types are the daemon's wire format as well as its domain model: a
+# front end in another process receives `UiEvent` itself rather than a
+# parallel set of protocol structs that would have to be kept in step.
+serde = { workspace = true }
+phonenumber = "0.3.10"
+wacore = { workspace = true }
+wacore-binary = { workspace = true }
+
+# Not used by this crate: named so the backend `wacore` needs on the web is
+# enabled for the whole graph. `velo-core` is the crate everything else
+# depends on, which makes it the one place that reaches all of them.
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom_02 = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# The call snapshot crosses the daemon socket; the round trip is a test.
+serde_json = { workspace = true, features = ["std"] }
+
+# Exercise the actual build-time visitor against all runtime regex categories.
+# The backend already uses this dependency; this edge is test-only.
+[dev-dependencies.regex]
+version = "1.7"
+
+[[test]]
+name = "phone_metadata_build"
+path = "../../vendor/phonenumber/build.rs"

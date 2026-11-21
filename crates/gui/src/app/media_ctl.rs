@@ -1,0 +1,2361 @@
+//! Playback and download of message media.
+//!
+//! Audio, video and image share one owner because they compete for the same
+//! output device and the same "what is playing right now" slot.
+
+use super::*;
+use gpui::AppContext as _;
+use velo_core::MediaType;
+
+/// A voice note whose expensive preparation is running off the UI executor.
+///
+/// The position and intent are captured here rather than read from
+/// `AudioPlayer` when a later speed click arrives: the native player has no
+/// loaded samples while preparation is in flight, so reading it would reset a
+/// rapid 1x -> 1.5x -> 2x sequence to the beginning.
+pub(super) struct PendingAudioPreparation {
+    message_id: String,
+    source: Arc<Vec<u8>>,
+    epoch: usize,
+    position: f32,
+    was_playing: bool,
+}
+
+impl PendingAudioPreparation {
+    fn matches(&self, message_id: &str, epoch: usize) -> bool {
+        self.epoch == epoch && self.message_id == message_id
+    }
+
+    fn resume_snapshot(&self) -> (f32, bool) {
+        (self.position, self.was_playing)
+    }
+
+    /// Toggle the saved intent and return it when the browser player has
+    /// already accepted the clip and is still decoding it.
+    fn toggle_playback(&mut self, player_loading: bool) -> Option<bool> {
+        self.was_playing = !self.was_playing;
+        player_loading.then_some(self.was_playing)
+    }
+
+    /// Update the saved seek position and return it when the player can bank
+    /// the seek while its browser decode is in flight.
+    fn seek(&mut self, fraction: f32, player_loading: bool) -> Option<f32> {
+        self.position = fraction.clamp(0.0, 1.0);
+        player_loading.then_some(self.position)
+    }
+}
+
+fn audio_receipt_chat(chats: &[Arc<Chat>], id: &str) -> Option<String> {
+    let mut rows = chats.iter().flat_map(|chat| {
+        chat.messages
+            .iter()
+            .filter(move |message| message.id == id)
+            .map(move |message| (chat, message))
+    });
+    let (chat, message) = rows.next()?;
+    (!message.is_from_me && rows.next().is_none()).then(|| chat.jid.clone())
+}
+
+fn media_identity(data: &Arc<Vec<u8>>) -> usize {
+    Arc::as_ptr(data) as usize
+}
+
+impl WhatsAppApp {
+    /// Let go of the media the conversations are holding beyond their share.
+    ///
+    /// A message keeps its bytes for as long as its row is loaded, and the
+    /// two media budgets that exist bound what is *cached* rather than what
+    /// this window is retaining — so a window open for a week grows by every
+    /// photo it has ever drawn, and a tab does it against a linear memory
+    /// with a ceiling. `Chat::release_media` is the arithmetic; what is here
+    /// is the judgement, because a viewport is a front end's and belongs
+    /// nowhere near `velo-core`.
+    ///
+    /// The judgement is two answers. **Which conversation the reader is in** —
+    /// one at a time, and every other one is holding bytes nobody can see, so
+    /// its allowance is nothing. That is [`Self::retained_chat`] rather than
+    /// [`Self::visible_chat`]: the frame reports no conversation whenever
+    /// Settings is up, the destination is Status, the viewer is open or the
+    /// window is too narrow to draw a chat area, and none of those means the
+    /// reader has left the conversation — sweeping on them emptied the very
+    /// album somebody had just opened.
+    ///
+    /// And **what the interface is holding open**: what is playing, what the
+    /// viewer is showing, the status update on screen, and whatever a
+    /// download is on its way to keep their bytes whatever the budget says,
+    /// because releasing those is not eviction — it is taking something away
+    /// from somebody looking at it. The fullscreen viewer is stronger still:
+    /// it walks a chat's pictures with the arrow keys, and a released row
+    /// leaves that album, so nothing is swept while it is up.
+    ///
+    /// Inside the retained conversation the newest rows keep their bytes and
+    /// the rest let go, which is coarser than a viewport: gpui's list hands
+    /// no visible range out of its render pass, so what is on screen is not
+    /// something this window can ask. A row released out from under a reader
+    /// who has scrolled up into an album draws the offer to download that the
+    /// renderer already draws for media the daemon never cached, and the
+    /// press that accepts it fetches — which is the whole reason the policy
+    /// is allowed to be coarse.
+    pub(super) fn sweep_retained_media(&mut self, cx: &mut App) {
+        self.sweep_retained_media_keeping(None, cx);
+    }
+
+    /// The same, with one more row nothing may take.
+    ///
+    /// For the download that has just landed: the bytes arrive into a row the
+    /// reader asked for by pressing on it, and the request that named it may
+    /// already have been cleared by the time they do.
+    pub(super) fn sweep_retained_media_keeping(&mut self, also: Option<&str>, cx: &mut App) {
+        // A viewer open is a reader walking one chat's pictures; see above.
+        if self.viewer.read(cx).showing().is_some() {
+            return;
+        }
+
+        let budget = velo_core::RETAINED_MEDIA_BUDGET_BYTES as usize;
+        let retained = self.retained_chat.clone();
+        // The rows nothing may take: cloned rather than borrowed because the
+        // predicate below runs while `chats` is borrowed mutably.
+        let open: Vec<String> = [
+            self.active_media.message_id().map(str::to_string),
+            self.pending_media_request.clone(),
+            self.status_pane.shown().map(str::to_string),
+            also.map(str::to_string),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        let mut released_rows: Vec<String> = Vec::new();
+        let mut touched: Vec<String> = Vec::new();
+        for chat in &mut self.chats {
+            let allowance = if retained.as_deref() == Some(chat.jid.as_str()) {
+                budget
+            } else {
+                0
+            };
+
+            // A successful preview may already have been released by the
+            // active chat's budget. Rearm it only after leaving that chat;
+            // failed/pending attempts must not become network retries.
+            if allowance == 0 {
+                for message in &chat.messages {
+                    if message
+                        .media
+                        .as_ref()
+                        .is_some_and(|media| media.data.is_empty())
+                    {
+                        let key = (chat.jid.clone(), message.id.clone());
+                        if self.channel_preview_attempts.get(&key) == Some(&true) {
+                            self.channel_preview_attempts.remove(&key);
+                        }
+                    }
+                }
+            }
+
+            // Whether there is anything to do, read before anything is
+            // written: writing means `Arc::make_mut`, and a chat shared with
+            // a frame in flight is a whole conversation copied. The
+            // conversation being read is *designed* to sit under its
+            // allowance, so asking only whether it holds releasable bytes
+            // would buy that copy on every message it receives.
+            let mut held = 0usize;
+            let over = chat.messages.iter().rev().any(|message| {
+                let Some(media) = message.media.as_ref() else {
+                    return false;
+                };
+                held = held.saturating_add(media.data.len());
+                media.is_releasable() && held > allowance && !open.contains(&message.id)
+            });
+            if !over {
+                continue;
+            }
+
+            let released = std::sync::Arc::make_mut(chat)
+                .release_media(allowance, |message| open.contains(&message.id));
+            if released.is_empty() {
+                continue;
+            }
+            debug!(
+                "released {} bytes of media across {} rows of {}",
+                released.bytes,
+                released.rows.len(),
+                chat.jid
+            );
+            // A successful payload evicted when leaving a conversation may
+            // be restored through the daemon's cache-first download path on
+            // return. Failed attempts release no bytes and stay suppressed.
+            // Keep the marker for budget eviction within the active chat:
+            // otherwise a visible old row could fetch/evict on every repaint.
+            if allowance == 0 {
+                for id in &released.rows {
+                    let key = (chat.jid.clone(), id.clone());
+                    if self.channel_preview_attempts.get(&key) == Some(&true) {
+                        self.channel_preview_attempts.remove(&key);
+                    }
+                }
+            }
+            touched.push(chat.jid.clone());
+            released_rows.extend(released.rows);
+        }
+
+        // Whoever takes a row's bytes away has to take what was decoded from
+        // them too: the picture cache is keyed by message id and holds the
+        // `Arc<Image>` gpui tracks animation against, so an entry left behind
+        // is the very thing this was trying to stop holding.
+        if !released_rows.is_empty() {
+            let mut decoded = self.decoded_images.borrow_mut();
+            for id in &released_rows {
+                decoded.shift_remove(id);
+            }
+            let mut validation = self.sticker_validation.borrow_mut();
+            for id in &released_rows {
+                validation.shift_remove(id);
+            }
+        }
+        for jid in touched {
+            self.invalidate_message_cache(&jid, cx);
+        }
+    }
+
+    /// Update a message's media data (used to cache downloaded media)
+    fn update_message_media_data(&mut self, message_id: &str, data: Arc<Vec<u8>>, cx: &mut App) {
+        self.update_chat_media_data(None, message_id, data, false, cx);
+    }
+
+    fn update_chat_media_data(
+        &mut self,
+        chat_jid: Option<&str>,
+        message_id: &str,
+        data: Arc<Vec<u8>>,
+        preview: bool,
+        cx: &mut App,
+    ) {
+        // Locate the owning chat through shared references first. Calling
+        // `Arc::make_mut` while scanning used to clone every chat in the
+        // window, including unrelated conversations, whenever one download
+        // completed. Only the target chat needs to become mutable.
+        let Some(chat_index) = self.chats.iter().position(|chat| {
+            chat_jid.is_none_or(|jid| chat.jid == jid)
+                && chat.messages.iter().any(|message| message.id == message_id)
+        }) else {
+            return;
+        };
+        let mut touched: Option<String> = None;
+        {
+            let chat = std::sync::Arc::make_mut(&mut self.chats[chat_index]);
+            if let Some(msg) = chat.messages.iter_mut().find(|m| m.id == message_id)
+                && let Some(ref mut media) = msg.media
+            {
+                // Bytes and the metadata that describes them, together:
+                // decoding a WebP sticker as the `image/jpeg` its poster
+                // frame claimed fails every time.
+                if preview {
+                    media.adopt_server_preview(data);
+                } else {
+                    media.adopt_full_bytes(data);
+                }
+                info!("Cached media data for message {}", message_id);
+                touched = Some(chat.jid.clone());
+            }
+        }
+        if touched.is_some() {
+            // Drop any render-cached image built from the old bytes.
+            self.decoded_images.borrow_mut().shift_remove(message_id);
+            self.sticker_validation
+                .borrow_mut()
+                .shift_remove(message_id);
+        }
+
+        // Through the shared invalidation rather than by poking one cache:
+        // the message list is not the only thing derived from these messages,
+        // and the status feed — which is — went on serving the version with no
+        // bytes in it, so a downloaded update stayed "cannot be shown".
+        if let Some(jid) = touched {
+            self.invalidate_message_cache(&jid, cx);
+            // This is the other path that adds bytes, and the one that adds
+            // them deliberately: a reader working back through an album,
+            // pressing download on picture after picture, passes the
+            // allowance with no message arriving to notice. The row that
+            // just landed is what the press was for, so it is what the sweep
+            // may not take — the request that named it is often already
+            // cleared by the time the bytes arrive.
+            self.sweep_retained_media_keeping(Some(message_id), cx);
+        }
+    }
+    /// Preserve a successful short play before a user switch clears its evidence.
+    pub(super) fn stop_user_media(&mut self) {
+        self.observe_audio_playback();
+        self.stop_current_media();
+    }
+
+    /// Discard playback during teardown or failed preparation, without notifying the UI.
+    pub(super) fn stop_current_media(&mut self) {
+        self.stop_media_with_poster(true);
+    }
+
+    pub(super) fn stop_hidden_media(&mut self) {
+        self.stop_media_with_poster(false);
+    }
+
+    fn stop_media_with_poster(&mut self, poster: bool) {
+        self.audio_player.stop();
+        // A stopped tick may still be between its sleep and `entity.update`.
+        // Drop the handle before a new preparation starts; otherwise the new
+        // playback sees `Some` and refuses to install its own repaint loop,
+        // while the old task can then clear the slot underneath it.
+        self.playback_tick = None;
+        // Invalidate and forget any native preparation that is still running.
+        // The detached worker may finish later, but its epoch no longer names
+        // the media sink and its result must be dropped.
+        self.audio_preparation = None;
+        // Name and bytes together, always: this is the whole reason they are
+        // one field.
+        self.audio = AudioHolder::None;
+        // An in-flight lazy download for the stopped media must not autoplay
+        // when it completes; user-initiated requests re-set this after the stop.
+        self.pending_media_request = None;
+
+        if let ActiveMedia::Video { message_id } = &self.active_media {
+            if let Some(player) = self.video_players.get_mut(message_id) {
+                if poster {
+                    player.stop();
+                } else {
+                    player.stop_hidden();
+                }
+            }
+            self.video_update_task = None;
+        }
+
+        self.active_media = ActiveMedia::None;
+        // Whatever was playing is over, so any completion still in flight for
+        // it describes a playback that no longer exists. Bumped here rather
+        // than where each playback starts, because every start goes through
+        // this and "stopped" is exactly when an outstanding completion stops
+        // meaning anything.
+        self.playback_epoch = self.playback_epoch.wrapping_add(1);
+    }
+
+    /// Keep an in-flight download, but revoke playback that has not begun
+    /// when its conversation is hidden. A note already playing may continue
+    /// while its listener browses; a worker still preparing its first samples
+    /// must not start sound behind the chat list, Settings, or Status.
+    pub(super) fn cancel_hidden_media_autoplay(&mut self) {
+        if self.audio_preparation.is_some() {
+            self.stop_user_media();
+        } else {
+            self.pending_media_request = None;
+        }
+    }
+    /// Get the currently playing audio message ID (if audio is playing)
+    pub fn playing_message_id(&self) -> Option<&str> {
+        match &self.active_media {
+            // `is_active`, which is the same question [`Self::toggle_audio`]
+            // asks — and they have to be the same question or the control
+            // lies about what tapping it does. `is_playing` is false for the
+            // whole of a decode, so a note the browser had accepted but not
+            // yet started drew a Play icon while the tap behind it went to
+            // `pause()`: the second tap on a control that looked idle was
+            // what stopped the note from ever starting.
+            //
+            // A paused note still renders as paused, which is what this was
+            // gated for: `is_active` is playing *or on its way*, and a pause
+            // during a decode sets `pending_pause`, which takes it out. Native
+            // preparation has the same gap, so use its captured intent until
+            // the stream is installed.
+            ActiveMedia::Audio { message_id }
+                if self.audio_player.is_active()
+                    || self.audio_preparation.as_ref().is_some_and(|pending| {
+                        pending.message_id == *message_id && pending.was_playing
+                    }) =>
+            {
+                Some(message_id)
+            }
+            _ => None,
+        }
+    }
+    /// Which clip the player currently holds, playing or paused.
+    ///
+    /// Distinct from [`Self::playing_message_id`], which is gated on the
+    /// stream: progress belongs to whichever note is *loaded*, so a paused
+    /// bubble keeps its position instead of snapping back to zero.
+    pub fn audio_owner(&self) -> Option<&str> {
+        self.audio.message_id()
+    }
+
+    /// How far through the loaded voice note playback is, in `0.0..=1.0`.
+    pub fn audio_progress(&self) -> f32 {
+        self.audio_player.progress()
+    }
+
+    /// Seconds played of the loaded voice note.
+    pub fn audio_elapsed_secs(&self) -> f32 {
+        self.audio_player.elapsed_secs()
+    }
+
+    pub fn audio_total_secs(&self) -> f32 {
+        self.audio_player.total_secs()
+    }
+
+    /// Whether this voice note is being decoded or re-timed off the UI thread.
+    ///
+    /// The message bubble uses this separately from `is_downloading`: bytes
+    /// may already be local while the native player is still preparing them.
+    pub fn is_audio_preparing(&self, message_id: &str) -> bool {
+        self.audio_preparation
+            .as_ref()
+            .is_some_and(|pending| pending.message_id == message_id)
+            || (self.audio.message_id() == Some(message_id) && self.audio_player.is_loading())
+    }
+
+    /// Jump to `fraction` of the way through the loaded voice note.
+    ///
+    /// Playback continues from there rather than restarting, which is what
+    /// makes the waveform a scrub bar and not a progress read-out.
+    pub fn seek_audio(&mut self, message_id: &str, fraction: f32, cx: &mut Context<Self>) {
+        if let Some(pending) = self
+            .audio_preparation
+            .as_mut()
+            .filter(|pending| pending.message_id == message_id)
+        {
+            let seek = pending.seek(fraction, self.audio_player.is_loading());
+            if let Some(position) = seek {
+                self.audio_player.seek(position);
+            }
+            cx.notify();
+            return;
+        }
+        // Named, not merely "something is loaded": every downloaded voice note
+        // draws a scrubbable waveform, and an unnamed seek let a click on one
+        // row move the position of whichever clip happened to be loaded.
+        if self.audio.message_id() != Some(message_id) {
+            return;
+        }
+        // A clip that ran to its end still owns an open stream, so rewinding
+        // its position alone would replay the audio with the UI insisting
+        // nothing is playing and no completion left to fire. Scrubbing a
+        // finished note means playing it again from the bytes still held.
+        if self.audio_player.is_finished()
+            && let Some(bytes) = self.audio.note_source(message_id)
+        {
+            // A finished stream must be rebuilt before it can seek. Keep the
+            // requested fraction in the pending snapshot so the worker's
+            // completion cannot reset a scrub to zero.
+            self.begin_audio_preparation(message_id.to_string(), bytes, fraction, true, cx);
+            return;
+        }
+        self.audio_player.seek(fraction);
+        self.ensure_playback_tick(cx);
+        cx.notify();
+    }
+
+    /// The current playback speed.
+    pub fn playback_speed(&self) -> f32 {
+        self.playback_speed
+    }
+
+    /// Step to the next speed, wrapping at the end.
+    ///
+    /// The chosen speed outlives the clip: someone who listens at 1.5× means
+    /// it for the next note too.
+    ///
+    /// The samples are re-timed when a clip is prepared, so a change while one
+    /// is playing has to prepare it again — from the bytes kept for exactly
+    /// this, and resumed where the listener was rather than from the top.
+    pub fn cycle_playback_speed(&mut self, cx: &mut Context<Self>) {
+        use crate::components::message_bubble::SPEEDS;
+        let next = SPEEDS
+            .iter()
+            .position(|s| (s - self.playback_speed).abs() < f32::EPSILON)
+            .map_or(0, |ix| (ix + 1) % SPEEDS.len());
+        self.playback_speed = SPEEDS[next];
+
+        // A preparation has no loaded samples on the native player yet, so
+        // `progress()` would report zero. Reuse the pending snapshot instead;
+        // this is what makes rapid 1x -> 1.5x -> 2x changes resume at the
+        // original position rather than jumping back to the start.
+        let pending = self.audio_preparation.as_ref().map(|pending| {
+            (
+                pending.message_id.clone(),
+                Arc::clone(&pending.source),
+                pending.position,
+                pending.was_playing,
+            )
+        });
+        let loaded = self
+            .audio
+            .message_id()
+            .map(str::to_owned)
+            .and_then(|message_id| {
+                let source = self.audio.note_source(&message_id)?;
+                Some((
+                    message_id,
+                    source,
+                    self.audio_player.progress(),
+                    self.audio_player.is_active(),
+                ))
+            });
+
+        if let Some((message_id, source, position, was_playing)) = pending.or(loaded) {
+            self.begin_audio_preparation(message_id, source, position, was_playing, cx);
+        } else {
+            // No voice note is loaded (for example, a video soundtrack owns
+            // the sink), so keep the preference for the next voice note.
+            self.audio_player.set_speed(self.playback_speed);
+        }
+        cx.notify();
+    }
+
+    /// Repaint while audio plays, so the playhead and clock advance.
+    ///
+    /// Position is read from the player rather than counted here, so a late
+    /// or dropped frame costs smoothness and never accuracy. Stops as soon as
+    /// nothing is playing — or is *about* to be: on the web a clip is handed
+    /// to the browser to decode and `play` returns before there is any sound,
+    /// so a tick that asked only whether audio was playing ended on its first
+    /// pass and left the button, the clock and the waveform frozen for the
+    /// whole note. `is_loading` is that gap, and it is false everywhere the
+    /// decoder is synchronous.
+    fn observe_audio_playback(&mut self) {
+        if !self.audio_player.take_started() {
+            return;
+        }
+        let ActiveMedia::Audio { message_id } = &self.active_media else {
+            return;
+        };
+        let Some(chat) = audio_receipt_chat(&self.chats, message_id) else {
+            return;
+        };
+        if let Some(client) = &self.client {
+            client.mark_audio_played(chat, message_id.clone());
+        }
+    }
+
+    pub(super) fn ensure_playback_tick(&mut self, cx: &mut Context<Self>) {
+        if self.playback_tick.is_some() {
+            return;
+        }
+        let epoch = self.playback_epoch;
+        let account = self.client.as_ref().map(|client| client.account());
+        self.playback_tick = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            loop {
+                // ~15fps: the playhead only has to look continuous, and a
+                // voice note is not worth a frame-rate repaint of the list.
+                crate::platform::sleep(std::time::Duration::from_millis(66)).await;
+                let running = entity.update(cx, |app, cx| {
+                    if app.playback_epoch != epoch
+                        || app.client.as_ref().map(|client| client.account()) != account
+                    {
+                        return false;
+                    }
+                    // The browser's `play_prepared` returns before
+                    // decodeAudioData resolves. Once that promise lands the
+                    // player no longer needs the app-level snapshot; while it
+                    // is pending, speed changes must continue reading the
+                    // saved position instead of the player's zero duration.
+                    if !app.audio_player.is_loading() {
+                        app.audio_preparation = None;
+                    }
+                    app.observe_audio_playback();
+                    let playing = app.audio_player.is_playing();
+                    if playing {
+                        cx.notify();
+                    }
+                    playing || app.audio_player.is_loading()
+                });
+                match running {
+                    Ok(true) => continue,
+                    Ok(false) | Err(_) => break,
+                }
+            }
+            let _ = entity.update(cx, |app, _| {
+                if app.playback_epoch == epoch {
+                    app.playback_tick = None;
+                }
+            });
+        }));
+    }
+
+    /// Get the currently playing video message ID (if video is playing)
+    pub fn playing_video_id(&self) -> Option<&str> {
+        match &self.active_media {
+            ActiveMedia::Video { message_id } => Some(message_id),
+            _ => None,
+        }
+    }
+
+    /// Queue decode, output conversion and time-stretching on GPUI's worker.
+    ///
+    /// Only the final CPAL/WebAudio installation returns to the entity thread.
+    /// Every request receives a fresh epoch, so a stopped note, a different
+    /// message, or a newer speed change can safely leave its worker running
+    /// until it naturally returns without letting it steal the sink.
+    fn begin_audio_preparation(
+        &mut self,
+        message_id: String,
+        source: Arc<Vec<u8>>,
+        position: f32,
+        was_playing: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.stop_user_media();
+        self.pending_media_request = Some(message_id.clone());
+        self.audio_player.set_speed(self.playback_speed);
+        // On the web this must happen synchronously while the click still has
+        // transient user activation. Native unlock is intentionally a no-op.
+        self.audio_player.unlock();
+        self.audio = AudioHolder::Note {
+            message_id: message_id.clone(),
+            source: Arc::clone(&source),
+        };
+        self.active_media = ActiveMedia::Audio {
+            message_id: message_id.clone(),
+        };
+
+        let epoch = self.playback_epoch;
+        let speed = self.playback_speed;
+        self.audio_preparation = Some(PendingAudioPreparation {
+            message_id: message_id.clone(),
+            source: Arc::clone(&source),
+            epoch,
+            position: position.clamp(0.0, 1.0),
+            was_playing,
+        });
+
+        // Install the completion sender before the worker starts. Native
+        // playback consumes it when its stream starts; the web backend keeps
+        // it through its asynchronous decode.
+        let completion_rx = self.audio_player.on_complete();
+        let bytes = (*source).clone();
+        let preparation = cx.background_spawn(async move { AudioPlayer::prepare(bytes, speed) });
+        let completed_id = message_id;
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let prepared = preparation.await;
+            let _ = entity.update(cx, |app, cx| {
+                let Some(pending) = app.audio_preparation.as_ref() else {
+                    return;
+                };
+                if !pending.matches(&completed_id, epoch) {
+                    return;
+                }
+                let pending = app
+                    .audio_preparation
+                    .take()
+                    .expect("audio preparation checked immediately above");
+
+                match prepared {
+                    Ok(prepared) => match app.audio_player.play_prepared(prepared) {
+                        Ok(()) => {
+                            // `play_prepared` starts at zero. Restore the
+                            // snapshot captured before the worker began, then
+                            // put a paused note back down if needed.
+                            let (position, was_playing) = pending.resume_snapshot();
+                            let keep_snapshot = app.audio_player.is_loading();
+                            if keep_snapshot {
+                                // WebAudio has accepted the bytes but is still
+                                // decoding them. Keep the snapshot until the
+                                // playback tick observes that decode complete.
+                                app.audio_preparation = Some(pending);
+                            }
+                            app.audio_player.seek(position);
+                            if !was_playing {
+                                app.audio_player.pause();
+                            }
+                            app.ensure_playback_tick(cx);
+
+                            let completed_id = completed_id.clone();
+                            let completion_epoch = app.playback_epoch;
+                            cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+                                let _ = completion_rx.await;
+                                let _ = entity.update(cx, |app, cx| {
+                                    if app.playback_epoch == completion_epoch
+                                        && app.active_media.is_playing(&completed_id)
+                                    {
+                                        app.observe_audio_playback();
+                                        app.active_media = ActiveMedia::None;
+                                        info!("Audio playback completed");
+                                        cx.notify();
+                                    }
+                                });
+                            })
+                            .detach();
+                        }
+                        Err(error) => {
+                            error!("Failed to start prepared audio: {error}");
+                            app.notify_user(
+                                crate::tr!(audio_start_failed, error),
+                                crate::app::notices::Tone::Problem,
+                                cx,
+                            );
+                            app.stop_current_media();
+                            cx.notify();
+                        }
+                    },
+                    Err(error) => {
+                        error!("Failed to prepare audio: {error}");
+                        app.notify_user(
+                            crate::tr!(audio_prepare_failed, error),
+                            crate::app::notices::Tone::Problem,
+                            cx,
+                        );
+                        app.stop_current_media();
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn play_audio(&mut self, message_id: String, audio_data: Vec<u8>, cx: &mut Context<Self>) {
+        self.begin_audio_preparation(message_id, Arc::new(audio_data), 0.0, true, cx);
+    }
+    /// Toggle play/pause for the current audio
+    pub fn toggle_audio(
+        &mut self,
+        message_id: String,
+        audio_data: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pending) = self
+            .audio_preparation
+            .as_mut()
+            .filter(|pending| pending.message_id == message_id)
+        {
+            // A native preparation has no stream to pause yet, so completion
+            // will honour the updated snapshot. WebAudio has already accepted
+            // the clip while its decode is pending; forward the same intent so
+            // the player applies it as soon as the buffer arrives.
+            if let Some(should_play) = pending.toggle_playback(self.audio_player.is_loading()) {
+                if should_play {
+                    self.audio_player.resume();
+                } else {
+                    self.audio_player.pause();
+                }
+            }
+            cx.notify();
+            return;
+        }
+        if self.active_media.is_playing(&message_id) && self.active_media.is_audio() {
+            // Same message - toggle play/pause. `is_active` rather than
+            // `is_playing`: a clip the browser is still decoding is not
+            // playing yet but is on its way, and reading that as "resume"
+            // ignored the tap and let the decode start what it had just been
+            // asked to stop.
+            if self.audio_player.is_active() {
+                self.audio_player.pause();
+            } else {
+                self.audio_player.resume();
+                // The tick loop ends as soon as playback stops, so a resume
+                // has to start a new one or the playhead never moves again.
+                self.ensure_playback_tick(cx);
+            }
+        } else {
+            // Different message or not playing - play it
+            self.play_audio(message_id, audio_data, cx);
+        }
+        cx.notify();
+    }
+    /// Toggle audio playback with lazy loading (download first if needed)
+    pub fn toggle_audio_lazy(
+        &mut self,
+        message_id: String,
+        downloadable: DownloadableMedia,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pending) = self
+            .audio_preparation
+            .as_mut()
+            .filter(|pending| pending.message_id == message_id)
+        {
+            if let Some(should_play) = pending.toggle_playback(self.audio_player.is_loading()) {
+                if should_play {
+                    self.audio_player.resume();
+                } else {
+                    self.audio_player.pause();
+                }
+            }
+            cx.notify();
+            return;
+        }
+        // If already playing this audio message, just toggle. `is_active`
+        // for the same reason as above: a decode in flight is a note on its
+        // way, and a tap during it means stop.
+        if self.active_media.is_playing(&message_id) && self.active_media.is_audio() {
+            if self.audio_player.is_active() {
+                self.audio_player.pause();
+            } else {
+                self.audio_player.resume();
+                self.ensure_playback_tick(cx);
+            }
+            cx.notify();
+            return;
+        }
+
+        // Here, in the gesture, and not where the sound starts. A browser
+        // grants an audio context permission to play only under a transient
+        // user activation, and this path downloads the note first — so by the
+        // time anything is decoded the click that authorised it has expired.
+        // Free where a sound card needs no permission.
+        self.audio_player.unlock();
+
+        // A second tap while the first is still in flight downloads the note
+        // twice, and both answers still match `pending_media_request` — so the
+        // later one calls `play_audio` again and restarts the note from the
+        // top under the listener. The image and document paths already claim
+        // this slot; the one that autoplays needed it most.
+        if !self.begin_download(&message_id, cx) {
+            return;
+        }
+
+        let Some(client) = &self.client else {
+            warn!("Cannot download audio: client is unavailable");
+            self.finish_download(&message_id);
+            self.notify_user(
+                crate::tr!(CannotDownloadAudioWhileDisconnected),
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
+            return;
+        };
+        let download_rx = client.download_downloadable_media(downloadable);
+
+        // Stop any current playback, video included: a playing video must not
+        // keep running underneath the download.
+        self.stop_user_media();
+        self.pending_media_request = Some(message_id.clone());
+
+        let msg_id = message_id.clone();
+
+        info!("Starting audio download for message {}", msg_id);
+
+        // Spawn a GPUI task to await the download result with timeout
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            match download_with_timeout(download_rx).await {
+                Ok(data) => {
+                    info!("Audio downloaded: {} bytes", data.len());
+
+                    // Cache the downloaded audio and play it
+                    let _ = entity.update(cx, |app, cx| {
+                        app.finish_download(&msg_id);
+                        // Cache the audio data in the message so we don't need to download again
+                        app.update_message_media_data(&msg_id, data.clone(), cx);
+                        // Autoplay only if the user hasn't started other media
+                        // since this download began.
+                        if app.pending_media_request.as_deref() == Some(msg_id.as_str()) {
+                            // Cloned, as at every other call site: the
+                            // player takes the bytes, and a voice note is
+                            // small enough that owning one is not the copy
+                            // worth avoiding.
+                            app.play_audio(msg_id, (*data).clone(), cx);
+                        } else {
+                            cx.notify();
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to download audio: {}", e);
+                    // Said, not only logged: the control goes back to idle
+                    // either way, so without this a tap that fetched nothing
+                    // is indistinguishable from one that was never noticed.
+                    say(
+                        &entity,
+                        cx,
+                        what_went_wrong(crate::tr!(CouldNotDownloadThatAudio), &e),
+                    );
+                    let _ = entity.update(cx, |app, cx| {
+                        app.finish_download(&msg_id);
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+
+        cx.notify();
+    }
+    /// Fetch the full image for a bubble whose eager download failed and left
+    /// no thumbnail; mirrors the audio lazy-download path (no autoplay, the
+    /// cached bytes just render).
+    pub fn download_image(
+        &mut self,
+        chat_jid: String,
+        message_id: String,
+        downloadable: DownloadableMedia,
+        cx: &mut Context<Self>,
+    ) {
+        self.fetch_image(message_id, downloadable, true, Some(chat_jid), cx);
+    }
+
+    fn fetch_image(
+        &mut self,
+        message_id: String,
+        downloadable: DownloadableMedia,
+        user_initiated: bool,
+        chat_jid: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        // A second tap while the first is still in flight would download the
+        // same bytes twice; the marker is also what the bubble reads to show
+        // that something is happening.
+        // The slot is claimed *before* the request goes out. Asking first and
+        // checking afterwards meant a double tap issued two daemon downloads
+        // and then abandoned the second receiver.
+        if !self.begin_download(&message_id, cx) {
+            return;
+        }
+        let preview = downloadable.is_thumbnail;
+        let download_rx = {
+            let Some(client) = &self.client else {
+                warn!("Cannot download image: client is unavailable");
+                self.finish_download(&message_id);
+                return;
+            };
+            client.download_downloadable_media(downloadable)
+        };
+
+        self.image_downloads_in_flight.insert(message_id.clone());
+        let generation = self.document_state_generation;
+        let account = self.account_scope();
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let result = download_with_timeout(download_rx).await;
+            // Carried out of the update rather than said inside it, because
+            // `say` needs the same handle this closure is borrowing.
+            let mut failed = None;
+            let _ = entity.update(cx, |app, cx| {
+                if !document_state_matches(
+                    app.document_state_generation,
+                    &app.account_scope(),
+                    generation,
+                    &account,
+                ) {
+                    return;
+                }
+                app.image_downloads_in_flight.remove(&message_id);
+                app.finish_download(&message_id);
+                if !user_initiated
+                    && let Some(chat) = &chat_jid
+                    && let Some(success) = app
+                        .channel_preview_attempts
+                        .get_mut(&(chat.clone(), message_id.clone()))
+                {
+                    *success = result.is_ok();
+                }
+                match result {
+                    Ok(data) => {
+                        info!("Image downloaded: {} bytes", data.len());
+                        app.update_chat_media_data(
+                            chat_jid.as_deref(),
+                            &message_id,
+                            data,
+                            preview,
+                            cx,
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to download image: {}", e);
+                        failed = Some(what_went_wrong(crate::tr!(CouldNotDownloadThatImage), &e));
+                    }
+                }
+                cx.notify();
+            });
+            if user_initiated && let Some(reason) = failed {
+                say_if_document_current(&entity, cx, generation, &account, reason);
+            }
+        })
+        .detach();
+    }
+
+    /// Called only for rows the virtual list lays out. Bound concurrency and
+    /// remember failures so repainting cannot create a network retry loop.
+    pub(crate) fn improve_channel_preview(
+        &mut self,
+        chat_jid: String,
+        message_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if !crate::platform::channel_preview::AUTOMATIC
+            || self.visible_chat.as_deref() != Some(chat_jid.as_str())
+            || !self.is_connected()
+            || self.downloads_in_flight.len() >= 2
+            || self.is_downloading(&message_id)
+            || self.channel_preview_attempts.len() >= 256
+            || !chat_jid.ends_with("@newsletter")
+        {
+            return;
+        }
+        let Some(chat) = self
+            .selected_chat
+            .as_ref()
+            .filter(|jid| **jid == chat_jid)
+            .and_then(|jid| self.find_chat(jid))
+        else {
+            return;
+        };
+        let Some(media) = chat
+            .messages
+            .iter()
+            .find(|m| m.id == message_id)
+            .and_then(|m| m.media.as_ref())
+        else {
+            return;
+        };
+        let Some(downloadable) = media
+            .preview_downloadable
+            .as_ref()
+            .or(media.downloadable.as_ref())
+            .filter(|d| {
+                media.media_type == velo_core::MediaType::Image
+                    && (media.data_is_preview || media.data.is_empty())
+                    && d.is_channel_preview_candidate()
+            })
+            .cloned()
+        else {
+            return;
+        };
+        match self
+            .channel_preview_attempts
+            .entry((chat_jid.clone(), message_id.clone()))
+        {
+            std::collections::hash_map::Entry::Occupied(_) => return,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(false);
+            }
+        }
+        self.fetch_image(message_id, downloadable, false, Some(chat_jid), cx);
+    }
+
+    /// Whether a download for this message is in flight.
+    pub fn is_downloading(&self, message_id: &str) -> bool {
+        self.downloads_in_flight.contains(message_id)
+    }
+
+    /// Claim the download slot for a message.
+    ///
+    /// Returns whether the caller owns it — `false` means one is already
+    /// running and this tap should be ignored rather than duplicated.
+    fn begin_download(&mut self, message_id: &str, cx: &mut Context<Self>) -> bool {
+        if !self.downloads_in_flight.insert(message_id.to_string()) {
+            return false;
+        }
+        cx.notify();
+        true
+    }
+
+    fn finish_download(&mut self, message_id: &str) {
+        self.downloads_in_flight.remove(message_id);
+    }
+
+    /// Invalidate pending image/document completions when logout keeps the
+    /// account identity but ends the session that authorized its downloads.
+    pub(super) fn invalidate_document_downloads(&mut self) {
+        self.document_state_generation = self.document_state_generation.wrapping_add(1);
+        for id in self.image_downloads_in_flight.drain() {
+            self.downloads_in_flight.remove(&id);
+        }
+        self.channel_preview_attempts.clear();
+        self.saved_documents.clear();
+        self.document_downloads_in_flight.clear();
+    }
+    /// Download a document and save it to the user's Downloads directory.
+    /// Documents open in external apps, so bytes on disk beat cached bytes.
+    pub fn download_document(
+        &mut self,
+        message_id: String,
+        file_name: String,
+        downloadable: DownloadableMedia,
+        cx: &mut Context<Self>,
+    ) {
+        if self.client.is_none() {
+            warn!("Cannot download document: client is unavailable");
+            return;
+        }
+        // Deduplicate within this account/chat/message, without blocking a
+        // different conversation that happens to reuse the same message id.
+        let Some(scope) = self.document_scope(&message_id) else {
+            return;
+        };
+        if !self.document_downloads_in_flight.insert(scope.clone()) {
+            return;
+        }
+        cx.notify();
+        let Some(client) = &self.client else {
+            self.document_downloads_in_flight.remove(&scope);
+            return;
+        };
+        let download_rx = client.download_downloadable_media(downloadable);
+        let expected_scope = scope.clone();
+        let expected_generation = self.document_state_generation;
+
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            match download_with_timeout(download_rx).await {
+                Ok(data) => {
+                    // The download can outlive its account. Check on the app
+                    // thread immediately before starting any native or browser
+                    // handoff; a stale completion must not write to Downloads.
+                    let current_state = entity
+                        .update(cx, |app, _| {
+                            (app.document_state_generation, app.account_scope())
+                        })
+                        .ok();
+                    if let Some((current_generation, current_account)) = current_state
+                        && let Some(result) = handoff_if_current(
+                            current_generation,
+                            &current_account,
+                            expected_generation,
+                            &expected_scope.0,
+                            hand_to_user(cx, file_name, data),
+                        )
+                        .await
+                    {
+                        match result {
+                            Ok(crate::platform::download::DownloadOutcome::NativeFile(path)) => {
+                                let display = path.display().to_string();
+                                let _ = entity.update(cx, |app, cx| {
+                                    if document_state_matches(
+                                        app.document_state_generation,
+                                        &app.account_scope(),
+                                        expected_generation,
+                                        &expected_scope.0,
+                                    ) {
+                                        let scope = (
+                                            app.account_scope(),
+                                            expected_scope.1.clone(),
+                                            expected_scope.2.clone(),
+                                        );
+                                        app.saved_documents.insert(scope, path);
+                                        cx.notify();
+                                    }
+                                });
+                                info!("Document {message_id} saved to {display}");
+                            }
+                            Ok(crate::platform::download::DownloadOutcome::BrowserDownloadRequested(
+                                where_it_went,
+                            )) => {
+                                info!("Document {message_id} handed to {where_it_went}");
+                            }
+                            Err(e) => {
+                                warn!("Failed to save document {message_id}: {e}");
+                                say_if_document_current(
+                                    &entity,
+                                    cx,
+                                    expected_generation,
+                                    &expected_scope.0,
+                                    e,
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to download document {}: {}", message_id, e);
+                    say_if_document_current(
+                        &entity,
+                        cx,
+                        expected_generation,
+                        &expected_scope.0,
+                        what_went_wrong(crate::tr!(CouldNotDownloadThatFile), &e),
+                    );
+                }
+            }
+            let _ = entity.update(cx, |app, cx| {
+                if app.document_state_generation == expected_generation {
+                    app.document_downloads_in_flight.remove(&scope);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    /// Identity tuple for a document operation; a message id alone is not
+    /// unique across accounts or conversations.
+    fn account_scope(&self) -> String {
+        format!(
+            "{}|{}",
+            self.account_jid.as_deref().unwrap_or(""),
+            self.account_lid.as_deref().unwrap_or("")
+        )
+    }
+
+    fn document_scope(&self, message_id: &str) -> Option<(String, String, String)> {
+        Some(document_scope_key(
+            &self.account_scope(),
+            self.selected_chat.as_deref()?,
+            message_id,
+        ))
+    }
+
+    /// Whether this document is being saved in the current account/chat.
+    pub fn is_document_downloading(&self, message_id: &str) -> bool {
+        self.document_scope(message_id)
+            .is_some_and(|scope| self.document_downloads_in_flight.contains(&scope))
+    }
+
+    /// The saved native destination for this message in the current chat.
+    pub fn saved_document_path(&self, message_id: &str) -> Option<std::path::PathBuf> {
+        self.saved_documents
+            .get(&self.document_scope(message_id)?)
+            .cloned()
+    }
+
+    /// Open the exact file produced by the save operation, if it still exists.
+    pub fn open_saved_document(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        let Some(path) = self.saved_document_path(message_id) else {
+            return;
+        };
+        if path.is_file() {
+            cx.open_with_system(&path);
+        } else if let Some(scope) = self.document_scope(message_id) {
+            self.saved_documents.remove(&scope);
+            cx.notify();
+            self.notify_user(
+                crate::tr!(ThatFileIsNoLongerInDownloadsSaveItAgainToOpenIt),
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
+        }
+    }
+
+    /// Reveal the exact saved file in its containing folder.
+    pub fn reveal_saved_document(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        let Some(path) = self.saved_document_path(message_id) else {
+            return;
+        };
+        if path.is_file() {
+            cx.reveal_path(&path);
+        } else if let Some(scope) = self.document_scope(message_id) {
+            self.saved_documents.remove(&scope);
+            cx.notify();
+            self.notify_user(
+                crate::tr!(ThatFileIsNoLongerInDownloadsSaveItAgainToShowIt),
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
+        }
+    }
+
+    /// Save a picture already in hand to the Downloads directory.
+    ///
+    /// Distinct from `download_document`, which fetches first: by the time
+    /// the viewer can show a picture its bytes are local, and re-fetching
+    /// them to save them would cost a round trip for nothing.
+    pub fn save_media(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        let Some(media) = self
+            .selected_chat_data()
+            .and_then(|chat| {
+                chat.messages
+                    .iter()
+                    .find(|message| message.id == message_id)
+                    .cloned()
+            })
+            .and_then(|message| (!message.revoked).then_some(message.media).flatten())
+        else {
+            warn!("nothing to save for {message_id}");
+            return;
+        };
+
+        let mime = media
+            .downloadable
+            .as_ref()
+            .map_or(media.mime_type.as_str(), |media| &media.mime_type);
+        let file_name = if media.media_type == MediaType::Sticker {
+            format!("sticker-{}", default_media_name(message_id, "image/webp"))
+        } else {
+            media
+                .file_name
+                .clone()
+                .unwrap_or_else(|| default_media_name(message_id, mime))
+        };
+        if media.data_is_preview || media.data.is_empty() {
+            if let Some(downloadable) = media.downloadable {
+                self.download_document(message_id.to_string(), file_name, downloadable, cx);
+            } else {
+                self.notify_user(
+                    "The original attachment is unavailable.",
+                    notices::Tone::Problem,
+                    cx,
+                );
+            }
+            return;
+        }
+        let Some(scope) = self.document_scope(message_id) else {
+            return;
+        };
+        if !self.document_downloads_in_flight.insert(scope.clone()) {
+            return;
+        }
+        cx.notify();
+        let generation = self.document_state_generation;
+        let data = Arc::clone(&media.data);
+        let id = message_id.to_string();
+
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            match hand_to_user(cx, file_name, data).await {
+                Ok(crate::platform::download::DownloadOutcome::NativeFile(path)) => {
+                    info!("Saved {id} to {}", path.display());
+                    let _ = entity.update(cx, |app, cx| {
+                        if app.document_state_generation == generation
+                            && app.account_scope() == scope.0
+                        {
+                            app.saved_documents.insert(scope.clone(), path);
+                            cx.notify();
+                        }
+                    });
+                }
+                Ok(crate::platform::download::DownloadOutcome::BrowserDownloadRequested(
+                    description,
+                )) => info!("Saved {id} to {description}"),
+                Err(e) => {
+                    warn!("Failed to save {id}: {e}");
+                    say_if_document_current(&entity, cx, generation, &scope.0, e);
+                }
+            }
+            let _ = entity.update(cx, |app, cx| {
+                if app.document_state_generation == generation {
+                    app.document_downloads_in_flight.remove(&scope);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Get the video player state for a message (if any)
+    pub fn video_player_state(&self, message_id: &str) -> Option<VideoPlayerState> {
+        self.video_players.get(message_id).map(|p| p.state())
+    }
+    /// Get current video frame for a message (if playing).
+    /// Returns an `Arc<RenderImage>` — YUV→RGBA was already converted when
+    /// the frame was decoded (same pattern Zed uses on Linux).
+    pub fn video_current_frame(&self, message_id: &str) -> Option<Arc<gpui::RenderImage>> {
+        self.video_players
+            .get(message_id)
+            .and_then(|p| p.current_frame())
+    }
+    /// Get or create the decoded image for a message.
+    ///
+    /// Two reasons this is cached rather than rebuilt per render: GPUI tracks
+    /// animation state per `Arc<Image>`, so a fresh one restarts an animated
+    /// sticker on every frame; and building one copies the encoded bytes and
+    /// makes GPUI decode them again. `update_message_media_data` evicts the
+    /// entry when the real bytes replace a preview — see [`Cached`] — so a
+    /// stale thumbnail cannot outlive its download.
+    /// Uses interior mutability (RefCell) so it can be called during immutable render.
+    ///
+    /// `None` where `data` is not a still picture — a video's bytes are its
+    /// own file once it has been fetched, and nothing decodes those as one.
+    /// Answered before the cache is touched, so an MP4 cannot take a slot
+    /// from the pictures the cache exists for.
+    pub fn get_decoded_image(
+        &self,
+        message_id: &str,
+        media: &MediaContent,
+        cx: &App,
+    ) -> Option<RetainedImage> {
+        let (data, format) = (&media.data, mime_to_image_format(&media.mime_type)?);
+
+        // Keyed by the id *and* what the bytes are, because a message's bytes
+        // are not fixed: a preview is replaced by the real picture, and there
+        // are two paths that do it — `update_message_media_data`, which
+        // evicts, and `fill` on the way in from the daemon, which never
+        // reaches this side at all. An entry keyed by the id alone therefore
+        // outlived its own download, and `is_viewable` then let the stale
+        // thumbnail be opened full screen, until the cache had pushed it out.
+        let cached = Cached {
+            bytes: data.len(),
+            format,
+            // The flag the two paths that replace a preview both set. Length
+            // and format alone are a signature two different pictures can
+            // share, and this is the one difference the replacement always
+            // has: `adopt_full_bytes` clears it, on the app's path and on the
+            // one that never reaches the app.
+            preview: media.data_is_preview,
+            identity: media_identity(data),
+        };
+        // A hit moves the entry to the back, which is what makes the order
+        // below least-recently-used rather than insertion order. By
+        // insertion, the entry evicted first was as likely as not the one
+        // being drawn this frame: the viewer and the status reader both
+        // resolve before the list's rows do, so a picture opened full screen
+        // was thrown out and rebuilt under itself: animated stickers
+        // restarting, and the bytes decoded again, which is the whole of what
+        // this cache exists to avoid.
+        {
+            let mut cache = self.decoded_images.borrow_mut();
+            if let Some(at) = cache.get_index_of(message_id) {
+                // Unless the bytes behind it have been replaced, in which
+                // case the entry describes a picture that is gone and the
+                // insert below overwrites it.
+                let hit = cache.get_index(at).is_some_and(|(_, (seen, image))| {
+                    seen.bytes == cached.bytes
+                        && seen.format == cached.format
+                        && seen.preview == cached.preview
+                        && (seen.identity == cached.identity
+                            || image.bytes.as_slice() == data.as_slice())
+                });
+                if hit {
+                    if let Some((_, (seen, _))) = cache.get_index_mut(at) {
+                        seen.identity = cached.identity;
+                    }
+                    let last = cache.len() - 1;
+                    cache.move_index(at, last);
+                    return cache.get_index(last).map(|(_, (_, image))| image.clone());
+                }
+            }
+        }
+
+        if media.media_type == velo_core::MediaType::Sticker
+            && !media.data_is_preview
+            && mime_to_image_format(&media.mime_type) == Some(gpui::ImageFormat::Webp)
+            && !self.sticker_payload_is_valid(message_id, media)
+        {
+            return None;
+        }
+
+        let image = RetainedImage::new(Image::from_bytes(format, data.to_vec()));
+
+        // What is on screen right now, which may not be evicted whatever the
+        // order says: dropping it is a rebuild inside the same frame.
+        let pinned = [self.viewer.read(cx).current_id(), self.status_pane.shown()];
+        let mut cache = self.decoded_images.borrow_mut();
+
+        // Least recently used first, never one that is being drawn, until
+        // this one fits — see `DECODED_IMAGE_BUDGET` for why there are two
+        // bounds and `MIN_DECODED_IMAGES` for why the byte one gives way.
+        let cost = image.bytes.len();
+        let mut held: usize = cache.values().map(|(seen, _)| seen.bytes).sum();
+        while super::over_budget(held + cost, cache.len()) {
+            let Some(at) = cache
+                .keys()
+                .position(|key| !pinned.contains(&Some(key.as_str())))
+            else {
+                // Everything left is being drawn — or there is nothing left at
+                // all, which is the same answer: this image is larger than the
+                // budget and goes in alone. Otherwise never reached, with
+                // ceilings this far above the two things that can be pinned;
+                // the entry is kept rather than one of them dropped.
+                break;
+            };
+            if let Some((_, evicted)) = cache.shift_remove_index(at) {
+                held = held.saturating_sub(evicted.0.bytes);
+            }
+        }
+
+        // Removed before it is inserted, not replaced in place: `insert`
+        // keeps an existing key where it is, so a picture decoded now would
+        // take the position of the one it replaced and be evicted before
+        // entries older than itself — a rebuild, which is the thing this
+        // whole path exists to avoid.
+        cache.shift_remove(message_id);
+        cache.insert(message_id.to_string(), (cached, image.clone()));
+        Some(image)
+    }
+
+    fn sticker_payload_is_valid(&self, message_id: &str, media: &MediaContent) -> bool {
+        let cached = Cached {
+            bytes: media.data.len(),
+            format: mime_to_image_format(&media.mime_type).unwrap_or(gpui::ImageFormat::Png),
+            preview: media.data_is_preview,
+            identity: media_identity(&media.data),
+        };
+        {
+            let mut validation = self.sticker_validation.borrow_mut();
+            if let Some((seen, valid, bytes)) = validation.get_mut(message_id)
+                && seen.bytes == cached.bytes
+                && seen.format == cached.format
+                && seen.preview == cached.preview
+                && (seen.identity == cached.identity || bytes.as_slice() == media.data.as_slice())
+            {
+                seen.identity = cached.identity;
+                return *valid;
+            }
+        }
+        let valid = crate::components::message_bubble::sticker_payload_is_valid(media);
+        const STICKER_VALIDATION_CACHE_BYTES: usize = 64 * 1024 * 1024;
+        if media.data.len() > STICKER_VALIDATION_CACHE_BYTES {
+            return valid;
+        }
+        let mut validation = self.sticker_validation.borrow_mut();
+        let mut held: usize = validation.values().map(|(_, _, bytes)| bytes.len()).sum();
+        while validation.len() >= MAX_DECODED_IMAGES
+            || held.saturating_add(media.data.len()) > STICKER_VALIDATION_CACHE_BYTES
+        {
+            let Some((_, (_, _, bytes))) = validation.shift_remove_index(0) else {
+                break;
+            };
+            held = held.saturating_sub(bytes.len());
+        }
+        validation.insert(
+            message_id.to_string(),
+            (cached, valid, Arc::clone(&media.data)),
+        );
+        valid
+    }
+
+    /// Toggle video playback for a message
+    pub fn toggle_video(
+        &mut self,
+        message_id: String,
+        downloadable: DownloadableMedia,
+        cx: &mut Context<Self>,
+    ) {
+        // Get player state first to determine action
+        let player_state = self.video_players.get(&message_id).map(|p| p.state());
+
+        // Here, in the gesture, for the reason the voice note path says it
+        // there: a browser grants an audio context permission to play only
+        // under a transient user activation, and the first play of a video
+        // downloads and demuxes the attachment before any sound starts, so
+        // the click that authorised it has long expired by the time
+        // `play_samples` calls `resume`. What that looks like is a video that
+        // plays with no sound at all. Free where a sound card needs no
+        // permission, and harmless on the paths that turn out not to need it.
+        self.audio_player.unlock();
+
+        match player_state {
+            Some(VideoPlayerState::Playing) => {
+                // Pause video and its audio
+                if let Some(player) = self.video_players.get_mut(&message_id) {
+                    player.pause();
+                }
+                self.audio_player.pause();
+                self.active_media = ActiveMedia::None;
+                // After the clear, like the two paths that end a playback: a
+                // paused player is idle, and a codec session is hardware a
+                // browser allows a handful of. `stop` is the one clear that
+                // keeps its decoder, because that is where a poster frame is
+                // asked for; a pause already has the frame it is showing, and
+                // resuming rebuilds from the samples that stay.
+                self.release_idle_decoders();
+                self.video_update_task = None;
+            }
+            Some(VideoPlayerState::Paused) => {
+                // Pausing cleared active_media, so is_playing alone can't
+                // tell "nothing else started" from "another media is live";
+                // audio ownership does. Stopping here on resume would drop
+                // this video's own paused audio and it would come back mute.
+                let owns_audio = self.audio.message_id() == Some(message_id.as_str());
+                if !self.active_media.is_playing(&message_id) && !owns_audio {
+                    self.stop_user_media();
+                }
+                self.pending_media_request = Some(message_id.clone());
+
+                let (needs_audio, audio_data) =
+                    if let Some(player) = self.video_players.get_mut(&message_id) {
+                        let resume_pos = player.current_time();
+                        let needs = player.play();
+                        let data = if needs {
+                            // A refcount, not the track: `samples` is shared.
+                            player
+                                .get_audio()
+                                .map(|a| (a.samples.clone(), 0, a.sample_rate))
+                        } else if !owns_audio {
+                            // Another media's start stole the paused sink, so a
+                            // plain resume() would leave this video silent;
+                            // re-feed its audio from the pause position
+                            // (samples are mono, so offset is seconds * rate).
+                            player.get_audio().map(|a| {
+                                let offset = ((resume_pos.as_secs_f64() * a.sample_rate as f64)
+                                    as usize)
+                                    .min(a.samples.len());
+                                // Where to start, rather than a copy of
+                                // everything from there on.
+                                (a.samples.clone(), offset, a.sample_rate)
+                            })
+                        } else {
+                            None
+                        };
+                        (needs, data)
+                    } else {
+                        return;
+                    };
+
+                self.active_media = ActiveMedia::Video {
+                    message_id: message_id.clone(),
+                };
+                self.start_video_update_task(cx);
+
+                if let Some((samples, from, sample_rate)) = audio_data {
+                    info!(
+                        "Playing video audio: {} samples at {} Hz",
+                        samples.len() - from,
+                        sample_rate
+                    );
+                    if let Err(e) = self
+                        .audio_player
+                        .play_samples(&samples[from..], sample_rate)
+                    {
+                        warn!("Failed to play video audio: {}", e);
+                    } else {
+                        // Ownership only on success: recording it for a dead
+                        // sink would turn every later resume into a silent
+                        // no-op resume().
+                        self.audio = AudioHolder::VideoTrack {
+                            message_id: message_id.clone(),
+                        };
+                    }
+                } else if !needs_audio && self.audio.message_id() == Some(message_id.as_str()) {
+                    // Only resume if audio belongs to this video
+                    self.audio_player.resume();
+                }
+            }
+            Some(VideoPlayerState::Idle) | Some(VideoPlayerState::Error) => {
+                // Start downloading (or retry on error)
+                self.start_video_download(message_id, downloadable, cx);
+            }
+            Some(VideoPlayerState::Downloading) | Some(VideoPlayerState::Decoding) => {
+                // Already on its way — but say again that it is wanted.
+                // Leaving the video clears `pending_media_request`, and the
+                // completion autoplays on the strength of that alone, so
+                // coming back before it finished used to land on a paused
+                // first frame with no play control anywhere in the status
+                // reader: stuck until the reader was closed and reopened.
+                self.pending_media_request = Some(message_id);
+            }
+            None => {
+                // No player yet, start downloading
+                self.start_video_download(message_id, downloadable, cx);
+            }
+        }
+        cx.notify();
+    }
+    /// Start downloading a video for playback
+    fn start_video_download(
+        &mut self,
+        message_id: String,
+        downloadable: DownloadableMedia,
+        cx: &mut Context<Self>,
+    ) {
+        // Asked before the fetch, not after it. The decoder is built from the
+        // parameter sets, so a browser with no `VideoDecoder` is otherwise
+        // discovered once the whole attachment has been downloaded and
+        // demuxed, and the bubble draws that as Retry: every press pays the
+        // download again to reach the same permanent answer.
+        if let Some(reason) = crate::platform::video_decode_unavailable() {
+            warn!("not downloading a video: {reason}");
+            self.notify_user(reason.to_string(), crate::app::notices::Tone::Problem, cx);
+            return;
+        }
+        let Some(client) = &self.client else {
+            warn!("Cannot download video: client is unavailable");
+            return;
+        };
+        let download_rx = client.download_downloadable_media(downloadable);
+
+        // Before the stop, which is what clears it: asked afterwards, this was
+        // always `None`, so the filter below protected nothing.
+        let playing = self.playing_video_id().map(str::to_string);
+
+        // Stop any currently playing media (mutual exclusion)
+        self.stop_user_media();
+        self.pending_media_request = Some(message_id.clone());
+
+        // Evict old video players if the cache is full, sparing the one that
+        // was playing, this one, and any still on their way. A player removed
+        // mid-flight is one the detached task cannot find when its bytes
+        // arrive: `load` and `set_error` both become no-ops, the decoded
+        // download is dropped in silence, and the bubble goes back to
+        // offering the download it had just made.
+        if self.video_players.len() >= MAX_VIDEO_PLAYERS {
+            let to_remove: Vec<_> = self
+                .video_players
+                .iter()
+                .filter(|(id, player)| {
+                    Some(id.as_str()) != playing.as_deref()
+                        && **id != message_id
+                        && !matches!(
+                            player.state(),
+                            VideoPlayerState::Downloading | VideoPlayerState::Decoding
+                        )
+                })
+                .map(|(id, _)| id.clone())
+                .take(MAX_VIDEO_PLAYERS / 2)
+                .collect();
+            for key in to_remove {
+                self.video_players.remove(&key);
+            }
+        }
+
+        // Create or get player and set to downloading
+        let player = self.video_players.entry(message_id.clone()).or_default();
+        let preparation = player.set_downloading();
+
+        let msg_id = message_id.clone();
+
+        // Spawn a GPUI task to await the download result with timeout
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            match download_with_timeout(download_rx).await {
+                Ok(data) => {
+                    info!("Video downloaded: {} bytes", data.len());
+
+                    // Set to decoding state (quick UI update)
+                    let current = entity
+                        .update(cx, |app, cx| {
+                            let Some(player) = app
+                                .video_players
+                                .get_mut(&msg_id)
+                                .filter(|player| player.owns_preparation(&preparation))
+                            else {
+                                return false;
+                            };
+                            player.set_decoding();
+                            cx.notify();
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !current {
+                        return;
+                    }
+
+                    let decode_result = crate::video::build_decoder(cx, data).await;
+
+                    // Update only the opening that requested this preparation.
+                    let _ = entity.update(cx, |app, cx| {
+                        if !app
+                            .video_players
+                            .get(&msg_id)
+                            .is_some_and(|player| player.owns_preparation(&preparation))
+                        {
+                            return;
+                        }
+                        match decode_result {
+                            Ok(mut decoder) => {
+                                info!(
+                                    "Video decoded: {} frames, {:.1}s",
+                                    decoder.frame_count(),
+                                    decoder.duration().as_secs_f64()
+                                );
+
+                                // Extract audio before loading decoder into player
+                                let audio = decoder.take_audio();
+
+                                if let Some(player) = app.video_players.get_mut(&msg_id) {
+                                    player.load(decoder);
+
+                                    // Store audio in player for replay capability
+                                    if let Some(ref audio_data) = audio {
+                                        player.set_audio(audio_data.clone());
+                                    }
+                                    // Don't call play() here - let the first frame render first
+                                    // so GPUI can decode the WebP image before playback starts
+                                }
+
+                                // Invalidate message cache to force virtual list re-render
+                                if let Some(jid) = app.selected_chat.clone() {
+                                    app.invalidate_message_cache(&jid, cx);
+                                }
+
+                                // Schedule play() for the next frame to allow GPUI to decode the image
+                                let msg_id_for_play = msg_id.clone();
+                                let audio_for_play = audio;
+                                cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+                                    // Wait one frame (~16ms at 60fps) for GPUI to decode the first frame
+                                    crate::platform::sleep(std::time::Duration::from_millis(16))
+                                        .await;
+
+                                    let _ = entity.update(cx, |app, cx| {
+                                        // Skip autoplay when the user started
+                                        // other media during download/decode.
+                                        if app.pending_media_request.as_deref()
+                                            == Some(msg_id_for_play.as_str())
+                                            && let Some(player) =
+                                                app.video_players.get_mut(&msg_id_for_play)
+                                            && player.owns_preparation(&preparation)
+                                            && player.state() == VideoPlayerState::Paused
+                                        {
+                                            let needs_audio = player.play();
+                                            app.active_media = ActiveMedia::Video {
+                                                message_id: msg_id_for_play.clone(),
+                                            };
+                                            app.start_video_update_task(cx);
+
+                                            if needs_audio && let Some(audio) = audio_for_play {
+                                                info!(
+                                                    "Playing video audio: {} samples at {} Hz",
+                                                    audio.samples.len(),
+                                                    audio.sample_rate
+                                                );
+                                                if let Err(e) = app
+                                                    .audio_player
+                                                    .play_samples(&audio.samples, audio.sample_rate)
+                                                {
+                                                    warn!("Failed to play video audio: {}", e);
+                                                } else {
+                                                    app.audio = AudioHolder::VideoTrack {
+                                                        message_id: msg_id_for_play.clone(),
+                                                    };
+                                                }
+                                            }
+                                        }
+                                        cx.notify();
+                                    });
+                                })
+                                .detach();
+                            }
+                            Err(e) => {
+                                error!("Failed to decode video: {}", e);
+                                if let Some(player) = app.video_players.get_mut(&msg_id) {
+                                    player.set_error(e.to_string());
+                                }
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to download video: {}", e);
+                    let _ = entity.update(cx, |app, cx| {
+                        if let Some(player) = app
+                            .video_players
+                            .get_mut(&msg_id)
+                            .filter(|player| player.owns_preparation(&preparation))
+                        {
+                            player.set_error(what_went_wrong(
+                                crate::tr!(CouldNotDownloadThatVideo),
+                                &e,
+                            ));
+                        }
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+
+        cx.notify();
+    }
+}
+
+fn document_scope_key(account: &str, chat: &str, message_id: &str) -> (String, String, String) {
+    (account.to_owned(), chat.to_owned(), message_id.to_owned())
+}
+
+/// Await a platform handoff only while the download still belongs to this session.
+async fn handoff_if_current<T>(
+    current_generation: u64,
+    current_account: &str,
+    expected_generation: u64,
+    expected_account: &str,
+    handoff: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if document_state_matches(
+        current_generation,
+        current_account,
+        expected_generation,
+        expected_account,
+    ) {
+        Some(handoff.await)
+    } else {
+        None
+    }
+}
+
+/// Show a document error only to the account session that initiated the operation.
+fn say_if_document_current(
+    entity: &WeakEntity<WhatsAppApp>,
+    cx: &mut gpui::AsyncApp,
+    expected_generation: u64,
+    expected_account: &str,
+    text: String,
+) {
+    let _ = entity.update(cx, |app, cx| {
+        if document_state_matches(
+            app.document_state_generation,
+            &app.account_scope(),
+            expected_generation,
+            expected_account,
+        ) {
+            app.notify_user(text, crate::app::notices::Tone::Problem, cx);
+        }
+    });
+}
+
+/// Compare the epoch and known account identity; an unset identity may hydrate within its epoch.
+fn document_state_matches(
+    current_generation: u64,
+    current_account: &str,
+    expected_generation: u64,
+    expected_account: &str,
+) -> bool {
+    current_generation == expected_generation
+        && (current_account == expected_account || expected_account == "|")
+}
+
+/// Put a failure in front of the person who asked for it.
+///
+/// These paths ran to `warn!` and stopped, which on a desktop is a save that
+/// quietly did not happen and in a browser is a first tap that does nothing
+/// and a second that works. The message is the one the platform wrote, which
+/// is why those are phrased for a reader rather than for a log.
+fn say(entity: &WeakEntity<WhatsAppApp>, cx: &mut gpui::AsyncApp, text: String) {
+    let _ = entity.update(cx, |app, cx| {
+        app.notify_user(text, crate::app::notices::Tone::Problem, cx);
+    });
+}
+
+/// Put a file where the user keeps things, on whichever thread can.
+///
+/// The desktop write is blocking I/O and belongs off the UI thread. The web
+/// one reaches for `document`, which exists on one thread only — and gpui's
+/// background executor is a real worker there — so it has to stay. One place
+/// asks; the call sites above do not care.
+async fn hand_to_user(
+    cx: &mut gpui::AsyncApp,
+    file_name: String,
+    data: std::sync::Arc<Vec<u8>>,
+) -> Result<crate::platform::download::DownloadOutcome, String> {
+    if crate::platform::download::SAVES_OFF_THREAD {
+        cx.background_spawn(async move { crate::platform::download::save(&file_name, &data) })
+            .await
+    } else {
+        crate::platform::download::save(&file_name, &data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_receipt_identity_refuses_own_or_cross_chat_id_collisions() {
+        let mut first = Chat::new("559900000001@s.whatsapp.net".into());
+        first.messages.push(ChatMessage::new_incoming(
+            "VOICE".into(),
+            "sender".into(),
+            String::new(),
+        ));
+        assert_eq!(
+            audio_receipt_chat(&[Arc::new(first.clone())], "VOICE"),
+            Some(first.jid.clone())
+        );
+        let mut second = Chat::new("111000011112222@lid".into());
+        second
+            .messages
+            .push(ChatMessage::new_outgoing("VOICE".into(), String::new()));
+        assert_eq!(
+            audio_receipt_chat(&[Arc::new(second.clone())], "VOICE"),
+            None
+        );
+        assert_eq!(
+            audio_receipt_chat(&[Arc::new(first), Arc::new(second)], "VOICE"),
+            None
+        );
+    }
+
+    fn pending(epoch: usize, position: f32, was_playing: bool) -> PendingAudioPreparation {
+        PendingAudioPreparation {
+            message_id: "voice-1".to_string(),
+            source: Arc::new(Vec::new()),
+            epoch,
+            position,
+            was_playing,
+        }
+    }
+
+    #[test]
+    fn speed_restart_preserves_position_and_pause_intent() {
+        let pending = pending(7, 0.625, false);
+
+        assert_eq!(pending.resume_snapshot(), (0.625, false));
+        assert!(pending.matches("voice-1", 7));
+    }
+
+    #[test]
+    fn pending_audio_controls_forward_only_while_player_is_loading() {
+        let mut pending = pending(7, 0.25, true);
+
+        assert_eq!(pending.toggle_playback(false), None);
+        assert_eq!(pending.resume_snapshot(), (0.25, false));
+        assert_eq!(pending.toggle_playback(true), Some(true));
+        assert_eq!(pending.toggle_playback(true), Some(false));
+
+        assert_eq!(pending.seek(-0.5, false), None);
+        assert_eq!(pending.resume_snapshot(), (0.0, false));
+        assert_eq!(pending.seek(1.5, true), Some(1.0));
+        assert_eq!(pending.resume_snapshot(), (1.0, false));
+    }
+
+    #[test]
+    fn an_old_preparation_cannot_install_after_a_new_epoch() {
+        let pending = pending(8, 0.25, true);
+
+        assert!(!pending.matches("voice-1", 7));
+        assert!(!pending.matches("voice-2", 8));
+        assert!(pending.matches("voice-1", 8));
+    }
+
+    #[gpui::test]
+    fn leaving_a_chat_rearms_successful_previews_but_preserves_failed_attempts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        app.update(cx, |app, cx| {
+            let jid = "120363000000000001@newsletter";
+            let full: DownloadableMedia = serde_json::from_value(serde_json::json!({
+                "direct_path":"/v/original", "media_key":[], "file_enc_sha256":[],
+                "file_sha256":vec![7;32], "file_length":1024, "mime_type":"image/webp",
+                "duration_secs":null, "download_type":"image"
+            }))
+            .unwrap();
+            let mut hq = full.clone();
+            hq.is_thumbnail = true;
+            hq.file_sha256 = vec![8; 32];
+            let mut chat = Chat::new(jid.into());
+            for (id, success) in [("success", true), ("failed", false)] {
+                let mut message =
+                    ChatMessage::new_incoming(id.into(), "channel".into(), String::new());
+                let mut media =
+                    MediaContent::image(Arc::new(vec![1, 2]), "image/jpeg".into(), true)
+                        .with_download(Some(full.clone()));
+                media.preview_downloadable = Some(hq.clone());
+                if success {
+                    media.adopt_server_preview(Arc::new(vec![3, 4, 5]));
+                }
+                message.media = Some(media);
+                chat.messages.push(message);
+                app.channel_preview_attempts
+                    .insert((jid.into(), id.into()), success);
+            }
+            app.chats = vec![Arc::new(chat)];
+            app.retained_chat = Some("other@newsletter".into());
+            app.sweep_retained_media(cx);
+            assert!(
+                app.chats[0].messages[0]
+                    .media
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .is_empty()
+            );
+            assert_eq!(
+                app.chats[0].messages[1]
+                    .media
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .as_slice(),
+                [1, 2]
+            );
+            assert!(
+                !app.channel_preview_attempts
+                    .contains_key(&(jid.into(), "success".into()))
+            );
+            assert!(
+                app.channel_preview_attempts
+                    .contains_key(&(jid.into(), "failed".into()))
+            );
+            // Budget eviction inside the visible conversation must not start
+            // a cache-read/eviction loop on each subsequent repaint.
+            let payload = Arc::new(vec![0; 512 * 1024]);
+            let count = velo_core::RETAINED_MEDIA_BUDGET_BYTES as usize / payload.len() + 1;
+            let mut chat = Chat::new(jid.into());
+            app.channel_preview_attempts.clear();
+            for i in 0..count {
+                let id = format!("budget-{i}");
+                let mut message =
+                    ChatMessage::new_incoming(id.clone(), "channel".into(), String::new());
+                let mut media =
+                    MediaContent::image(Arc::new(Vec::new()), "image/jpeg".into(), true)
+                        .with_download(Some(full.clone()));
+                media.preview_downloadable = Some(hq.clone());
+                media.adopt_server_preview(Arc::clone(&payload));
+                message.media = Some(media);
+                chat.messages.push(message);
+                app.channel_preview_attempts.insert((jid.into(), id), true);
+            }
+            app.chats = vec![Arc::new(chat)];
+            app.retained_chat = Some(jid.into());
+            app.sweep_retained_media(cx);
+            assert!(
+                app.chats[0].messages[0]
+                    .media
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .is_empty()
+            );
+            assert!(
+                app.channel_preview_attempts
+                    .contains_key(&(jid.into(), "budget-0".into()))
+            );
+            app.retained_chat = Some("other@newsletter".into());
+            app.sweep_retained_media(cx);
+            assert!(
+                !app.channel_preview_attempts
+                    .contains_key(&(jid.into(), "budget-0".into())),
+                "a successful budget-evicted preview becomes restorable after leaving"
+            );
+            // A failed subsequent restoration remains suppressed even though
+            // the row still records that its earlier bytes were server HQ.
+            app.channel_preview_attempts
+                .insert((jid.into(), "budget-0".into()), false);
+            app.sweep_retained_media(cx);
+            assert_eq!(
+                app.channel_preview_attempts
+                    .get(&(jid.into(), "budget-0".into())),
+                Some(&false)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn logout_releases_image_slots_before_rejecting_late_completions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        app.update(cx, |app, _| {
+            app.downloads_in_flight
+                .extend(["image".into(), "audio".into()]);
+            app.image_downloads_in_flight.insert("image".into());
+            app.channel_preview_attempts
+                .insert(("channel@newsletter".into(), "image".into()), false);
+            let generation = app.document_state_generation;
+            let account = app.account_scope();
+            app.invalidate_document_downloads();
+            assert!(!app.is_downloading("image"));
+            assert!(app.is_downloading("audio"));
+            assert!(app.channel_preview_attempts.is_empty());
+            assert!(!document_state_matches(
+                app.document_state_generation,
+                &app.account_scope(),
+                generation,
+                &account
+            ));
+        });
+    }
+
+    #[gpui::test]
+    fn a_channel_image_completion_updates_only_its_own_chat(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        app.update(cx, |app, cx| {
+            let mut chats = Vec::new();
+            for jid in [
+                "120363000000000001@newsletter",
+                "120363000000000002@newsletter",
+            ] {
+                let mut chat = Chat::new(jid.into());
+                let mut message =
+                    ChatMessage::new_incoming("42".into(), "channel".into(), String::new());
+                message.media = Some(MediaContent::image(
+                    Arc::new(vec![1]),
+                    "image/jpeg".into(),
+                    true,
+                ));
+                chat.messages.push(message);
+                chats.push(Arc::new(chat));
+            }
+            app.chats = chats;
+            app.update_chat_media_data(
+                Some("120363000000000002@newsletter"),
+                "42",
+                Arc::new(vec![2, 3]),
+                false,
+                cx,
+            );
+            assert_eq!(
+                app.chats[0].messages[0]
+                    .media
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .as_slice(),
+                [1]
+            );
+            assert_eq!(
+                app.chats[1].messages[0]
+                    .media
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .as_slice(),
+                [2, 3]
+            );
+            app.update_chat_media_data(
+                Some("120363000000000002@newsletter"),
+                "42",
+                Arc::new(vec![4, 5]),
+                true,
+                cx,
+            );
+            let preview = app.chats[1].messages[0].media.as_ref().unwrap();
+            assert!(
+                preview.data_is_preview,
+                "HQ bytes must not masquerade as the original"
+            );
+            assert_eq!(preview.mime_type, "image/jpeg");
+            assert_eq!(preview.data.as_slice(), [4, 5]);
+            assert_eq!(
+                app.chats[0].messages[0]
+                    .media
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .as_slice(),
+                [1]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn hiding_a_chat_cancels_pending_autoplay_without_cancelling_download(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        app.update(cx, |app, _| {
+            app.downloads_in_flight.insert("voice-1".into());
+            app.pending_media_request = Some("voice-1".into());
+            app.audio_preparation = Some(pending(app.playback_epoch, 0.5, true));
+            app.active_media = ActiveMedia::Audio {
+                message_id: "voice-1".into(),
+            };
+            let epoch = app.playback_epoch;
+
+            app.cancel_hidden_media_autoplay();
+
+            assert!(app.downloads_in_flight.contains("voice-1"));
+            assert!(app.pending_media_request.is_none());
+            assert!(app.audio_preparation.is_none());
+            assert!(matches!(app.active_media, ActiveMedia::None));
+            assert_eq!(app.playback_epoch, epoch.wrapping_add(1));
+        });
+    }
+
+    #[gpui::test]
+    fn hiding_a_chat_keeps_audio_that_was_already_playing(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        app.update(cx, |app, _| {
+            app.downloads_in_flight.insert("voice-1".into());
+            app.pending_media_request = Some("voice-1".into());
+            app.active_media = ActiveMedia::Audio {
+                message_id: "voice-1".into(),
+            };
+            let epoch = app.playback_epoch;
+
+            app.cancel_hidden_media_autoplay();
+
+            assert!(app.downloads_in_flight.contains("voice-1"));
+            assert!(app.pending_media_request.is_none());
+            assert!(matches!(app.active_media, ActiveMedia::Audio { .. }));
+            assert_eq!(app.playback_epoch, epoch);
+        });
+    }
+}
+
+#[cfg(test)]
+mod document_scope_tests {
+    use super::{document_scope_key, handoff_if_current};
+
+    #[test]
+    fn regression_193_same_message_id_isolated_by_account_and_chat() {
+        let first = document_scope_key("account-a", "chat-a", "message-1");
+        assert_ne!(
+            first,
+            document_scope_key("account-b", "chat-a", "message-1")
+        );
+        assert_ne!(
+            first,
+            document_scope_key("account-a", "chat-b", "message-1")
+        );
+        assert_eq!(
+            first,
+            document_scope_key("account-a", "chat-a", "message-1")
+        );
+    }
+
+    #[test]
+    fn regression_193_delayed_old_account_download_is_not_handed_off_or_recorded() {
+        futures_lite::future::block_on(async {
+            let expected_generation = 4_u64;
+            let expected_account = "account-a";
+            let scope = document_scope_key(expected_account, "chat-a", "message-1");
+            let current_generation = std::future::poll_fn(|_| {
+                std::task::Poll::Ready(expected_generation.wrapping_add(1))
+            })
+            .await;
+            let current_account = expected_account;
+            let mut handed_off = false;
+            let mut saved_documents = std::collections::HashMap::new();
+
+            // The delayed completion crosses an async boundary after logout
+            // invalidates the generation; identity remains unchanged.
+            let completion = handoff_if_current(
+                current_generation,
+                current_account,
+                expected_generation,
+                expected_account,
+                async {
+                    handed_off = true;
+                    std::path::PathBuf::from("old-session.pdf")
+                },
+            )
+            .await;
+            if let Some(path) = completion {
+                saved_documents.insert(scope.clone(), path);
+            }
+
+            assert!(!handed_off);
+            assert!(!saved_documents.contains_key(&scope));
+            // Account switching without a generation change must also fail.
+            let switched_account = handoff_if_current(4, "account-b", 4, "account-a", async {
+                panic!("stale account must not reach platform handoff");
+            })
+            .await;
+            assert!(switched_account.is_none());
+
+            // The daemon can publish Connected before account metadata. Let
+            // that same session's initial identity hydrate without dropping
+            // its download; saved paths are keyed under the current identity.
+            let hydrated_account = handoff_if_current(4, "account-a", 4, "|", async {
+                std::path::PathBuf::from("hydrated-session.pdf")
+            })
+            .await;
+            assert_eq!(
+                hydrated_account,
+                Some(std::path::PathBuf::from("hydrated-session.pdf"))
+            );
+        });
+    }
+
+    #[test]
+    fn regression_193_current_session_download_is_handed_off_and_recorded() {
+        futures_lite::future::block_on(async {
+            let scope = document_scope_key("account-a", "chat-a", "message-1");
+            let mut handed_off = false;
+            let mut saved_documents = std::collections::HashMap::new();
+            let completion = handoff_if_current(4, "account-a", 4, "account-a", async {
+                handed_off = true;
+                std::path::PathBuf::from("document.pdf")
+            })
+            .await;
+            if let Some(path) = completion {
+                saved_documents.insert(scope.clone(), path);
+            }
+
+            assert!(handed_off);
+            assert_eq!(
+                saved_documents.get(&scope),
+                Some(&std::path::PathBuf::from("document.pdf"))
+            );
+        });
+    }
+}

@@ -1,0 +1,666 @@
+# Workspace root. `crates/gui` is the only member today; the daemon
+# (`velod`) and a TUI front end land beside it, which is why the front end
+# is already a member instead of the root package.
+[workspace]
+members = [
+    "crates/audio",
+    "crates/chat-store",
+    "crates/cli",
+    "crates/core",
+    "crates/daemon",
+    "crates/gui",
+    "crates/ipc",
+    "crates/logging",
+    "crates/platform",
+    "crates/plugin-abi",
+    "crates/plugin-host",
+    "crates/plugin-sdk",
+    "crates/session",
+    "crates/setup",
+    "crates/video",
+    "crates/wire",
+]
+# Example plugins build for `wasm32-unknown-unknown` and link against imports
+# only the daemon provides, so they are not workspace members: `cargo build`
+# here would try to link them for the host and fail at every `oxi_*` symbol.
+# Each carries its own `[workspace]` table and is built with its own
+# `cargo build --target wasm32-unknown-unknown`.
+exclude = ["examples"]
+resolver = "3"
+
+[workspace.package]
+version = "1.2.0"
+edition = "2024"
+# Keep the workspace compiler floor aligned with rust-toolchain.toml and CI.
+rust-version = "1.100.0"
+license = "MIT"
+authors = ["João Lucas <jlucaso@hotmail.com>"]
+repository = "https://github.com/Ruchin-Audichya/velo"
+
+# Mirror the library's safeguards (see /clippy.toml): wacore::time instead of
+# std clocks, portable-atomic for 64-bit atomics.
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+disallowed_types = "deny"
+# Diagnostics belong in `log`: a line on stdout is invisible to the journal
+# and, in the daemon, competes with nothing that reads it. `clippy.toml`'s
+# `allow-print-in-tests` is what keeps a measurement's `--nocapture` output
+# legitimate, and it was configured here against lints nothing turned on.
+print_stdout = "deny"
+print_stderr = "deny"
+
+[workspace.dependencies]
+
+# Mirrored from the library workspace: the chat store was authored against
+# these exact feature sets, and default-features would pull in backends it
+# deliberately avoids.
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+buffa = { version = "0.9.2", default-features = false, features = ["json"] }
+# `wasmbind` reads the clock from the browser's `Date` instead of
+# `SystemTime`, which on `wasm32-unknown-unknown` is the std function that
+# panics with "time not implemented on this platform" — and `Utc::now()` is
+# how every message, receipt and chat row here is stamped, so without it the
+# first thing a page does with a timestamp takes the whole task down. It is
+# one of chrono's own defaults; `default-features = false` above is what
+# switched it off. Named here rather than per-crate because the crates that
+# ask for a clock are the same ones on both sides, and chrono declares
+# `wasm-bindgen`/`js-sys` under a wasm-only target table, so a native build
+# picks up nothing from it.
+chrono = { version = "0.4.45", default-features = false, features = ["wasmbind"] }
+diesel = { version = "2.3.14", default-features = false, features = ["sqlite", "r2d2", "32-column-tables"] }
+diesel_migrations = { version = "2.3.2", default-features = false, features = ["sqlite"] }
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+# Wasm has no OS entropy source of its own: `getrandom` refuses to build for
+# `wasm32-unknown-unknown` unless a backend is named, and everything under
+# `wacore` that signs, pads or generates an id reaches for it. Declared here so
+# the one crate every other one depends on can turn the backend on for the
+# whole graph — features are additive, so naming it once is naming it
+# everywhere.
+getrandom = { version = "0.4.3", default-features = false, features = ["wasm_js"] }
+# The same problem one major behind. Both are in the graph — 0.4 under
+# `wacore`, 0.2 under an older transitive dependency — and each refuses to
+# build for the web until its own backend is named, so both have to be.
+getrandom_02 = { package = "getrandom", version = "0.2.17", default-features = false, features = ["js"] }
+log = "0.4.34"
+velo-audio = { path = "crates/audio" }
+velo-chat-store = { path = "crates/chat-store" }
+velo-core = { path = "crates/core" }
+velo-daemon = { path = "crates/daemon" }
+velo-ipc = { path = "crates/ipc", default-features = false }
+velo-logging = { path = "crates/logging" }
+velo-platform = { path = "crates/platform" }
+velo-plugin-abi = { path = "crates/plugin-abi" }
+velo-plugin-host = { path = "crates/plugin-host" }
+velo-session = { path = "crates/session" }
+velo-video = { path = "crates/video" }
+velo-wire = { path = "crates/wire" }
+portable-atomic = { version = "1.15.0", default-features = false, features = ["fallback"] }
+usage-rs = { version = "7.1.3", default-features = false, features = ["spec", "help", "diagnostics", "completions"] }
+# The Unix syscalls the daemon and the IPC crate need (flock, getuid, kill),
+# as safe wrappers. Already in the tree transitively; declared because both
+# crates import it directly, and it replaces hand-written `extern "C"` blocks.
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "net", "process"] }
+serde = { version = "1.0.229", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0.154", default-features = false }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", default-features = false }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+
+# Keep every whatsapp-rust crate on one git source and branch.
+
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
+
+[patch.crates-io]
+# Validate immutable phone metadata during the build, not the first label.
+# See vendor/phonenumber/LOCAL_CHANGES.md.
+phonenumber = { path = "vendor/phonenumber" }
+# Canvas readback needs integer coordinates with web_sys_unstable_apis.
+gpui-fast-web = { path = "vendor/gpui-fast-web" }
+
+[profile.dev]
+# Dependencies carry no debug information. Nobody here steps into diesel, and
+# what a dependency's DWARF costs is paid three times over: rustc emits it,
+# the linker copies it into every binary that touches the crate, and CI then
+# compresses the whole target directory into a cache entry the next run has to
+# download again.
+#
+# Measured on this workspace from cold, `cargo test --workspace --exclude
+# velo-gui --all-features --no-run`, four cores:
+#
+#                                    build   target/debug   zstd -3
+#   as a developer builds it         188 s        7.87 GB   1.74 GB
+#   the same, dependencies bare      165 s        4.54 GB   1.09 GB
+#   as CI builds it                  150 s        3.27 GB    756 MB
+#   the same, dependencies bare      146 s        2.21 GB    556 MB
+#
+# The compressed column is the one CI pays twice for, once on the download and
+# once on the upload. Nothing got slower: emitting and linking DWARF is work,
+# so not emitting it is 12% off a cold local build as well.
+#
+# That is one Linux machine, and DWARF is the format on one of the three
+# platforms CI builds. What the same change is worth on each of them was
+# measured separately and is in docs/ci.md; it is much less on Windows and
+# macOS, and this table should not be read as speaking for them.
+#
+# `panic::Location` is compiled in regardless, so `#[track_caller]`, `assert!`
+# and every panic message still name the file and line they came from; what is
+# lost is stepping through a dependency's source and reading its locals, which
+# is a debugger session somebody can turn back on for the crate they are
+# actually chasing. Our own crates are untouched and keep full debug info
+# locally — CI narrows those to line tables through
+# `CARGO_PROFILE_DEV_DEBUG`, where nothing attaches a debugger.
+[profile.dev.package."*"]
+debug = false
+
+# gpui is unusably slow unoptimized; match zed's own dev profile for it. Its
+# debug info is stated here rather than left to the glob above: a named
+# package override and `"*"` both apply to gpui, and which of the two answers
+# for a setting the named one does not mention is a question this file should
+# not be asking about the largest dependency in the tree.
+[profile.dev.package.gpui-fast]
+opt-level = 3
+debug = false
+
+# Build scripts and proc macros, which the glob above does not reach: cargo
+# gives a host-compiled unit its `build-override` settings rather than the
+# package's, so `serde_derive`, `thiserror-impl` and `prost-build` were the
+# one part of the dependency graph still emitting DWARF nobody reads. Nothing
+# steps through a build script; when one misbehaves it is read by what it
+# printed.
+[profile.dev.build-override]
+debug = false
+
+[profile.release]
+opt-level = 3
+debug = false
+# fat LTO + a single codegen unit is worth several MiB across a tree this size.
+# It costs release build time, which is why the nightly job builds the same
+# profile only on main rather than per PR.
+lto = "fat"
+codegen-units = 1
+# gpui only reaches for catch_unwind in its test harness, so aborting loses no
+# runtime recovery and drops the unwind tables.
+panic = "abort"
+strip = true
+incremental = false
+
+# Off-hot-path crates run per connection / sync / request, not per frame, so
+# size-optimizing them shrinks the binary at no measurable cost. This mirrors
+# the same sweep in whatsapp-rust's own manifest, because profile settings only apply
+# from the workspace root, so consuming those crates by git does not inherit
+# them. Media decode (image, openh264, symphonia, mp4) and the per-message
+# crypto/protocol crates deliberately stay at opt-level 3.
+# z = persistence, media HTTP and TLS PKI.
+[profile.release.package.diesel]
+opt-level = "z"
+[profile.release.package.diesel_migrations]
+opt-level = "z"
+[profile.release.package.r2d2]
+opt-level = "z"
+[profile.release.package.whatsapp-rust-sqlite-storage]
+opt-level = "z"
+[profile.release.package.libsqlite3-sys]
+opt-level = "z"
+[profile.release.package.ureq]
+opt-level = "z"
+[profile.release.package.ureq-proto]
+opt-level = "z"
+[profile.release.package.whatsapp-rust-ureq-http-client]
+opt-level = "z"
+[profile.release.package.rustls-webpki]
+opt-level = "z"
+[profile.release.package.webpki-roots]
+opt-level = "z"
+[profile.release.package.http]
+opt-level = "z"
+# The desktop-integration and one-shot subsystems. None of these run per
+# frame or per message: naga compiles shaders once at renderer start, the
+# D-Bus stack carries notifications, keyring reads and accessibility events,
+# SVG rasterization happens when an icon is first loaded, and the regex
+# engines back syntax highlighting. Size-optimizing them costs nothing a user
+# can perceive.
+[profile.release.package.naga]
+opt-level = "z"
+[profile.release.package.zbus]
+opt-level = "z"
+[profile.release.package.zvariant]
+opt-level = "z"
+[profile.release.package.accesskit_unix]
+opt-level = "z"
+[profile.release.package.accesskit_atspi_common]
+opt-level = "z"
+[profile.release.package.accesskit_consumer]
+opt-level = "z"
+[profile.release.package.atspi-common]
+opt-level = "z"
+[profile.release.package.atspi-proxies]
+opt-level = "z"
+[profile.release.package.oo7]
+opt-level = "z"
+[profile.release.package.notify-rust]
+opt-level = "z"
+[profile.release.package.ashpd]
+opt-level = "z"
+[profile.release.package.usvg]
+opt-level = "z"
+[profile.release.package.resvg]
+opt-level = "z"
+[profile.release.package.rustybuzz]
+opt-level = "z"
+[profile.release.package.tiny-skia]
+opt-level = "z"
+[profile.release.package.regex-automata]
+opt-level = "z"
+[profile.release.package.regex]
+opt-level = "z"
+[profile.release.package.markdown]
+opt-level = "z"
+[profile.release.package.html5ever]
+opt-level = "z"
+[profile.release.package.markup5ever]
+opt-level = "z"
+[profile.release.package.markup5ever_rcdom]
+opt-level = "z"
+# The charset tables, which two cold things reach: `html5ever`, on a path that
+# begins with pasting HTML into a message, and `xim-ctext`, which converts the
+# X11 input method's compound text when a composition is committed. 130 KiB of
+# Big5, GBK, JIS and KSX ideograph maps in `.rodata` alone, and neither caller
+# is in a frame.
+[profile.release.package.encoding_rs]
+opt-level = "z"
+
+# The image formats `gpui` turns on that nothing here can hand it.
+#
+# `image` is declared in `crates/gui` with `png`, `jpeg` and `webp`, but
+# features are additive and gpui takes the crate's whole default set, so EXR,
+# TIFF, QOI, PNM, TGA, DDS, farbfeld and the colour management behind them are
+# compiled in whatever this manifest asks for. They cannot be removed —
+# nothing here owns that dependency edge — and they cannot be reached either,
+# which is the part worth checking rather than assuming: a decoder is not
+# sniffed for, it is *named*, by `utils::mime_to_image_format`, and the six
+# names it can answer with are JPEG, PNG, GIF, WebP, BMP and a PNG guess for
+# any other `image/*`. Nothing in this application can ask for an OpenEXR
+# decoder, so what `opt-level = "z"` costs there is decode speed in a decoder
+# that is never called.
+#
+# GIF is on that list of six, which is why it is *not* in this block: see the
+# reachable codecs further down. `color_quant` is, because it is the GIF
+# encoder's quantizer — reached through `gif` and through `image`, and nothing
+# here encodes one; the LZW that decoding really runs on is `weezl`, which
+# this manifest does not touch. `moxcms` is not, because `image` reaches it
+# for any picture carrying an ICC profile.
+#
+# `exr` is also the largest single *datum* in the window: 131,076 bytes of
+# `to_linear_table::TABLE`, which is DWA compression's transfer curve. That is
+# not what this changes — a table is a table at every optimization level — but
+# it is the reason to look at the crate at all.
+[profile.release.package.exr]
+opt-level = "z"
+[profile.release.package.tiff]
+opt-level = "z"
+[profile.release.package.qoi]
+opt-level = "z"
+[profile.release.package.color_quant]
+opt-level = "z"
+[profile.release.package.zune-inflate]
+opt-level = "z"
+
+# Path tessellation for the SVG icons, beside the `usvg`/`resvg`/`tiny-skia`
+# entries above that were already here: it runs when an icon is first
+# rasterized and never again.
+[profile.release.package.lyon_tessellation]
+opt-level = "z"
+[profile.release.package.lyon_path]
+opt-level = "z"
+[profile.release.package.lyon_geom]
+opt-level = "z"
+[profile.release.package.lyon_algorithms]
+opt-level = "z"
+
+# Finding the fonts. `fontconfig-parser` reads the system configuration at
+# startup; `fontdb` is the database `usvg` and `cosmic-text` match a family
+# against, which is a lookup per family and style rather than per glyph, and
+# cached above. Drawing with them does not go through here — that is `swash`,
+# `harfrust` and `skrifa`, which stay where they are.
+[profile.release.package.fontdb]
+opt-level = "z"
+[profile.release.package.fontconfig-parser]
+opt-level = "z"
+
+# The X11 input method and the clipboard's X11 half: a keystroke's worth of
+# work, on the platform where a Wayland session does none of it.
+[profile.release.package.zed-xim]
+opt-level = "z"
+[profile.release.package.xim-ctext]
+opt-level = "z"
+[profile.release.package.xim-parser]
+opt-level = "z"
+
+# The tray, which is one icon and a menu of three items, redrawn when the
+# connection state changes. 263 KiB of the daemon before this.
+[profile.release.package.ksni]
+opt-level = "z"
+# The same tray on the other two platforms, where `ksni` has nothing to talk
+# to. Same shape of work — clicks and a menu nobody opens in a loop — so the
+# same level, keeping the Linux-only halves this crate leaves out.
+[profile.release.package.tray-icon]
+opt-level = "z"
+[profile.release.package.muda]
+opt-level = "z"
+
+# The pattern parser under the regex engine the sweep already names. `regex`
+# and `regex-automata` have been at "z" here from the start, and this runs
+# once per pattern compiled, never per match.
+#
+# `aho-corasick` is deliberately not beside it, though it looks like the same
+# entry: as well as being regex's literal prefilter it is a *direct*
+# dependency of `gpui-base`, whose `input/editor/search.rs` builds one — which
+# is a person typing into a search field rather than anything cold.
+[profile.release.package.regex-syntax]
+opt-level = "z"
+
+# Parsing an icon: the XML reader and the SVG value grammar under `usvg`,
+# which has been at "z" since the sweep was written.
+[profile.release.package.roxmltree]
+opt-level = "z"
+[profile.release.package.svgtypes]
+opt-level = "z"
+# URL parsing. Three callers and all of them one-shot: `gpui` and `gpui_linux`
+# open a link, `http_client` builds a request, and `rtc-shared` reads a
+# candidate while a call is being set up.
+[profile.release.package.url]
+opt-level = "z"
+# The bignum behind the keyring's RSA, on a path that runs when a secret is
+# read and never again.
+[profile.release.package.num-bigint-dig]
+opt-level = "z"
+
+# A plugin's module is *validated* once, at load, and then interpreted, one
+# instruction at a time, at whatever pace the plugin sets. Neither half is a
+# loop the process drives, so both go here rather than only the validator.
+[profile.release.package.wasmparser]
+opt-level = "z"
+[profile.release.package.wasmi]
+opt-level = "z"
+[profile.release.package.wasmi_collections]
+opt-level = "z"
+[profile.release.package.wasmi_core]
+opt-level = "z"
+[profile.release.package.wasmi_ir]
+opt-level = "z"
+
+# The certificate work at connect: parsing a chain, checking a name, and the
+# self-signed pair a call's DTLS handshake generates. Once per connection and
+# once per call, against a TLS record path (`rustls`, `ring`) that is
+# untouched.
+[profile.release.package.x509-parser]
+opt-level = "z"
+[profile.release.package.rcgen]
+opt-level = "z"
+
+# A call's signalling transports, which are not its media. DTLS is a handshake
+# and then a key schedule nothing carries audio over, and SCTP is the data
+# channel beside the RTP that does. `rtc-shared` and `rtc-crypto` are
+# deliberately absent: SRTP protects every packet.
+[profile.release.package.rtc-dtls]
+opt-level = "z"
+[profile.release.package.rtc-sctp]
+opt-level = "z"
+# The Noise handshake the connection opens with: once per connect, against a
+# record path (`rustls`, `ring`) that stays untouched, like the DTLS entry
+# above it.
+[profile.release.package.wacore-noise]
+opt-level = "z"
+# Decompression behind a network wait: history-sync blobs and HTTP gzip.
+# The bytes arrive at wire speed either way, so nothing here can cost a user
+# anything measurable.
+[profile.release.package.zlib-rs]
+opt-level = "z"
+
+# The wire format, which the web profile below has always had at "z" and the
+# desktop deliberately did not.
+#
+# What made the desktop different was the sentence that per-message code is
+# hot; the measurement is that it is not, and that it is expensive. `waproto`
+# is 2.3 MiB of the daemon's 19.1 MiB of `.text` — generated from a 590 KB
+# descriptor — and its four largest functions are `Message::write_to`,
+# `SyncActionValue::merge_to_limit`, `Message::compute_size` and four separate
+# 72 KiB copies of `Message::clone`. None of that is a loop: it is one pass
+# over one stanza, some hundreds of times a minute at the very busiest, and
+# what `opt-level = "z"` withholds from it is inlining and vectorization of
+# straight-line field dispatch. The one burst that is not per message — an
+# appstate or history sync — is bounded by the network and the store, not by
+# this.
+[profile.release.package.waproto]
+opt-level = "z"
+[profile.release.package.buffa]
+opt-level = "z"
+
+# The client above the wire format, for the same reason and one notch less
+# far. `whatsapp-rust` is 2.4 MiB of the daemon's `.text` — the stanza
+# handlers, the connection lifecycle, the send paths and the VoIP facade —
+# and every one of those runs once per stanza or once per call rather than in
+# a loop. "s" rather than "z" because it is the layer a message actually
+# passes through, where `waproto` is the encoder underneath it.
+#
+# `wacore` is deliberately not here despite being the next largest: it
+# carries the MLow codec, and `CelpEncoder::encode_subframe` is per audio
+# frame of a call. The ciphers are not here either.
+[profile.release.package.whatsapp-rust]
+opt-level = "s"
+
+
+# s, not z: these sit on a path a user can feel, but not one that runs per
+# frame. Image decode happens once per attachment, the Wayland protocol
+# marshals input events, and TLS runs at connect plus per record.
+[profile.release.package.image]
+opt-level = "s"
+# GIF decodes here like the other three. `mime_to_image_format` answers
+# `ImageFormat::Gif` for an `image/gif` attachment and `message_bubble::media`
+# hands those bytes to `Image::from_bytes`, so this is a path a user waits on
+# rather than a format nothing opens — which is what the block above claimed
+# about it until a review pointed at the mapping.
+[profile.release.package.gif]
+opt-level = "s"
+# And the colour management under all of them: `moxcms` is reached from
+# `image` itself, so an ICC profile on an ordinary photo goes through it.
+[profile.release.package.moxcms]
+opt-level = "s"
+[profile.release.package.zune-jpeg]
+opt-level = "s"
+[profile.release.package.image-webp]
+opt-level = "s"
+[profile.release.package.png]
+opt-level = "s"
+[profile.release.package.wayland-client]
+opt-level = "s"
+[profile.release.package.wayland-backend]
+opt-level = "s"
+[profile.release.package.calloop]
+opt-level = "s"
+
+# s = data-path framing kept a notch faster than z.
+[profile.release.package.rustls]
+opt-level = "s"
+[profile.release.package.tokio-websockets]
+opt-level = "s"
+[profile.release.package.whatsapp-rust-tokio-transport]
+opt-level = "s"
+[profile.release.package.wacore-appstate]
+opt-level = "s"
+# The Signal session and the binary framing under it: per message like the
+# appstate entry above, and control-plane work rather than a loop — the
+# arithmetic underneath (`curve25519-dalek`, `aes`, `sha2`) stays where it is.
+[profile.release.package.wacore-libsignal]
+opt-level = "s"
+[profile.release.package.wacore-binary]
+opt-level = "s"
+[profile.release.package.chrono]
+opt-level = "s"
+# The IPC and protocol serialization beside `serde_json`: per request rather
+# than per frame, on paths a user waits on but never in a loop.
+[profile.release.package.serde]
+opt-level = "s"
+[profile.release.package.serde_core]
+opt-level = "s"
+[profile.release.package.serde_json]
+opt-level = "s"
+# The container and the codec behind a video attachment's audio track: `mp4`
+# walks the boxes once, `symphonia` decodes AAC for as long as the video
+# plays. Real work, on a path a user waits on — so "s" rather than the "z"
+# above it.
+[profile.release.package.mp4]
+opt-level = "s"
+[profile.release.package.symphonia]
+opt-level = "s"
+[profile.release.package.symphonia-core]
+opt-level = "s"
+[profile.release.package.symphonia-format-isomp4]
+opt-level = "s"
+[profile.release.package.symphonia-codec-aac]
+opt-level = "s"
+[profile.release.package.symphonia-metadata]
+opt-level = "s"
+# X11's protocol marshalling, which is the same shape of work `wayland-client`
+# above is kept at "s" for, on the other of the two Linux backends.
+[profile.release.package.x11rb]
+opt-level = "s"
+[profile.release.package.x11rb-protocol]
+opt-level = "s"
+
+
+
+# The same tree, built to be downloaded.
+#
+# `release` above is calibrated for the binary, where an optimization is paid
+# for once at build time and collected at every frame afterwards. The web
+# artifact is one 28 MiB module a visitor waits on before the first pixel and
+# a browser then has to compile, so the same setting is the wrong one — and
+# cargo has no per-target profiles, which is why this is a profile of its own
+# rather than a `cfg`. `cargo xtask web build` selects it through trunk's
+# `--cargo-profile`; nothing else uses it, and the desktop build is untouched.
+#
+# The measurements are at the rustc stage on this tree, against `release`
+# (35,828,266 bytes), each on its own:
+#
+#   opt-level = "s"                     -11,196,329   (-31.3%)
+#   waproto + buffa at "z"               -1,237,629    (-3.5%)
+#
+# The package overrides above *are* inherited, which this file said for a long
+# time that they were not. Cargo merges the parent profile's package table
+# into the child's and lets the child's entries win, so the whole desktop
+# sweep reaches this profile on its own and only the differences belong below.
+# The measurement is under that table.
+#
+# What does not carry over is the base setting, because this profile replaces
+# it: a crate the sweep does not name is at "s" here and at "3" there.
+[profile.web]
+inherits = "release"
+opt-level = "s"
+
+# The same bundle with its symbols, which `WEB_PROFILE=debug cargo xtask web build`
+# selects. It inherits `web` rather than `release` deliberately: a build you
+# are diagnosing should be the build that misbehaved, so the only difference
+# is that the names survive.
+#
+# `strip` and not `debug`: what a wasm flame graph and a panic trace read is
+# the *name section*, which rustc emits unless it is stripped — and which
+# `strip = true` removes before wasm-opt ever sees the module, which is why
+# there are no Rust symbols in a profile of the published page and never were.
+# Full DWARF would add source lines and tens of megabytes; the names are what
+# was promised.
+# And it really is only that. A review of this change asked whether the
+# per-package table survives the `inherits`, since a debug module compiled at
+# the profile-wide "s" would not be the build that misbehaved; it does, by the
+# same measurement as the note under `[profile.web]`, and `gpui` is at 3 here
+# too.
+[profile.web-debug]
+inherits = "web"
+strip = "none"
+
+# And the same again with the line table, which `WEB_PROFILE=dwarf cargo xtask
+# web build` selects. A third profile rather than a switch on the second,
+# because names and lines are different questions with different prices: the
+# name section is what rustc emits anyway and `web-debug` only declines to
+# throw away, while `debug = "full"` is DWARF the compiler would not otherwise
+# write — several times the module in `.debug_info`, `.debug_str` and
+# `.debug_line`, and `build-std` means the standard library pays it too.
+#
+# It is the input to `cargo xtask web map`, which turns `.debug_line` into a
+# source map beside the module: DWARF is what a browser extension reads, and a
+# source map is what DevTools itself reads in every engine with nothing
+# installed. Both come out of this profile because both are projections of the
+# same section.
+#
+# The build this selects is also the one build here that is *not* run through
+# wasm-opt — see `dwarf_index` in xtask/src/web.rs — so it is the slowest to
+# load and the largest of the three by a wide margin. That is the trade, and it
+# is a trade nobody makes by accident: none of it is reachable without naming
+# the profile.
+[profile.web-dwarf]
+inherits = "web"
+strip = "none"
+debug = "full"
+
+# What is left of this table, now that the sentence it was built on turned
+# out to be false.
+#
+# It said package overrides are not inherited through `inherits`, so every
+# entry in the desktop sweep that also reaches wasm had to be repeated here.
+# That is not what cargo does. Measured on this manifest with cargo 1.98,
+# `cargo build -p url --profile web --target wasm32-unknown-unknown -v`
+# compiles `url` at `z` — the level `[profile.release.package.url]` names,
+# under a profile whose own base is "s" and whose table does not mention it.
+# The parent's package table is merged in and the child's entries win.
+#
+# Which is the rule docs/web.md already states about comments like the one
+# that was here: reproduce the impossibility before believing it. Thirty-nine
+# entries were doing nothing.
+#
+# So what stays is only what genuinely differs from what this profile would
+# inherit — the desktop's whole sweep reaches wasm on its own, and repeating
+# any of it here is dead configuration that reads as a decision.
+
+# `gpui` draws every frame, it is the largest single crate in the shipped
+# module at 10.6% of its code, and it is the one place where "fast" is worth
+# more than "small". Needed here precisely because the desktop leaves it to
+# the base setting, and this profile's base is "s".
+[profile.web.package.gpui-fast]
+opt-level = 3
+
+# The protocol, for the reason `[profile.web]` exists at all. A page's
+# scarcest resource is the bytes a visitor waits on before the first pixel,
+# which is exactly the trade `opt-level = "s"` makes for the whole graph;
+# these are the crates where it is worth going a step further, because they
+# are large and because what they do is one pass over one stanza rather than
+# anything in a loop. The desktop keeps them at "3": there the module is paid
+# for once at build time.
+#
+# `waproto` and `buffa` are *not* in this list any more, and that is the
+# change rather than an omission: the desktop sweep now takes them to "z" as
+# well, so naming them here would be repeating it.
+#
+# The ciphers are deliberately absent too. `aes`, `sha2`, `hmac` and
+# `curve25519-dalek` are separate crates and are left alone — a ratchet step
+# is the one part of this that really is arithmetic in a loop.
+[profile.web.package.wacore]
+opt-level = "z"
+[profile.web.package.wacore-binary]
+opt-level = "z"
+[profile.web.package.wacore-libsignal]
+opt-level = "z"
+[profile.web.package.wacore-noise]
+opt-level = "z"
+[profile.web.package.whatsapp-rust]
+opt-level = "z"
+
+# `tiny-skia`'s path module, which the desktop sweep names the rasterizer but
+# not this. One icon's worth of work on either target; it is here rather than
+# up there only because the desktop's figures in this file were measured
+# without it.
+[profile.web.package.tiny-skia-path]
+opt-level = "z"

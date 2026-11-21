@@ -1,0 +1,32 @@
+//! WhatsApp client wrapper
+//!
+//! This module handles all communication with the WhatsApp service,
+//! keeping the async/network logic separate from the UI.
+
+mod exec;
+mod group_notice;
+pub mod media;
+mod mentions;
+mod names;
+mod net;
+mod quoting;
+mod relay;
+mod store;
+mod video;
+mod whatsapp;
+
+#[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+pub use whatsapp::{OutgoingAcceptCase, outgoing_accept_events};
+
+pub use exec::{Cancelled, Task, sleep, spawn, unblock, with_timeout};
+pub use store::{
+    StoreRegistry, StoredAccount, is_durable as store_is_durable, same_account_identity,
+};
+pub use video::{CameraPreview, set_camera_preferences};
+pub use whatsapp::{
+    AvatarRecorder, BackfillFile, BackfillReport, ChannelView, ContactCheckView, ContactView,
+    GroupDetails, GroupListEntry, GroupParticipantView, HistoryCoverage, JoinGroupView,
+    JoinRequestView, OutgoingFile, ParticipantChange, PollView, ProfileView, ReadBoundary,
+    UiEventReceiver, UiEventTryRecvError, WhatsAppClient, prepare_store, resolve_database_path,
+    wipe_local_state,
+};

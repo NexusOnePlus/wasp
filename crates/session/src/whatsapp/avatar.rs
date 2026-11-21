@@ -1,0 +1,801 @@
+//! Resolving profile pictures, on their own lifecycle.
+//!
+//! A picture is relatively stable metadata, and it used to be looked up by the
+//! history reload path: every store invalidation, every receipt and every
+//! acknowledgement ran the same profile-picture IQs over the same chats. That
+//! coupled a slow network round trip to a local read, delayed `HistoryLoaded`
+//! behind it, and paid for a hundred lookups to learn that nothing had moved.
+//!
+//! So the lookup lives here instead, driven by two things: one pass after the
+//! session reports `Connected`, and one when the chat list is paged further.
+//! A receipt or an ack starts nothing.
+//!
+//! Only the *metadata* is fetched here; the bytes are the daemon's business.
+//! What this publishes is [`UiEvent::AvatarsResolved`], which carries the
+//! picture id and the signed source the daemon fetches, and never the bytes
+//! or the URL in state.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+
+use log::debug;
+use velo_chat_store::ChatStore;
+use velo_core::UiEvent;
+use whatsapp_rust::client::Client;
+use whatsapp_rust::wacore_binary::jid::{Jid, JidExt};
+use whatsapp_rust::{ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
+
+use super::WhatsAppClient;
+use super::ui_queue::Sender as UiEventSender;
+
+/// How many avatar lookups may be in flight at once.
+///
+/// A per-chat IQ, so the limit is what keeps a first connect on an account of
+/// a thousand chats from opening a thousand of them. Eight is comfortably
+/// inside what the server tolerates while still filling a burst quickly.
+const AVATAR_CONCURRENCY: usize = 8;
+
+/// What one metadata lookup actually told us.
+///
+/// The distinction is why this is not an `Option`: the library used to fold
+/// "no picture" (`404`), "not authorized" (`401`), "unchanged" (`304`) and a
+/// partial response into one `Ok(None)`, and only a positive answer may change
+/// what a chat shows. `NotFound` is the one destructive state, and it is now
+/// told apart from the rest.
+enum Lookup {
+    /// A picture with a fetchable source.
+    Found { picture_id: String, source: String },
+    /// The picture did not change, or the answer carried no usable URL.
+    /// Nothing to fetch, nothing to forget.
+    Unchanged,
+    /// WhatsApp says this chat has no picture. The only destructive answer.
+    NotFound,
+    /// Permission refused (privacy restricted or not authorized).
+    NotAuthorized,
+    /// An unknown outcome or refusal: the previous picture stays.
+    Unknown,
+    /// The lookup failed. Deliberately not remembered, so a transient failure
+    /// is retried the next time a page names the chat.
+    Failed,
+}
+
+impl Lookup {
+    /// The group query's outcome, plus the community fallback.
+    ///
+    /// A community parent is an ordinary `@g.us` address, so the JID cannot
+    /// say which query it needs; only group metadata's `is_parent_group` can,
+    /// and fetching that would be an extra IQ per group on every connect. So
+    /// the community query is a *fallback*, taken when the group query answers
+    /// `NotAuthorized`: a parent refuses `w:profile:picture` and answers the
+    /// `w:g2` query, while a normal group that is merely privacy-restricted
+    /// refuses both.
+    ///
+    /// Only `Found` is taken from the fallback. A non-parent can answer the
+    /// community query with a `404`, and trusting that would erase a picture
+    /// the ordinary query refused to show rather than said was gone — the
+    /// destructive reading this whole type exists to avoid.
+    fn of(outcome: whatsapp_rust::features::ProfilePictureLookup) -> Self {
+        use whatsapp_rust::features::ProfilePictureLookup as Outcome;
+        match outcome {
+            Outcome::Found(picture) if !picture.url.is_empty() => Self::Found {
+                picture_id: picture.id,
+                source: picture.url,
+            },
+            // An id with no URL: the metadata moved but there is nothing to
+            // fetch, so this session keeps what it had.
+            Outcome::Found(_) | Outcome::Unchanged => Self::Unchanged,
+            Outcome::NotFound => Self::NotFound,
+            Outcome::NotAuthorized => Self::NotAuthorized,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Whether the fallback is worth asking, and only it.
+    ///
+    /// The one outcome a community parent is known to produce for the wrong
+    /// query. Rate-limit errors stay `Failed` and never trigger a second query.
+    fn wants_community_fallback(&self) -> bool {
+        matches!(self, Self::NotAuthorized | Self::Unknown)
+    }
+
+    /// Read the fallback's answer, keeping only a picture.
+    ///
+    /// Anything else leaves the original answer standing.
+    fn or_community(self, outcome: whatsapp_rust::features::ProfilePictureLookup) -> Self {
+        match Self::of(outcome) {
+            found @ Self::Found { .. } => found,
+            // Unchanged is not evidence of anything here either: the fallback
+            // never sent an `existing_id`, so there is nothing for it to be
+            // unchanged *against*.
+            _ => self,
+        }
+    }
+}
+
+/// Chats whose metadata this side has already asked about, and when.
+///
+/// What makes the resolver safe to ask again on every page: a chat already
+/// asked about costs a hash lookup rather than an IQ, so a page that repeats
+/// its rows does not repeat its traffic.
+///
+/// The generation is the connection it was resolved under. A new connection
+/// makes every entry stale, because a picture can change while the process is
+/// offline and the previous socket's answer says nothing about this one.
+/// Resolution state of an avatar lookup within a connection generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AvatarResolutionState {
+    /// Metadata freshness checked (`need_bytes: false`), or degraded from failed fetch.
+    MetadataKnown,
+    /// Picture URL was resolved and delivered to the daemon for download (`need_bytes: true`).
+    SourceDelivered,
+    /// Daemon confirmed bytes are downloaded and written to cache.
+    BytesReady,
+    /// WhatsApp confirmed chat has no picture.
+    NotFound,
+}
+
+#[derive(Default)]
+pub(super) struct Resolver {
+    order: VecDeque<String>,
+    asked: HashMap<String, (u64, AvatarResolutionState)>,
+}
+
+impl Resolver {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether `jid` still needs a lookup in this generation.
+    fn needs(&self, jid: &str, generation: u64, need_bytes: bool, cache_miss: bool) -> bool {
+        match self.asked.get(jid) {
+            None => true,
+            Some(&(recorded_gen, state)) => {
+                if recorded_gen != generation {
+                    true
+                } else {
+                    match state {
+                        AvatarResolutionState::NotFound => false,
+                        // The daemon can outlive every window, so its earlier
+                        // `BytesReady` observation may describe a file the
+                        // cache budget (or the OS runtime-directory cleanup)
+                        // has since removed. Only an explicit front-end cache
+                        // miss overrides it; ordinary byte demands remain
+                        // deduplicated within this connection.
+                        AvatarResolutionState::BytesReady => need_bytes && cache_miss,
+                        AvatarResolutionState::SourceDelivered => false,
+                        AvatarResolutionState::MetadataKnown => need_bytes,
+                    }
+                }
+            }
+        }
+    }
+
+    fn mark(&mut self, jid: &str, generation: u64, state: AvatarResolutionState) {
+        const MAX_TRACKED: usize = 4096;
+        if !self.asked.contains_key(jid) {
+            if self.asked.len() >= MAX_TRACKED
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.asked.remove(&oldest);
+            }
+            self.order.push_back(jid.to_string());
+        }
+        let entry = self
+            .asked
+            .entry(jid.to_string())
+            .or_insert((generation, state));
+        if entry.0 != generation {
+            *entry = (generation, state);
+        } else {
+            entry.1 = state;
+        }
+    }
+
+    pub(super) fn mark_ready(&mut self, jid: &str) {
+        if let Some((_, state)) = self.asked.get_mut(jid) {
+            *state = AvatarResolutionState::BytesReady;
+        }
+    }
+
+    pub(super) fn mark_failed(&mut self, jid: &str) {
+        if matches!(
+            self.asked.get(jid),
+            Some((_, AvatarResolutionState::MetadataKnown))
+        ) {
+            self.asked.remove(jid);
+            self.order.retain(|key| key != jid);
+            return;
+        }
+        if let Some((_, state)) = self.asked.get_mut(jid)
+            && matches!(
+                *state,
+                AvatarResolutionState::SourceDelivered | AvatarResolutionState::NotFound
+            )
+        {
+            *state = AvatarResolutionState::MetadataKnown;
+        }
+    }
+
+    /// Forget every chat, so the next pass re-queries.
+    ///
+    /// For a cache that was cleared or an account change: the metadata may be
+    /// unchanged, but the source it described has expired and the bytes it
+    /// named are gone.
+    pub(super) fn forget_all(&mut self) {
+        self.asked.clear();
+        self.order.clear();
+    }
+}
+
+/// The JID kinds this side will not spend an IQ on.
+///
+/// The status broadcast is a pseudo-user that never answers, a broadcast list
+/// is a local construct with no server picture, and the system account is
+/// short-circuited by the library. Asking for any is a request timeout spent
+/// to learn nothing.
+fn lookup_is_useless(jid: &Jid) -> bool {
+    jid.is_status_broadcast() || jid.is_broadcast_list() || jid.is_psa()
+}
+
+/// Fetch one chat's picture metadata.
+///
+/// The group branch carries the community fallback; see [`Lookup::or_community`]
+/// for why only a `Found` is taken from it.
+///
+/// When `need_bytes` is true, `existing_id` is passed as `None` to avoid the
+/// "unchanged trap": an `Unchanged` response carries no download URL, so if
+/// cached bytes are missing, an unconditional lookup is required.
+async fn lookup(
+    client: &Arc<Client>,
+    jid: &Jid,
+    known_id: Option<&str>,
+    need_bytes: bool,
+) -> Lookup {
+    let existing_id = if need_bytes { None } else { known_id };
+    if jid.is_group() {
+        let asked = match client
+            .pictures()
+            .lookup(
+                ProfilePictureRequest::new(
+                    ProfilePictureTarget::Group(jid),
+                    ProfilePictureType::Preview,
+                )
+                .existing_id(existing_id),
+            )
+            .await
+        {
+            Ok(outcome) => Lookup::of(outcome),
+            Err(error) => {
+                debug!(
+                    "avatar metadata lookup failed for {}: {error}",
+                    jid.observe()
+                );
+                return Lookup::Failed;
+            }
+        };
+        if !asked.wants_community_fallback() {
+            return asked;
+        }
+        // Not authorized, which for a community parent is what
+        // `w:profile:picture` answers. Ask the `w:g2` query before giving up.
+        match client
+            .pictures()
+            .lookup(
+                ProfilePictureRequest::new(
+                    ProfilePictureTarget::Community(jid),
+                    ProfilePictureType::Preview,
+                )
+                .existing_id(existing_id),
+            )
+            .await
+        {
+            Ok(outcome) => asked.or_community(outcome),
+            // A group that is not a parent has no answer here; the original
+            // not-authorized stands, and it was not destructive.
+            Err(_) => asked,
+        }
+    } else {
+        match client
+            .pictures()
+            .lookup(
+                ProfilePictureRequest::new(
+                    ProfilePictureTarget::Contact(jid),
+                    ProfilePictureType::Preview,
+                )
+                .existing_id(existing_id),
+            )
+            .await
+        {
+            Ok(outcome) => Lookup::of(outcome),
+            Err(error) => {
+                // Facts only: never the URL or any token it carries.
+                debug!(
+                    "avatar metadata lookup failed for {}: {error}",
+                    jid.observe()
+                );
+                Lookup::Failed
+            }
+        }
+    }
+}
+
+/// Resolve avatar demands and publish what was learned, a chunk at a time.
+///
+/// Bounded and deduplicated. The caller is viewport demand or an explicit ask.
+pub(super) async fn resolve(
+    client: &Arc<Client>,
+    ui_tx: &UiEventSender,
+    resolver: &mut Resolver,
+    demands: Vec<velo_core::AvatarDemand>,
+    generation: u64,
+) {
+    let mut filtered: HashMap<String, (Jid, Option<String>, bool)> = HashMap::new();
+    let mut cached_absent = HashSet::new();
+    for demand in demands {
+        let Ok(jid) = demand.jid.parse::<Jid>() else {
+            let _ = ui_tx.send(UiEvent::AvatarFailed {
+                jid: demand.jid,
+                retryable: false,
+            });
+            continue;
+        };
+        if lookup_is_useless(&jid) {
+            let _ = ui_tx.send(UiEvent::AvatarFailed {
+                jid: demand.jid,
+                retryable: false,
+            });
+            continue;
+        }
+        // A newly attached window has its own admission reservations. The
+        // daemon's negative cache must answer them even without another IQ.
+        if matches!(resolver.asked.get(&demand.jid), Some((known_generation, AvatarResolutionState::NotFound)) if *known_generation == generation)
+        {
+            cached_absent.insert(demand.jid);
+            continue;
+        }
+        if !resolver.needs(
+            &demand.jid,
+            generation,
+            demand.need_bytes,
+            demand.cache_miss,
+        ) {
+            continue;
+        }
+        let entry = filtered
+            .entry(demand.jid.clone())
+            .or_insert_with(|| (jid, demand.known_picture_id.clone(), demand.need_bytes));
+        if demand.need_bytes {
+            entry.2 = true;
+        }
+    }
+
+    let cached: Vec<_> = cached_absent
+        .into_iter()
+        .map(|jid| velo_core::AvatarResolution {
+            jid,
+            outcome: velo_core::AvatarOutcome::NotFound,
+        })
+        .collect();
+    for chunk in cached.chunks(AVATAR_CONCURRENCY) {
+        // Go through the daemon's guarded removal path, preserving ordering
+        // and commit-before-readiness even if an earlier removal is pending.
+        if ui_tx
+            .send(UiEvent::AvatarsResolved {
+                resolutions: chunk.to_vec(),
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    let pending: Vec<(Jid, Option<String>, bool)> = filtered.into_values().collect();
+    if pending.is_empty() {
+        return;
+    }
+    let total = pending.len();
+    let mut published = 0usize;
+    for chunk in pending.chunks(AVATAR_CONCURRENCY) {
+        let answered = whatsapp_rust::futures::future::join_all(chunk.iter().map(
+            |(jid, known_id, need_bytes)| {
+                let jid = jid.clone();
+                let known_id = known_id.clone();
+                let need_bytes = *need_bytes;
+                async move {
+                    let answer = lookup(client, &jid, known_id.as_deref(), need_bytes).await;
+                    (jid, need_bytes, answer)
+                }
+            },
+        ))
+        .await;
+
+        let mut resolutions = Vec::with_capacity(answered.len());
+        for (jid, need_bytes, answer) in answered {
+            let jid_str = jid.to_string();
+            let (outcome, state) = match answer {
+                Lookup::Found { picture_id, source } => {
+                    let state = if need_bytes {
+                        AvatarResolutionState::SourceDelivered
+                    } else {
+                        AvatarResolutionState::MetadataKnown
+                    };
+                    (
+                        velo_core::AvatarOutcome::Found {
+                            picture_id,
+                            source: Some(source),
+                        },
+                        state,
+                    )
+                }
+                Lookup::NotFound => (
+                    velo_core::AvatarOutcome::NotFound,
+                    AvatarResolutionState::NotFound,
+                ),
+                Lookup::Unchanged => {
+                    resolver.mark(&jid_str, generation, AvatarResolutionState::MetadataKnown);
+                    if need_bytes {
+                        let _ = ui_tx.send(UiEvent::AvatarFailed {
+                            jid: jid_str,
+                            retryable: true,
+                        });
+                    }
+                    continue;
+                }
+                Lookup::NotAuthorized | Lookup::Unknown => {
+                    resolver.mark(&jid_str, generation, AvatarResolutionState::MetadataKnown);
+                    let _ = ui_tx.send(UiEvent::AvatarFailed {
+                        jid: jid_str,
+                        retryable: false,
+                    });
+                    continue;
+                }
+                Lookup::Failed => {
+                    resolver.mark_failed(&jid_str);
+                    let _ = ui_tx.send(UiEvent::AvatarFailed {
+                        jid: jid_str,
+                        retryable: true,
+                    });
+                    continue;
+                }
+            };
+            resolver.mark(&jid_str, generation, state);
+            resolutions.push(velo_core::AvatarResolution {
+                jid: jid_str,
+                outcome,
+            });
+        }
+        if resolutions.is_empty() {
+            continue;
+        }
+        let count = resolutions.len();
+        match ui_tx.send(UiEvent::AvatarsResolved { resolutions }) {
+            Ok(()) => {
+                published += count;
+            }
+            Err(_) => return,
+        }
+    }
+    debug!("avatar resolver: {published} of {total} chats published a picture");
+}
+
+/// How many chats one full pass reads.
+///
+/// The chat list is drawn from a hundred at a time, and the descriptor attach
+/// runs over exactly that page; a pass that covered every chat in a very
+/// large account would spend a lookup per conversation to learn what the next
+/// page's attach will not even draw yet. Five pages is enough to cover the
+/// visible list and the near tail, and the next connect covers any more.
+const RESOLVE_CHAT_LIMIT: i64 = 500;
+
+/// The addresses to resolve for the chats the store holds.
+pub(super) async fn stored_jids(chat_store: &Arc<ChatStore>) -> Vec<Jid> {
+    match chat_store.chats(false, RESOLVE_CHAT_LIMIT).await {
+        Ok(entries) => entries.into_iter().map(|entry| entry.jid).collect(),
+        Err(e) => {
+            debug!("avatar resolver could not read the chat list: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// The resolver's whole life: wait for a pass, resolve, repeat.
+///
+/// One task for the session, like the history reloader, and for the same
+/// reason: profile-picture lookups are a stream of the account's own metadata
+/// and there is no sense in a task per ask. Stops when the session does.
+impl WhatsAppClient {
+    pub(super) fn spawn_avatar_resolver(
+        client: Arc<Client>,
+        chat_store: Arc<ChatStore>,
+        ui_tx: UiEventSender,
+        signal: super::AvatarResolveSignal,
+        stopping: tokio::sync::watch::Receiver<()>,
+    ) {
+        crate::exec::spawn_owned(async move {
+            let mut resolver = Resolver::new();
+            let mut stopping = stopping;
+            loop {
+                let request = tokio::select! {
+                    request = signal.next() => request,
+                    _ = stopping.changed() => return,
+                };
+                if request.reset {
+                    resolver.forget_all();
+                }
+                for jid in request.ready {
+                    resolver.mark_ready(&jid);
+                }
+                for jid in request.failed {
+                    resolver.mark_failed(&jid);
+                }
+                if !request.demands.is_empty() {
+                    resolve(
+                        &client,
+                        &ui_tx,
+                        &mut resolver,
+                        request.demands,
+                        request.generation,
+                    )
+                    .await;
+                }
+                if request.full {
+                    let jids = stored_jids(&chat_store).await;
+                    let demands = jids
+                        .into_iter()
+                        .map(|jid| velo_core::AvatarDemand {
+                            jid: jid.to_string(),
+                            known_picture_id: None,
+                            cache_key: None,
+                            need_bytes: true,
+                            cache_miss: false,
+                        })
+                        .collect();
+                    resolve(&client, &ui_tx, &mut resolver, demands, request.generation).await;
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn reopened_frontend_gets_cached_negative_completions_without_network() {
+        let store =
+            super::super::SqliteStore::open("file:avatar-negative-replay?mode=memory&cache=shared")
+                .await
+                .unwrap();
+        let bot = super::super::persistent_companion(whatsapp_rust::bot::Bot::builder())
+            .with_backend(store)
+            .build()
+            .await
+            .unwrap();
+        let (sender, mut receiver) = super::super::ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(super::super::ui_queue::HistoryBudget::new()),
+        );
+        let mut resolver = Resolver::new();
+        let demands: Vec<_> = (0..300)
+            .map(|i| {
+                let jid = format!("reopened-{i}@s.whatsapp.net");
+                resolver.mark(&jid, 1, AvatarResolutionState::NotFound);
+                velo_core::AvatarDemand {
+                    jid,
+                    known_picture_id: None,
+                    cache_key: None,
+                    need_bytes: true,
+                    cache_miss: false,
+                }
+            })
+            .collect();
+        // The bot is never connected or run. A lookup would fail, rather
+        // than producing the cached NotFound completions asserted below.
+        resolve(&bot.client(), &sender, &mut resolver, demands.clone(), 1).await;
+        let mut answered = HashSet::new();
+        while let Ok(event) = receiver.try_recv() {
+            let UiEvent::AvatarsResolved { resolutions } = event else {
+                panic!("unexpected avatar replay event")
+            };
+            for resolution in resolutions {
+                assert!(matches!(
+                    resolution.outcome,
+                    velo_core::AvatarOutcome::NotFound
+                ));
+                answered.insert(resolution.jid);
+            }
+        }
+        assert_eq!(answered.len(), demands.len());
+        // Filtered pseudo-chats and malformed demands also need terminal
+        // replies, otherwise they consume the same bounded admission slots.
+        let excluded = ["status@broadcast", "0@s.whatsapp.net", ""];
+        assert!(excluded[2].parse::<Jid>().is_err());
+        let skipped = excluded
+            .iter()
+            .map(|jid| velo_core::AvatarDemand {
+                jid: (*jid).into(),
+                known_picture_id: None,
+                cache_key: None,
+                need_bytes: true,
+                cache_miss: true,
+            })
+            .collect();
+        resolve(&bot.client(), &sender, &mut resolver, skipped, 1).await;
+        let mut failed = HashSet::new();
+        while let Ok(event) = receiver.try_recv() {
+            let UiEvent::AvatarFailed {
+                jid,
+                retryable: false,
+            } = event
+            else {
+                panic!("expected a terminal filtered-demand failure")
+            };
+            failed.insert(jid);
+        }
+        assert_eq!(
+            failed,
+            excluded
+                .into_iter()
+                .map(str::to_string)
+                .collect::<HashSet<_>>()
+        );
+        for demand in &demands {
+            assert!(answered.contains(&demand.jid));
+            assert!(!resolver.needs(&demand.jid, 1, true, false));
+            assert!(resolver.needs(&demand.jid, 2, true, false));
+        }
+    }
+
+    #[test]
+    fn a_status_broadcast_is_never_looked_up() {
+        assert!(lookup_is_useless(&"status@broadcast".parse().unwrap()));
+        assert!(lookup_is_useless(&"0@s.whatsapp.net".parse().unwrap()));
+    }
+
+    /// A channel is not the accidental `!is_group` branch. Its JID is a
+    /// newsletter, the generic profile-picture spec answers it, and the only
+    /// thing this side decides is that it is worth asking.
+    #[test]
+    fn a_channel_is_worth_asking_about() {
+        let newsletter: Jid = "120363000000000001@newsletter".parse().unwrap();
+        let group: Jid = "120363000000000002@g.us".parse().unwrap();
+        let direct: Jid = "12025550143@s.whatsapp.net".parse().unwrap();
+        assert!(!lookup_is_useless(&newsletter));
+        assert!(!lookup_is_useless(&group));
+        assert!(!lookup_is_useless(&direct));
+        assert!(newsletter.is_newsletter());
+    }
+
+    /// The dedup is what keeps a repeated page from repeating its traffic.
+    #[test]
+    fn an_asked_chat_is_not_asked_again() {
+        let mut resolver = Resolver::new();
+        assert!(resolver.needs("a@s.whatsapp.net", 1, true, false));
+        resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::BytesReady);
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, true, false));
+        assert!(resolver.needs("b@s.whatsapp.net", 1, true, false));
+
+        resolver.forget_all();
+        assert!(
+            resolver.needs("a@s.whatsapp.net", 1, true, false),
+            "a clear re-queries"
+        );
+    }
+
+    /// A reconnect is a new generation, and every previous answer is stale:
+    /// a picture can change while the process is offline.
+    #[test]
+    fn a_new_connection_revalidates_what_the_last_one_resolved() {
+        let mut resolver = Resolver::new();
+        resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::BytesReady);
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, true, false));
+        assert!(
+            resolver.needs("a@s.whatsapp.net", 2, true, false),
+            "the answer belongs to the socket that gave it"
+        );
+    }
+
+    /// Needing bytes supersedes a previous freshness-only ask.
+    #[test]
+    fn needing_bytes_supersedes_a_metadata_only_ask() {
+        let mut resolver = Resolver::new();
+        resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::MetadataKnown);
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, false, false));
+        assert!(resolver.needs("a@s.whatsapp.net", 1, true, false));
+    }
+
+    #[test]
+    fn failed_metadata_persistence_permits_a_fresh_metadata_lookup() {
+        let mut resolver = Resolver::new();
+        resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::MetadataKnown);
+        resolver.mark_failed("a@s.whatsapp.net");
+        assert!(resolver.needs("a@s.whatsapp.net", 1, false, false));
+        assert!(resolver.order.is_empty());
+    }
+
+    /// A metadata-only Unchanged lookup records MetadataKnown, so a subsequent byte demand proceeds.
+    #[test]
+    fn metadata_only_unchanged_lookup_permits_subsequent_byte_demand() {
+        let mut resolver = Resolver::new();
+        resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::MetadataKnown);
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, false, false));
+        assert!(
+            resolver.needs("a@s.whatsapp.net", 1, true, false),
+            "byte demand must proceed even after metadata Unchanged"
+        );
+    }
+
+    #[test]
+    fn source_delivered_suppresses_while_in_flight_and_failure_downgrades_to_allow_retry() {
+        let mut resolver = Resolver::new();
+        // Found with need_bytes = true marks SourceDelivered
+        resolver.mark(
+            "a@s.whatsapp.net",
+            1,
+            AvatarResolutionState::SourceDelivered,
+        );
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, true, false));
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, false, false));
+
+        // When CDN download fails, resolver marks failure, downgrading to MetadataKnown:
+        resolver.mark_failed("a@s.whatsapp.net");
+        assert!(
+            resolver.needs("a@s.whatsapp.net", 1, true, false),
+            "retry must be allowed after failure"
+        );
+    }
+
+    #[test]
+    fn a_missing_cache_file_can_refetch_after_bytes_were_ready() {
+        let mut resolver = Resolver::new();
+        resolver.mark(
+            "a@s.whatsapp.net",
+            1,
+            AvatarResolutionState::SourceDelivered,
+        );
+        resolver.mark_ready("a@s.whatsapp.net");
+        assert!(
+            resolver.needs("a@s.whatsapp.net", 1, true, true),
+            "an explicit persistent-cache miss must override stale daemon state"
+        );
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, true, false));
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, false, true));
+    }
+
+    #[test]
+    fn a_failed_durable_removal_releases_the_negative_resolution_for_retry() {
+        let mut resolver = Resolver::new();
+        resolver.mark("retry@example.invalid", 1, AvatarResolutionState::NotFound);
+        assert!(!resolver.needs("retry@example.invalid", 1, true, true));
+        resolver.mark_failed("retry@example.invalid");
+        assert!(resolver.needs("retry@example.invalid", 1, true, true));
+    }
+
+    #[test]
+    fn resolver_tracking_is_bounded_and_forgetting_releases_its_ordering_index() {
+        let mut resolver = Resolver::new();
+        for i in 0..5000 {
+            resolver.mark(
+                &format!("peer-{i}@example.invalid"),
+                1,
+                AvatarResolutionState::BytesReady,
+            );
+        }
+        assert_eq!(resolver.asked.len(), 4096);
+        assert_eq!(resolver.order.len(), 4096);
+        assert!(resolver.needs("peer-0@example.invalid", 1, true, false));
+        assert!(!resolver.needs("peer-4999@example.invalid", 1, true, false));
+        resolver.forget_all();
+        assert!(resolver.order.is_empty());
+    }
+
+    #[test]
+    fn not_found_prevents_subsequent_lookups_in_same_generation() {
+        let mut resolver = Resolver::new();
+        resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::NotFound);
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, true, true));
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, false, true));
+    }
+}

@@ -1,0 +1,81 @@
+[package]
+name = "velo-ipc"
+description = "Wire protocol between the Velo daemon and its front ends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+default = ["legacy-protocol"]
+legacy-protocol = ["dep:velo-core"]
+
+[[test]]
+name = "session_frames"
+required-features = ["legacy-protocol"]
+
+[dependencies]
+log = { workspace = true }
+velo-core = { workspace = true, optional = true }
+velo-wire = { workspace = true }
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+
+# The write half of every transport is a `Link`, and on the web that is a
+# queue into the task holding the socket rather than the socket itself. On a
+# byte stream it is a mutex, which needs nothing.
+[target.'cfg(target_family = "wasm")'.dependencies]
+# A oneshot to say the socket closed, and `or` to race the writer's receive
+# against it: a writer parked on a receive is not woken by a closed socket.
+futures-channel = "0.3.34"
+futures-lite = "2.6.1"
+js-sys = "0.3.106"
+tokio = { workspace = true, features = ["sync"] }
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+web-sys = { version = "0.3.106", features = [
+    "AbortController",
+    # The transport between two tabs of one origin, and the lock that says
+    # which of them holds the account — see `endpoint/tab.rs`.
+    "BroadcastChannel",
+    "Lock",
+    "LockManager",
+    "LockOptions",
+    "AbortSignal",
+    "CloseEvent",
+    "Event",
+    "Headers",
+    "Location",
+    "MessageEvent",
+    "Request",
+    "RequestInit",
+    "Response",
+    "Url",
+    "WebSocket",
+    "Document",
+    "Element",
+    "Window",
+] }
+
+# The uid for the `TMPDIR` fallback, and the peer's uid to check that the
+# daemon answering is ours.
+# The process token's SID, which is what a machine-wide pipe name has to carry
+# and what the daemon's access-control entry names — and the overlapped pipe
+# I/O that keeps a read from blocking a write.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+# `getpeereid`, which is how every Unix but Linux answers "who is on the other
+# end of this socket". Linux answers `SO_PEERCRED`, which rustix already has —
+# and which is why `libc` is not needed there.
+[target.'cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))'.dependencies]
+libc = "0.2.191"
+
+[lints]
+workspace = true

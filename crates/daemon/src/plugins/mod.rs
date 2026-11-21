@@ -1,0 +1,373 @@
+//! Wiring the plugin host into the daemon.
+//!
+//! Two directions, and each is a small adapter rather than a mechanism. What
+//! a plugin does goes onto the same command channel a front end's requests
+//! go onto — a plugin is a front end that does not draw, so it has no
+//! privileged path to the session. What a plugin publishes goes into
+//! [`StateHub`] as ordinary versioned state, which is what makes a plugin's
+//! interface survive a window closing and reappear in the next window's
+//! snapshot.
+//!
+//! What differs by platform is neither of those directions: it is *where a
+//! module comes from* and *where the work runs*. A desktop reads a directory
+//! only this user can write, and every scan and every approval is synchronous
+//! I/O that has to leave the runtime's threads. A page reads OPFS, keeps its
+//! approvals in `localStorage`, and has no blocking pool to move anything to
+//! — nor could it, since a browser agent is one thread. So the two live in
+//! `native` and `web` as the same seven functions plus `Bridge::ask` — start,
+//! reload, detach, approve, and the three a front end asks for by name — and
+//! everything in this file is written once. What is *not* different is
+//! anything below that line: the same host, the same sandbox, the same
+//! bounds, the same protocol carrying the surfaces to whatever is drawing
+//! them.
+
+use std::sync::Arc;
+
+use velo_core::AccountId;
+use velo_plugin_host::{Commands, Outcome, Plugins, Reloaded, Sink};
+
+#[cfg(not(target_family = "wasm"))]
+mod native;
+#[cfg(target_family = "wasm")]
+mod web;
+
+// Named once so nothing below has to ask which one it is. Two `mod` items
+// rather than the `#[cfg_attr(path)]` idiom used elsewhere in the tree,
+// because `web` has a submodule — the browser tests — and rustfmt resolves a
+// `#[path]` module's children against the wrong directory.
+#[cfg(not(target_family = "wasm"))]
+use native as platform;
+#[cfg(target_family = "wasm")]
+use web as platform;
+
+use crate::session_bridge::{Action, Commands as SessionCommands};
+use crate::state::StateHub;
+
+/// Build the plugin host, or an empty one when there is nowhere to look.
+///
+/// Failing to find a plugin directory is not a failure: the ordinary account
+/// has no plugins, and a daemon that would not start without a folder is a
+/// daemon that would not start.
+///
+/// Awaited rather than spawned on either platform, for the binary's reason:
+/// the session must not start until the plugins subscribed to messages are
+/// there to receive them.
+pub async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugins> {
+    platform::start(hub, commands).await
+}
+
+/// This account's slice of the plugin state root.
+///
+/// `None` wherever [`velo_plugin_host::default_state_dir`] is: there is
+/// no per-user directory to scope. Every plugin's recorded approval and every
+/// plugin's settings file are this account's data, never the daemon's as a
+/// whole — a `.wasm` module is shared (the plan calls it a global catalog),
+/// but what it may do and what it remembers are not, so a second account on
+/// the same machine must never inherit or overwrite the first's. Every path
+/// this module hands to a `Plugins` host, or to [`velo_plugin_host::forget_approvals`],
+/// goes through here rather than through `default_state_dir` directly.
+///
+/// Native only: a page's plugin state lives in `localStorage` behind
+/// [`velo_plugin_host::Origin`], which is not yet keyed by account (see
+/// the multi-account plan, section 13.3) and has no path to scope.
+#[cfg(not(target_family = "wasm"))]
+#[must_use]
+pub fn account_state_dir(account_id: AccountId) -> Option<std::path::PathBuf> {
+    velo_plugin_host::default_state_dir().map(|root| root.join(account_id.get().to_string()))
+}
+
+/// Move a pre-multi-account `plugin-state/` into the legacy account's slot.
+///
+/// Before multi-account, every plugin's approvals and settings lived directly
+/// under `plugin-state/`; now they live under `plugin-state/<account>/`. The
+/// legacy account is the one the single-account client paired, so its state
+/// was the root's: without this, an upgrade keeps the modules and silently
+/// starts account 1 with no approvals and no settings, which is user data
+/// lost for no reason. Run once, idempotently, before any plugin loads.
+///
+/// Only the *legacy* account may claim the root: a second account is never
+/// the one that wrote it, so migrating on its behalf would hand it the first
+/// account's recorded permissions — consent given for an account that is not
+/// this one.
+#[cfg(not(target_family = "wasm"))]
+pub fn migrate_legacy_state(account_id: AccountId) {
+    let Some(root) = velo_plugin_host::default_state_dir() else {
+        return;
+    };
+    migrate_legacy_state_in(&root, account_id);
+}
+
+/// The migration itself, against a state root the caller supplies.
+///
+/// Split out so it can be tested against a temporary directory rather than the
+/// machine's real per-user one: the property is "the root's unscoped contents
+/// became the legacy account's", and the root is the only thing the test has
+/// to choose.
+#[cfg(not(target_family = "wasm"))]
+fn migrate_legacy_state_in(root: &std::path::Path, account_id: AccountId) {
+    if account_id != AccountId::LEGACY {
+        return;
+    }
+    let target = root.join(account_id.get().to_string());
+    // The root's entries, but only the files and directories that are state:
+    // an account slot is a numeric directory, and anything already under one
+    // has been migrated, so a non-numeric entry is what is left of the old
+    // layout.
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut moved_any = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.parse::<i32>().is_ok() {
+            continue;
+        }
+        // A move onto a name this same account already has would overwrite the
+        // newer file with the older one. The destination is the live copy, so
+        // the stale root entry is dropped rather than left: an account reset
+        // clears `plugin-state/<id>/`, and a root entry still sitting here
+        // would be re-imported on the next start — restoring the approvals the
+        // reset just removed. Said out loud because it is a deletion.
+        let destination = target.join(name);
+        if destination.exists() {
+            log::warn!(
+                "plugin state {} already had a current copy at {}; removing the stale root entry",
+                entry.path().display(),
+                destination.display()
+            );
+            let stale = entry.path();
+            let removed = match entry.file_type() {
+                Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&stale),
+                Ok(_) => std::fs::remove_file(&stale),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = removed {
+                log::error!(
+                    "could not remove the stale plugin state {}: {e}",
+                    stale.display()
+                );
+            }
+            continue;
+        }
+        if let Err(e) = std::fs::create_dir_all(&target) {
+            log::error!(
+                "could not create the plugin state directory for account {}: {e}",
+                account_id.get()
+            );
+            return;
+        }
+        match std::fs::rename(entry.path(), &destination) {
+            Ok(()) => moved_any = true,
+            Err(e) => log::error!(
+                "could not move legacy plugin state {}: {e}",
+                entry.path().display()
+            ),
+        }
+    }
+    if moved_any {
+        log::info!(
+            "moved pre-multi-account plugin state into account {}'s directory",
+            account_id.get()
+        );
+    }
+}
+
+/// Read the plugin folder again and replace what is running with what is in
+/// it now, without stopping the daemon or the session.
+///
+/// The mirror of [`start`], down to where the work happens: a desktop's scan
+/// reads files and runs each `oxi_init`, all of it synchronous, so it goes to
+/// a blocking thread; a page's modules come out of OPFS and its host runs on
+/// the page's own loop, so it is awaited there.
+///
+/// Answers what the reload did, rather than a count: three of the four
+/// outcomes are zero plugins installed and mean different things, and the
+/// count is what gets written to the log.
+pub async fn reload(plugins: &Arc<Plugins>, account_id: AccountId) -> Reloaded {
+    platform::reload(plugins, account_id).await
+}
+
+/// The same, off the caller's own task.
+///
+/// What the IPC server asks for, because the caller there is one connection's
+/// loop: awaiting a reload in it is a window served nothing for as long as the
+/// folder takes — no state, no session events, and no call video, which is
+/// eight frames deep and overflows in a fraction of a second. Nothing is
+/// waiting for the answer either; what came back is state, and every front end
+/// reads it in the same frame.
+///
+/// Where the work goes is the platform's, for the reason every split in this
+/// module exists: a page's tasks are not `Send` and there is no runtime to
+/// hand one to, so it goes on the loop it is already running on.
+pub fn reload_in_background(plugins: &Arc<Plugins>, account_id: AccountId) {
+    let plugins = Arc::clone(plugins);
+    platform::detach(async move {
+        // Said as what it was. A deferred pass and a loader that fell over
+        // both installed nothing, and both used to be reported as a reload
+        // that finished with none running — over a folder of five healthy
+        // plugins, in the first case, all of them still going.
+        match reload(&plugins, account_id).await {
+            Reloaded::Ran(running) => log::info!("plugins reloaded: {running} running"),
+            Reloaded::Deferred => {
+                log::info!("a plugin reload is already running; it will cover this one");
+            }
+            Reloaded::Kept(running) => {
+                log::warn!("plugins not reloaded; the {running} that were running still are");
+            }
+            Reloaded::Failed => log::warn!("plugins were not reloaded"),
+        }
+    });
+}
+
+/// Put a module in this daemon's plugin folder, and answer the id it claimed.
+///
+/// The folder belongs to whatever runs the plugins, which is this process on
+/// either platform — a directory beside `velod`, or the page's own origin
+/// storage. So a front end asks for this rather than writing the folder: it
+/// may share no filesystem with the daemon, and on the one target where it
+/// did share an address space it reached past the protocol to do it.
+///
+/// Installing grants nothing and starts nothing. What a plugin may do is
+/// recorded separately and read live, and what is *running* changes only at
+/// [`reload`] — which retires the whole generation before it loads the next,
+/// because an id is what an approval and a settings document are keyed on.
+///
+/// # Errors
+///
+/// The name is not one a plugin can have, there is nowhere to keep it, the
+/// folder is full, or the write failed.
+pub async fn install(file_name: &str, bytes: Vec<u8>) -> Result<String, String> {
+    let id = plugin_id(file_name)
+        .ok_or_else(|| format!("`{file_name}` is not a name a plugin can have"))?;
+    platform::install(id, bytes).await
+}
+
+/// Take one back out of it.
+///
+/// Removing what is not there is not a failure: a second press deserves the
+/// answer the first one produced rather than an error about a file it took
+/// away.
+///
+/// # Errors
+///
+/// There is nowhere to look, or the store refused the removal.
+pub async fn uninstall(id: &str) -> Result<(), String> {
+    platform::uninstall(id).await
+}
+
+/// Every plugin id in that folder, loaded or not.
+///
+/// The order and the uniqueness are decided here rather than in each half: an
+/// id is what a settings row is keyed on, and one folder can hold
+/// `autoreply.wasm` beside `autoreply.WASM` — one plugin as far as the loader
+/// is concerned, two rows if this answered what the directory listed.
+///
+/// # Errors
+///
+/// The folder could not be read. Distinct from an empty one, which is the
+/// ordinary account: a failed read must not be drawn as "nothing installed",
+/// because that is the frame in which every Remove button disappears.
+pub async fn names() -> Result<Vec<String>, String> {
+    let mut ids = platform::names().await?;
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// The id a file carries: `autoreply.wasm` is `autoreply`.
+///
+/// Written once for both folders, because the two must not disagree: the file
+/// name *is* the registry key, so a name one half would keep and the other
+/// would skip is a module that installs and never loads. The host's own rule
+/// decides what an id may contain — asked here so an install is refused at
+/// the moment somebody can still choose another file.
+fn plugin_id(file_name: &str) -> Option<String> {
+    let stem = file_name.strip_suffix(".wasm").or_else(|| {
+        // A file picker hands back whatever the operating system called it,
+        // and an uppercase extension is a file like any other.
+        let (stem, ext) = file_name.rsplit_once('.')?;
+        ext.eq_ignore_ascii_case("wasm").then_some(stem)
+    })?;
+    velo_plugin_host::plugin_id_is_usable(stem).then(|| stem.to_owned())
+}
+
+/// Record what somebody answered about a plugin's permissions.
+///
+/// A platform split for one reason, and it is the reason every other one here
+/// exists: a desktop writes and renames a file, which is disk I/O that must
+/// not run on a runtime worker, and a page writes `localStorage`, which is
+/// synchronous by construction and has no blocking pool to be moved to. This
+/// was `spawn_blocking` on both, and on a page that is not a slow answer but
+/// a panic — "there is no reactor running" — so approving a plugin in the
+/// browser has never once worked.
+///
+/// Answers whether it was recorded, and the caller refuses the request rather
+/// than acknowledging a permission nothing holds. Two ways to answer `false`,
+/// and neither used to be said: the store refusing the write — a quota, a
+/// browsing context with no `localStorage`, a disk — where a *grant* is then
+/// rolled back and the plugin is left unapproved, and the thread that was
+/// writing it having panicked.
+pub async fn approve(plugins: &Arc<Plugins>, plugin: String, approved: bool) -> bool {
+    platform::approve(plugins, plugin, approved).await
+}
+
+/// Where a plugin's published interface goes.
+///
+/// Through [`StateHub::set_plugins`], which is to say through the same
+/// versioned channel every other piece of daemon state travels on. Called
+/// from a plugin's own thread, which the hub's lock already accounts for.
+fn publishing_to(hub: &Arc<StateHub>) -> Sink {
+    let hub = Arc::clone(hub);
+    Arc::new(move |surfaces| hub.set_plugins(surfaces))
+}
+
+/// The plugin host's view of the session.
+///
+/// [`Bridge::ask`] is the platform's — a desktop's plugin runs on a thread of
+/// its own and can wait for the answer, a page's cannot — so it lives beside
+/// the rest of the split. Everything a plugin can actually ask for is here,
+/// written once on top of it.
+struct Bridge {
+    commands: SessionCommands,
+}
+
+impl Commands for Bridge {
+    fn send_text(&self, jid: &str, text: &str, quoted: Option<&str>) -> Outcome {
+        self.ask(Action::SendText(velo_ipc::SendText {
+            jid: jid.to_owned(),
+            text: text.to_owned(),
+            // The daemon invents one. A plugin has no bubble to rename, so a
+            // local id would be a token nobody holds.
+            local_id: None,
+            // A plugin knows the id and nothing else, which is all the ABI
+            // gives it. The session does *not* re-read the original —
+            // `quote_context` serializes these fields straight onto the wire —
+            // so the quote bar the peer sees carries the reply's linkage and
+            // an empty body, and in a group it names no author. Filling that
+            // in means a lookup the daemon has no store to make; see the
+            // note in docs/roadmap.md.
+            quoted: quoted.map(|id| velo_core::QuotedMessage {
+                message_id: id.to_owned(),
+                sender: String::new(),
+                sender_name: String::new(),
+                preview: String::new(),
+                kind: None,
+            }),
+        }))
+    }
+
+    fn mark_read(&self, jid: &str, message_id: Option<&str>) -> Outcome {
+        self.ask(Action::MarkRead(velo_ipc::MarkRead {
+            jid: jid.to_owned(),
+            through_message_id: message_id.map(str::to_owned),
+        }))
+    }
+
+    fn typing(&self, jid: &str, composing: bool) -> Outcome {
+        self.ask(Action::Typing(velo_ipc::Typing {
+            jid: jid.to_owned(),
+            composing,
+        }))
+    }
+}

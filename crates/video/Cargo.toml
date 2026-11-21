@@ -1,0 +1,94 @@
+[package]
+name = "velo-video"
+description = "Camera capture and H.264 encoding for video calls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-channel = "2.5.0"
+log = { workspace = true }
+portable-atomic = { workspace = true }
+# `wacore::time::Instant` rather than std's, which /clippy.toml disallows: the
+# same portable clock the rest of the tree stamps against.
+wacore = { workspace = true }
+
+# The device and the codec, which are a platform each. See `src/web/` for the
+# other one, where both are the browser's.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# The camera, on every platform that has one: V4L2 on Linux, AVFoundation on
+# macOS, Media Foundation on Windows. `input-native` is the only feature
+# taken; the defaults would add an MJPEG decoder we reach through the same
+# crate's own path, and `input-opencv` would pull a C++ toolchain.
+nokhwa = { version = "0.10.11", default-features = false, features = [
+    "input-native",
+    "decoding",
+] }
+# The same encoder the GUI already decodes with: one copy of OpenH264 in the
+# tree, and a video call adds no codec the binary did not already carry.
+openh264 = "0.9.9"
+image = { version = "0.25.10", default-features = false, features = ["gif"] }
+mp4 = "0.14.0"
+# Only to get the blocking open and the blocking close off a runtime thread.
+tokio = { workspace = true, features = ["rt"] }
+
+# Read AVFoundation's actual tuples directly: nokhwa 0.10.11's aggregate
+# format lookup inverts its pixel-format filter. This crate is already used
+# transitively by nokhwa; no new backend or registry package is introduced.
+[target.'cfg(target_os = "macos")'.dependencies]
+nokhwa-bindings-macos = "0.2.4"
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+# The one place a browser timer is armed; `/clippy.toml` bans the spelling
+# everywhere else. This crate used to hand-roll its own because the seam was
+# the session's `exec`, which sits above it -- `velo-platform` is below.
+velo-platform = { workspace = true }
+# Not called from here; see the same note in `velo-audio`.
+getrandom = { workspace = true }
+# Racing the camera permission prompt against a ceiling; see `after`.
+futures-lite = "2.6.1"
+getrandom_02 = { workspace = true }
+js-sys = "0.3.106"
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+web-sys = { version = "0.3.106", features = [
+    "CodecState",
+    "Document",
+    "Element",
+    "EncodedVideoChunk",
+    "EncodedVideoChunkType",
+    "HtmlElement",
+    "HtmlMediaElement",
+    "HtmlVideoElement",
+    "LatencyMode",
+    "Location",
+    "MediaDevices",
+    "MediaStream",
+    "MediaStreamConstraints",
+    "Event",
+    "MediaStreamTrack",
+    "MediaStreamTrackState",
+    "Navigator",
+    "Node",
+    "Performance",
+    "VideoEncoder",
+    "VideoEncoderConfig",
+    "VideoEncoderEncodeOptions",
+    "VideoEncoderInit",
+    "VideoEncoderSupport",
+    "VideoFrame",
+    "VideoFrameInit",
+    "Window",
+] }
+
+[dev-dependencies]
+# Round-trip test only: the send path's packetizer against an independent
+# decoder. Production code in this crate never touches the wire format.
+wacore = { workspace = true, features = ["voip"] }
+
+[lints]
+workspace = true

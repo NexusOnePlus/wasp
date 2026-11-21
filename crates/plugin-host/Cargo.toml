@@ -1,0 +1,74 @@
+[package]
+name = "velo-plugin-host"
+description = "Runs .wasm plugins inside the daemon: discovery, sandbox, and the host half of the ABI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+# The parker a plugin's worker is driven by on a desktop, and the `or` that
+# races its queue against a timer in a page. Deliberately not a runtime: a
+# plugin's command reaches the daemon through `blocking_send`, which panics
+# inside a Tokio context, and the worker's future awaits nothing but this
+# crate's own platform calls.
+futures-lite = "2.6.1"
+# A 64-bit capability mask, through portable-atomic rather than std
+# (see /clippy.toml).
+portable-atomic = { workspace = true }
+log = { workspace = true }
+velo-core = { workspace = true }
+# The browser's clock and the browser's loop, written once for the whole
+# workspace. This host sits beside the session rather than above it, so it
+# cannot reach the session's `exec` — which is exactly how it came to carry
+# its own copy of the same `setTimeout`, worker arm and drop guard and all.
+velo-platform = { workspace = true }
+velo-plugin-abi = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["std"] }
+# The interpreter, deliberately: wasmi has no JIT, so nothing here generates
+# code inside the process that holds the account. It also has the two things
+# that make running a stranger's module in-process defensible — fuel metering
+# and a resource limiter — and it does not implement the component model,
+# which is the trade this ABI is built around.
+# The clock behind `oxi_now_ms`, through the library's pluggable
+# TimeProvider rather than std (see /clippy.toml): a plugin observing time
+# must move when a deterministic test moves it.
+wacore = { workspace = true }
+# Wasmi 2 separates bytecode validation and safe dispatch selection from std.
+# auto-dispatch avoids native recursion at opt-level 0 and on wasm without tail calls.
+wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate", "auto-dispatch"] }
+
+# One call, `getuid`, for the check that refuses a plugin another local
+# account could have replaced — through the same crate the daemon and the IPC
+# crate already ask it with, which is what the root manifest says `rustix` is
+# here for: the syscalls this tree needs, as safe wrappers, instead of
+# hand-written `extern "C"`.
+# The queue a plugin's worker takes jobs from, where there is no thread to
+# block: `sync` and `macros` are among the few parts of Tokio that work on
+# `wasm32-unknown-unknown`. Its `time` is not — the clock underneath it is
+# `std::time::Instant`, which traps on this target — so the waits go through
+# `sched`.
+[target.'cfg(target_family = "wasm")'.dependencies]
+tokio = { workspace = true, features = ["sync"] }
+# A plugin's settings, which is the one browser object this crate still names
+# for itself. The timer that used to need `js-sys`, `wasm-bindgen` and a
+# `WorkerGlobalScope` feature beside it now comes from `velo-platform`.
+web-sys = { version = "0.3.106", features = ["Storage", "Window"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[dev-dependencies]
+# Fixture modules are hand-written `.wat` assembled at test time. A `.wasm`
+# checked in would be a binary nobody reviews, and building one in CI would
+# mean a wasm toolchain there for the sake of six tests.
+chrono = { workspace = true, features = ["std", "clock"] }
+# The same synthetic chats and messages every crate above core tests against.
+velo-core = { workspace = true, features = ["fixtures"] }
+wat = "1.262.0"
+
+[lints]
+workspace = true

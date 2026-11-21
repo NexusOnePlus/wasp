@@ -1,0 +1,1070 @@
+//! Real outgoing builders and injected production library events, with no media relay.
+
+use super::*;
+use whatsapp_rust::test_support::CallFixture;
+use whatsapp_rust::wacore_binary::{Node, builder::NodeBuilder};
+
+#[derive(Clone, Copy, Debug)]
+pub enum OutgoingAcceptCase {
+    Video,
+    EarlyVideo,
+    Audio,
+    InvalidOrientation,
+    MissingOrientation,
+    ExplicitOff,
+    Sibling,
+    SiblingOff,
+    SiblingOffAfter,
+    WinnerOffAfter,
+    CameraClosed,
+    CameraReplaced,
+    Ended,
+    PhoneTarget,
+    PhoneTargetCacheLost,
+    PhoneTargetCacheLostWrongUser,
+    WrongUser,
+    Flood,
+}
+
+impl OutgoingAcceptCase {
+    pub const ALL: [Self; 18] = [
+        Self::Video,
+        Self::EarlyVideo,
+        Self::Audio,
+        Self::InvalidOrientation,
+        Self::MissingOrientation,
+        Self::ExplicitOff,
+        Self::Sibling,
+        Self::SiblingOff,
+        Self::SiblingOffAfter,
+        Self::WinnerOffAfter,
+        Self::CameraClosed,
+        Self::CameraReplaced,
+        Self::Ended,
+        Self::PhoneTarget,
+        Self::PhoneTargetCacheLost,
+        Self::PhoneTargetCacheLostWrongUser,
+        Self::WrongUser,
+        Self::Flood,
+    ];
+    pub fn connects(self) -> bool {
+        !matches!(
+            self,
+            Self::Ended | Self::WrongUser | Self::PhoneTargetCacheLostWrongUser
+        )
+    }
+    pub fn remote_expected(self) -> bool {
+        matches!(
+            self,
+            Self::Video
+                | Self::EarlyVideo
+                | Self::InvalidOrientation
+                | Self::MissingOrientation
+                | Self::Sibling
+                | Self::SiblingOff
+                | Self::SiblingOffAfter
+                | Self::PhoneTarget
+                | Self::PhoneTargetCacheLost
+                | Self::Flood
+        )
+    }
+}
+
+fn stanza(
+    fixture: &CallFixture,
+    id: &str,
+    device: u16,
+    tag: &'static str,
+    video: Option<Node>,
+) -> Node {
+    NodeBuilder::new("call")
+        .attr("from", fixture.peer().clone().with_device(device))
+        .attr("id", format!("{tag}-{device}"))
+        .attr("t", "1788840000")
+        .children([NodeBuilder::new(tag)
+            .attr("call-id", id)
+            .attr("call-creator", fixture.client().lid().unwrap())
+            .children(video)
+            .build()])
+        .build()
+}
+
+fn video_state(fixture: &CallFixture, id: &str, device: u16) -> Node {
+    NodeBuilder::new("call")
+        .attr("from", fixture.peer().clone().with_device(device))
+        .attr("id", format!("stopped-{device}"))
+        .attr("t", "1788840000")
+        .children([NodeBuilder::new("video")
+            .attr("call-id", id)
+            .attr("call-creator", fixture.client().lid().unwrap())
+            .attr("state", "6")
+            .build()])
+        .build()
+}
+
+async fn dispatch(
+    fixture: &CallFixture,
+    cursor: &mut usize,
+    calls: &CallRegistry,
+    ui: &UiEventSender,
+) {
+    let events = fixture.events().unwrap();
+    let relevant: Vec<_> = events[*cursor..]
+        .iter()
+        .filter(|event| {
+            matches!(&***event, Event::IncomingCall(_))
+                || matches!(&***event, Event::RawNode(node)
+            if node.get().tag == "call" && node.get().get_optional_child("accept").is_some())
+        })
+        .cloned()
+        .collect();
+    let (_stop, stopping) = tokio::sync::watch::channel(());
+    let (processed, done) = async_channel::bounded(relevant.len().max(1));
+    let names = Arc::new(NameBook::new(None));
+    let mut lanes = crate::whatsapp::lanes::EventLanes::new(
+        {
+            let client = fixture.client().clone();
+            let calls = calls.clone();
+            let ui = ui.clone();
+            let names = names.clone();
+            move |event, epoch| {
+                let client = client.clone();
+                let calls = calls.clone();
+                let ui = ui.clone();
+                let names = names.clone();
+                let processed = processed.clone();
+                async move {
+                    WhatsAppClient::handle_event(
+                        event, client, ui, calls, names, None, None, None, epoch,
+                    )
+                    .await;
+                    processed.send(()).await.unwrap();
+                }
+            }
+        },
+        stopping,
+        calls.clone(),
+        ui.clone(),
+    );
+    let count = relevant.len();
+    for event in relevant {
+        lanes.dispatch(fixture.client(), &names, event).await;
+    }
+    for _ in 0..count {
+        done.recv().await.unwrap();
+    }
+    *cursor = events.len();
+}
+
+pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
+    let fixture = Arc::new(CallFixture::new().await.unwrap());
+    let _raw = fixture.client().acquire_raw_node_forwarding();
+    let calls = CallRegistry::default();
+    let starting_guard = StartGuard {
+        stamp: calls.begin_start("placeholder"),
+        calls: calls.clone(),
+        placeholder: "placeholder".into(),
+    };
+    let (ui, mut events) = ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(ui_queue::HistoryBudget::new()),
+    );
+    let (local, endpoints, _capture) = video::camera_fixture("placeholder", Arc::new(|_, _| {}));
+    let camera = local.camera_id();
+    let (_mic, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
+    let (speaker, _speaker_rx) = async_channel::bounded::<Vec<i16>>(1);
+    let cache_lost = matches!(
+        case,
+        OutgoingAcceptCase::PhoneTargetCacheLost
+            | OutgoingAcceptCase::PhoneTargetCacheLostWrongUser
+    );
+    let wrong_user = matches!(
+        case,
+        OutgoingAcceptCase::WrongUser | OutgoingAcceptCase::PhoneTargetCacheLostWrongUser
+    );
+    let requested = if cache_lost {
+        fixture.cache_peer_phone("15550003333").await
+    } else if matches!(case, OutgoingAcceptCase::PhoneTarget) {
+        fixture
+            .client()
+            .add_lid_pn_mapping(
+                fixture.peer().user.as_ref(),
+                "15550003333",
+                whatsapp_rust::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .unwrap();
+        Jid::pn("15550003333")
+    } else {
+        fixture.peer().clone()
+    };
+    let starting = tokio::spawn({
+        let fixture = fixture.clone();
+        let requested = requested.clone();
+        async move {
+            fixture
+                .client()
+                .voip()
+                .call(&requested)
+                .audio(mic_rx, speaker)
+                .video(endpoints.source, endpoints.sink)
+                .start()
+                .await
+        }
+    });
+    let offer = fixture.next_offer().await.unwrap();
+    if cache_lost {
+        fixture.clear_lid_pn_cache().await;
+        assert!(
+            fixture
+                .client()
+                .get_lid_pn_entry(&requested)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!starting.is_finished());
+    }
+    assert_eq!(
+        offer.stanza().as_node_ref().attrs().optional_jid("to"),
+        Some(fixture.peer().clone())
+    );
+    let id = offer
+        .stanza()
+        .as_node_ref()
+        .get_optional_child("offer")
+        .unwrap()
+        .attrs()
+        .optional_string("call-id")
+        .unwrap()
+        .into_owned();
+    let advertisement = match case {
+        OutgoingAcceptCase::Audio => None,
+        OutgoingAcceptCase::MissingOrientation => {
+            Some(NodeBuilder::new("video").attr("dec", "H264").build())
+        }
+        _ => Some(
+            NodeBuilder::new("video")
+                .attr("dec", "H264")
+                .attr(
+                    "device_orientation",
+                    if matches!(case, OutgoingAcceptCase::InvalidOrientation) {
+                        "4"
+                    } else {
+                        "0"
+                    },
+                )
+                .build(),
+        ),
+    };
+    let accept = if wrong_user {
+        NodeBuilder::new("call")
+            .attr("from", Jid::lid("999999999999999").with_device(2))
+            .attr("id", "wrong-user-accept")
+            .attr("t", "1788840000")
+            .children([NodeBuilder::new("accept")
+                .attr("call-id", id.clone())
+                .attr("call-creator", fixture.client().lid().unwrap())
+                .children(advertisement)
+                .build()])
+            .build()
+    } else {
+        stanza(&fixture, &id, 2, "accept", advertisement)
+    };
+    let early = cache_lost
+        || matches!(
+            case,
+            OutgoingAcceptCase::EarlyVideo | OutgoingAcceptCase::Ended | OutgoingAcceptCase::Flood
+        );
+    let mut injection = early.then(|| {
+        tokio::spawn({
+            let fixture = fixture.clone();
+            let accept = accept.clone();
+            async move {
+                fixture.inject(accept).await.unwrap();
+            }
+        })
+    });
+    if early && wrong_user {
+        // The library now authenticates the answer before selecting a device.
+        // A spoofed early answer completes without mutating the pending call.
+        injection.take().unwrap().await.unwrap();
+        assert!(
+            fixture
+                .call_snapshot(&id)
+                .unwrap()
+                .answering_device
+                .is_none()
+        );
+        assert!(!starting.is_finished());
+    } else if early {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while fixture
+                .call_snapshot(&id)
+                .unwrap()
+                .answering_device
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|error| {
+            panic!("{case:?}: early answering device was not observed: {error}")
+        });
+        assert!(!starting.is_finished());
+    }
+    offer.complete().unwrap();
+    let handle = Arc::new(starting.await.unwrap().unwrap());
+    assert_eq!(handle.call_id(), id);
+    let target = handle.initial_peer_jid().clone();
+    assert_eq!(target, *fixture.peer());
+    if cache_lost {
+        assert!(
+            fixture
+                .client()
+                .get_lid_pn_entry(&requested)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(whatsapp_rust::futures::poll!(std::pin::pin!(handle.wait_ended())).is_pending());
+    }
+    if let Some(injection) = injection {
+        injection.await.unwrap();
+    }
+    use whatsapp_rust::futures::{StreamExt, stream::FuturesUnordered};
+    let mut flooding = FuturesUnordered::new();
+    if matches!(case, OutgoingAcceptCase::Flood) {
+        for index in 0..300 {
+            fixture
+                .inject(stanza(
+                    &fixture,
+                    &format!("unrelated-{index}"),
+                    2,
+                    "accept",
+                    None,
+                ))
+                .await
+                .unwrap();
+        }
+        for event in fixture.events().unwrap() {
+            if let Event::IncomingCall(call) = &*event
+                && call.action.call_id().starts_with("unrelated-")
+            {
+                let calls = calls.clone();
+                let call = call.clone();
+                let ui = ui.clone();
+                flooding.push(async move { calls.accepted(&call, &ui).await });
+            }
+        }
+        assert_eq!(flooding.len(), 300);
+        assert!(whatsapp_rust::futures::poll!(flooding.next()).is_pending());
+        assert!(
+            calls.calls.lock().unwrap().outgoing.is_empty(),
+            "unrelated IDs entered the registry"
+        );
+    }
+    let mut cursor = 0;
+    let mut early_dispatch =
+        (early && !wrong_user).then(|| Box::pin(dispatch(&fixture, &mut cursor, &calls, &ui)));
+    if let Some(dispatching) = &mut early_dispatch {
+        assert!(
+            whatsapp_rust::futures::poll!(dispatching.as_mut()).is_pending(),
+            "early event must await registration"
+        );
+        assert!(events.try_recv().is_err());
+    }
+    assert!(calls.finish_start("placeholder", &id, &handle));
+    local.rename(&id);
+    if matches!(case, OutgoingAcceptCase::CameraClosed) {
+        local.stop().await;
+    } else {
+        assert!(calls.hold_camera(&id, local).await == Camera::Held);
+    }
+    let replacement = if matches!(case, OutgoingAcceptCase::CameraReplaced) {
+        calls.take_camera(&id).unwrap().stop().await;
+        let (local, endpoints, capture) = video::camera_fixture(&id, Arc::new(|_, _| {}));
+        assert!(calls.hold_camera(&id, local).await == Camera::Held);
+        Some((endpoints, capture))
+    } else {
+        None
+    };
+    let mut call_events = handle.take_events().expect("the fixture owns the receiver");
+    let mut watcher = Box::pin(WhatsAppClient::run_call_events(
+        handle.clone(),
+        &mut call_events,
+        calls.clone(),
+        ui.clone(),
+    ));
+    if matches!(
+        case,
+        OutgoingAcceptCase::ExplicitOff | OutgoingAcceptCase::SiblingOff
+    ) {
+        fixture
+            .inject(video_state(
+                &fixture,
+                &id,
+                if matches!(case, OutgoingAcceptCase::SiblingOff) {
+                    0
+                } else {
+                    2
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    if !early {
+        fixture.inject(accept.clone()).await.unwrap();
+    }
+    if matches!(case, OutgoingAcceptCase::Sibling) {
+        fixture
+            .inject(stanza(
+                &fixture,
+                &id,
+                0,
+                "accept",
+                Some(NodeBuilder::new("video").attr("dec", "H264").build()),
+            ))
+            .await
+            .unwrap();
+    }
+    if matches!(case, OutgoingAcceptCase::Ended) {
+        calls.ended_remotely(&id);
+        calls.announce_ending(&id);
+    }
+    ui.send(UiEvent::OutgoingCallStarted {
+        call_id: id.clone(),
+        recipient_jid: requested.to_string(),
+        placeholder_id: "placeholder".into(),
+        is_video: true,
+    })
+    .unwrap();
+    calls.outgoing_ready(&id, &handle, target, Some(camera));
+    drop(starting_guard);
+    while flooding.next().await.is_some() {}
+    if let Some(dispatching) = early_dispatch.take() {
+        dispatching.await;
+    }
+    drop(early_dispatch);
+    dispatch(&fixture, &mut cursor, &calls, &ui).await;
+    if matches!(
+        case,
+        OutgoingAcceptCase::SiblingOffAfter | OutgoingAcceptCase::WinnerOffAfter
+    ) {
+        fixture
+            .inject(video_state(
+                &fixture,
+                &id,
+                if matches!(case, OutgoingAcceptCase::WinnerOffAfter) {
+                    2
+                } else {
+                    0
+                },
+            ))
+            .await
+            .unwrap();
+        dispatch(&fixture, &mut cursor, &calls, &ui).await;
+    }
+    fixture.inject(accept).await.unwrap();
+    dispatch(&fixture, &mut cursor, &calls, &ui).await;
+    let _ = whatsapp_rust::futures::poll!(watcher.as_mut());
+    drop(watcher);
+    assert!(
+        call_events.try_recv().is_err(),
+        "the watcher must drain queued events"
+    );
+    if wrong_user {
+        assert!(
+            fixture
+                .call_snapshot(&id)
+                .unwrap()
+                .answering_device
+                .is_none(),
+            "{case:?}: an unauthenticated answer must not select a device"
+        );
+    } else if !matches!(case, OutgoingAcceptCase::Ended) {
+        assert_eq!(handle.peer_jid(), fixture.peer().clone().with_device(2));
+    }
+    let mut result = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        result.push(event);
+    }
+    let announcements = fixture
+        .outgoing_stanzas()
+        .unwrap()
+        .iter()
+        .filter(|node| {
+            node.as_node_ref()
+                .get_optional_child("video")
+                .is_some_and(|video| video.attrs().optional_string("state").as_deref() == Some("1"))
+        })
+        .count();
+    assert_eq!(
+        announcements, 0,
+        "{case:?}: a video-from-start outgoing accept sends no standalone Enabled announce"
+    );
+    let upgrade_requests = fixture
+        .outgoing_stanzas()
+        .unwrap()
+        .iter()
+        .filter(|node| {
+            node.as_node_ref()
+                .get_optional_child("video")
+                .is_some_and(|video| {
+                    video.attrs().optional_string("state").as_deref() == Some("11")
+                })
+        })
+        .count();
+    // The re-request API only retries an outstanding local upgrade, and a
+    // video-from-start call has none open: no upgrade stanza goes out here
+    // until initiating on live video is designed upstream.
+    assert_eq!(
+        upgrade_requests, 0,
+        "{case:?}: a video-from-start outgoing accept sends no upgrade request"
+    );
+    if let Some(camera) = calls.ended(&id) {
+        camera.stop().await;
+    }
+    drop(replacement);
+    fixture.shutdown().await.unwrap();
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn phone_target_cache_loss_preserves_call_and_rejects_spoofed_winner() {
+        for case in [
+            OutgoingAcceptCase::PhoneTargetCacheLost,
+            OutgoingAcceptCase::PhoneTargetCacheLostWrongUser,
+        ] {
+            let events = outgoing_accept_events(case).await;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, UiEvent::CallAccepted(_)))
+                    .count(),
+                usize::from(case.connects()),
+                "{case:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, UiEvent::CallEnded { .. })),
+                "{case:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_watcher_keeps_upgrade_and_stop_in_source_queue_order() {
+        for (accepting_upgrade, pressure, before_activation) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (false, true, false),
+            (true, false, true),
+            (false, false, true),
+        ] {
+            let fixture = Arc::new(CallFixture::new().await.unwrap());
+            let calls = CallRegistry::default();
+            let guard = StartGuard {
+                stamp: calls.begin_start("pending"),
+                calls: calls.clone(),
+                placeholder: "pending".into(),
+            };
+            let (ui, mut received) = ui_queue::channel(
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(ui_queue::HistoryBudget::new()),
+            );
+            let (_mic, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
+            let (speaker, _speaker_rx) = async_channel::bounded::<Vec<i16>>(1);
+            let starting = tokio::spawn({
+                let fixture = fixture.clone();
+                async move {
+                    fixture
+                        .client()
+                        .voip()
+                        .call(fixture.peer())
+                        .audio(mic_rx, speaker)
+                        .start()
+                        .await
+                }
+            });
+            fixture.next_offer().await.unwrap().complete().unwrap();
+            let handle = Arc::new(starting.await.unwrap().unwrap());
+            let id = handle.call_id();
+            assert!(calls.finish_start("pending", id, &handle));
+            calls.outgoing_ready(id, &handle, fixture.peer().clone(), None);
+            drop(guard);
+            fixture
+                .inject(stanza(&fixture, id, 2, "accept", None))
+                .await
+                .unwrap();
+            let mut cursor = 0;
+            if !before_activation {
+                dispatch(&fixture, &mut cursor, &calls, &ui).await;
+            }
+            while received.try_recv().is_ok() {}
+
+            let capture = if accepting_upgrade {
+                let (local, endpoints, capture) = video::camera_fixture(id, Arc::new(|_, _| {}));
+                calls.begin_upgrade(id, local.camera_id());
+                handle
+                    .start_video(endpoints.source, endpoints.sink)
+                    .await
+                    .unwrap();
+                local.live();
+                assert!(calls.hold_camera(id, local).await == Camera::Held);
+                Some(capture)
+            } else {
+                None
+            };
+            let video = |state: VideoState, sequence: usize| {
+                NodeBuilder::new("call")
+                    .attr("from", fixture.peer().clone().with_device(2))
+                    .attr("id", format!("ordered-{sequence}"))
+                    .attr("t", "1788840000")
+                    .children([NodeBuilder::new("video")
+                        .attr("call-id", id)
+                        .attr("call-creator", fixture.client().lid().unwrap())
+                        .attr("state", state.code().to_string())
+                        .attr("dec", "H264")
+                        .build()])
+                    .build()
+            };
+            let mut queue = handle.take_events().expect("the fixture owns the receiver");
+            if pressure {
+                for index in 0..1024 {
+                    fixture
+                        .inject(video(VideoState::Paused, index))
+                        .await
+                        .unwrap();
+                }
+            }
+            fixture
+                .inject(video(
+                    if accepting_upgrade {
+                        VideoState::UpgradeAccept
+                    } else {
+                        VideoState::UpgradeRequestV2
+                    },
+                    1000,
+                ))
+                .await
+                .unwrap();
+            fixture
+                .inject(video(VideoState::Stopped, 1001))
+                .await
+                .unwrap();
+            let mut watching = Box::pin(WhatsAppClient::run_call_events(
+                handle.clone(),
+                &mut queue,
+                calls.clone(),
+                ui.clone(),
+            ));
+            if before_activation {
+                assert!(whatsapp_rust::futures::poll!(watching.as_mut()).is_pending());
+                let held = calls.calls.lock().unwrap();
+                let pending = held.outgoing[id].peer_video.as_ref().unwrap();
+                assert_eq!(pending.source, fixture.peer().clone().with_device(2));
+                assert_eq!(pending.upgrade_token.is_some(), !accepting_upgrade);
+            }
+            // Normal cases hold the watcher; the last two reverse that scheduling.
+            dispatch(&fixture, &mut cursor, &calls, &ui).await;
+            let mut global_changes = Vec::new();
+            while let Ok(event) = received.try_recv() {
+                global_changes.push(event);
+            }
+            let _ = whatsapp_rust::futures::poll!(watching.as_mut());
+            drop(watching);
+            assert!(
+                queue.try_recv().is_err(),
+                "the watcher must drain queued events"
+            );
+            let mut remote = None;
+            let mut requested = false;
+            while let Ok(event) = received.try_recv() {
+                match event {
+                    UiEvent::CallVideoChanged {
+                        stream: VideoStream::Remote,
+                        on,
+                        ..
+                    } => remote = Some(on),
+                    UiEvent::CallVideoRequested { pending, .. } => requested = pending,
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                remote,
+                Some(false),
+                "accept={accepting_upgrade}, pressure={pressure}"
+            );
+            assert!(!requested, "a stopped request was resurrected");
+            assert!(!calls.upgrade_pending(id));
+            assert!(!calls.calls.lock().unwrap().upgrades.contains_key(id));
+            assert!(
+                before_activation || global_changes.is_empty(),
+                "global video events still mutate call state"
+            );
+            if let Some(camera) = calls.ended(id) {
+                camera.stop().await;
+            }
+            drop(capture);
+            fixture.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn losing_sibling_state_cannot_override_winning_accept() {
+        for case in [
+            OutgoingAcceptCase::SiblingOff,
+            OutgoingAcceptCase::SiblingOffAfter,
+        ] {
+            let events = outgoing_accept_events(case).await;
+            let remote: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    UiEvent::CallVideoChanged {
+                        stream: VideoStream::Remote,
+                        on,
+                        ..
+                    } => Some(*on),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !remote.is_empty() && remote.iter().all(|on| *on),
+                "{case:?}: {remote:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn real_call_acceptance_cases() {
+        for case in OutgoingAcceptCase::ALL {
+            let events = outgoing_accept_events(case).await;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, UiEvent::CallAccepted(_)))
+                    .count(),
+                usize::from(case.connects()),
+                "{case:?}"
+            );
+            let remote = events
+                .iter()
+                .filter_map(|event| match event {
+                    UiEvent::CallVideoChanged {
+                        stream: VideoStream::Remote,
+                        on,
+                        ..
+                    } => Some(*on),
+                    _ => None,
+                })
+                .next_back()
+                .unwrap_or(false);
+            assert_eq!(remote, case.remote_expected(), "{case:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn arbitrary_accept_ids_are_not_admitted_by_an_unrelated_start() {
+        let fixture = CallFixture::new().await.unwrap();
+        let calls = CallRegistry::default();
+        calls.begin_start("placeholder");
+        let (ui, _) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
+        fixture
+            .inject(stanza(&fixture, "unrelated", 2, "accept", None))
+            .await
+            .unwrap();
+        let events = fixture.events().unwrap();
+        let call = events
+            .iter()
+            .find_map(|event| match &**event {
+                Event::IncomingCall(call) if call.action.call_id() == "unrelated" => {
+                    Some(call.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let mut accepting = std::pin::pin!(calls.accepted(&call, &ui));
+        let _ = whatsapp_rust::futures::poll!(accepting.as_mut());
+        assert!(calls.calls.lock().unwrap().outgoing.is_empty());
+        calls.abandon_start("placeholder");
+        tokio::time::timeout(std::time::Duration::from_secs(1), accepting)
+            .await
+            .unwrap();
+        fixture.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn registration_waiters_follow_real_builder_completion_failure_and_cancellation() {
+        for ending in ["complete", "fail", "cancel", "drop"] {
+            let fixture = Arc::new(CallFixture::new().await.unwrap());
+            let calls = CallRegistry::default();
+            let guard = StartGuard {
+                stamp: calls.begin_start("pending"),
+                calls: calls.clone(),
+                placeholder: "pending".into(),
+            };
+            let (_mic, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
+            let (speaker, _speaker_rx) = async_channel::bounded::<Vec<i16>>(1);
+            let starting = tokio::spawn({
+                let fixture = fixture.clone();
+                let calls = calls.clone();
+                async move {
+                    let _guard = guard;
+                    let result = fixture
+                        .client()
+                        .voip()
+                        .call(fixture.peer())
+                        .audio(mic_rx, speaker)
+                        .start()
+                        .await;
+                    match result {
+                        Ok(handle) => {
+                            let handle = Arc::new(handle);
+                            assert!(calls.finish_start("pending", handle.call_id(), &handle));
+                            calls.outgoing_ready(
+                                handle.call_id(),
+                                &handle,
+                                fixture.peer().clone(),
+                                None,
+                            );
+                            Some(handle)
+                        }
+                        Err(_) => {
+                            calls.abandon_start("pending");
+                            None
+                        }
+                    }
+                }
+            });
+            let offer = fixture.next_offer().await.unwrap();
+            let id = offer
+                .stanza()
+                .as_node_ref()
+                .get_optional_child("offer")
+                .unwrap()
+                .attrs()
+                .optional_string("call-id")
+                .unwrap()
+                .into_owned();
+            let mut waiter = std::pin::pin!(calls.registered_outgoing(&id));
+            assert!(whatsapp_rust::futures::poll!(waiter.as_mut()).is_pending());
+            match ending {
+                "complete" => {
+                    offer.complete().unwrap();
+                    let handle = starting.await.unwrap().unwrap();
+                    let registered =
+                        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    assert!(Arc::ptr_eq(&handle, &registered));
+                }
+                "drop" => {
+                    starting.abort();
+                    assert!(starting.await.err().unwrap().is_cancelled());
+                    let _ = offer.fail();
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+                other => {
+                    if other == "cancel" {
+                        assert!(matches!(calls.cancel("pending"), Cancelled::Deferred));
+                        calls.begin_start("replacement");
+                        assert!(
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(1),
+                                waiter.as_mut()
+                            )
+                            .await
+                            .unwrap()
+                            .is_none()
+                        );
+                        assert!(!starting.is_finished());
+                    }
+                    offer.fail().unwrap();
+                    assert!(starting.await.unwrap().is_none());
+                    if other == "fail" {
+                        assert!(
+                            tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                                .await
+                                .unwrap()
+                                .is_none()
+                        );
+                    }
+                }
+            }
+            fixture.shutdown().await.unwrap();
+        }
+    }
+
+    /// A re-enable the peer never answers must be withdrawn by us, well
+    /// before the library's own upgrade timeout: the timeout would send
+    /// `UpgradeCancelByTimeout`, which the peer applies by tearing its own
+    /// direction down too, collapsing the whole call. Withdrawing first sends
+    /// `Stopped`, spares the peer, and leaves the library with nothing
+    /// pending — so a later retry can begin rather than being refused.
+    #[tokio::test]
+    async fn unanswered_reenable_is_withdrawn_before_the_library_timeout() {
+        let fixture = Arc::new(CallFixture::new().await.unwrap());
+        let calls = CallRegistry::default();
+        let guard = StartGuard {
+            stamp: calls.begin_start("pending"),
+            calls: calls.clone(),
+            placeholder: "pending".into(),
+        };
+        let (ui, mut received) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
+        let (_mic, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
+        let (speaker, _speaker_rx) = async_channel::bounded::<Vec<i16>>(1);
+        let starting = tokio::spawn({
+            let fixture = fixture.clone();
+            async move {
+                fixture
+                    .client()
+                    .voip()
+                    .call(fixture.peer())
+                    .audio(mic_rx, speaker)
+                    .start()
+                    .await
+            }
+        });
+        fixture.next_offer().await.unwrap().complete().unwrap();
+        let handle = Arc::new(starting.await.unwrap().unwrap());
+        let id = handle.call_id().to_string();
+        assert!(calls.finish_start("pending", &id, &handle));
+        calls.outgoing_ready(&id, &handle, fixture.peer().clone(), None);
+        drop(guard);
+        let video_state = |wanted: &str| {
+            fixture
+                .outgoing_stanzas()
+                .unwrap()
+                .iter()
+                .filter(|node| {
+                    node.as_node_ref()
+                        .get_optional_child("video")
+                        .is_some_and(|video| {
+                            video.attrs().optional_string("state").as_deref() == Some(wanted)
+                        })
+                })
+                .count()
+        };
+        // A loss report fired here would be the pump mistaking our own
+        // endpoint release for a device failure: the pre-empt stops the peer
+        // stanza first and the device second, and the pump must read the
+        // release as asked-for.
+        let lost: Arc<std::sync::Mutex<Vec<(String, video::CameraId)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lost_callback = {
+            let lost = lost.clone();
+            Arc::new(move |call_id: String, camera_id: video::CameraId| {
+                lost.lock().unwrap().push((call_id, camera_id));
+            })
+        };
+        // Twice, the way the retested call went: re-enable, an ack with a
+        // re-key, then silence — no accept, no enable. Each unanswered
+        // attempt must be withdrawn the same way, and a later retry must
+        // never find the earlier one still pending.
+        for cycle in 1..=2 {
+            let (local, endpoints, _capture) = video::camera_fixture(&id, lost_callback.clone());
+            let camera_id = local.camera_id();
+            let sink_probe = endpoints.sink.clone();
+            calls.begin_upgrade(&id, camera_id);
+            handle
+                .start_video(endpoints.source, endpoints.sink)
+                .await
+                .unwrap();
+            local.live();
+            assert!(calls.hold_camera(&id, local).await == Camera::Held);
+            let lane = calls.video_lane(&id);
+            let seq = {
+                let mut intent = lane.intent.lock().expect("video intent poisoned");
+                intent.seq += 1;
+                intent.seq
+            };
+            while received.try_recv().is_ok() {}
+            WhatsAppClient::watch_upgrade_attempt(
+                calls.clone(),
+                ui.clone(),
+                id.clone(),
+                camera_id,
+                lane,
+                seq,
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+            assert_eq!(video_state("11"), cycle, "each attempt itself goes out");
+            assert_eq!(
+                video_state("6"),
+                cycle,
+                "each unanswered attempt is withdrawn with Stopped"
+            );
+            assert_eq!(
+                video_state("9"),
+                0,
+                "withdrawing first leaves the library timeout nothing to cancel"
+            );
+            assert!(
+                !calls.upgrade_pending(&id),
+                "the attempt is gone from our map too"
+            );
+            assert!(
+                !calls.calls.lock().unwrap().cameras.contains_key(&id),
+                "the attempt's camera is released"
+            );
+            assert!(
+                calls.calls.lock().unwrap().remotes.contains_key(&id),
+                "the withdrawn attempt's remote half is retained, not dropped"
+            );
+            assert!(
+                !sink_probe.is_closed(),
+                "the peer's sink stays attached across the withdrawal"
+            );
+            assert!(
+                lost.lock().unwrap().is_empty(),
+                "withdrawing an attempt is not a device loss"
+            );
+            assert!(
+                matches!(
+                    received.try_recv(),
+                    Ok(UiEvent::CallVideoChanged {
+                        stream: VideoStream::Local,
+                        on: false,
+                        ..
+                    })
+                ),
+                "the attempt settles off"
+            );
+        }
+        // The disarm proof, without waiting out the five-second library
+        // timeout: a fresh upgrade begins, which a still-pending one refuses.
+        let (retry, retry_endpoints, _capture) = video::camera_fixture(&id, lost_callback.clone());
+        calls.begin_upgrade(&id, retry.camera_id());
+        handle
+            .start_video(retry_endpoints.source, retry_endpoints.sink)
+            .await
+            .expect("a withdrawn attempt must not wedge the next one");
+        assert_eq!(video_state("11"), 3, "the retry goes out as a new upgrade");
+        if let Some(camera) = calls.ended(&id) {
+            camera.stop().await;
+        }
+        handle.hangup_local().await;
+        fixture.shutdown().await.unwrap();
+    }
+}

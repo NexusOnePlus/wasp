@@ -1,0 +1,75 @@
+//! The wire protocol between `velod` and its front ends.
+//!
+//! Types only: no sockets, no runtime. Both sides depend on this crate so a
+//! protocol change breaks compilation rather than a running client.
+//!
+//! # Why a state version
+//!
+//! A client that connects mid-stream needs the current state and every event
+//! after it, with nothing lost or applied twice. Taking a snapshot and *then*
+//! subscribing drops whatever happens in between; subscribing and then
+//! snapshotting delivers events the snapshot already reflects.
+//!
+//! Every mutation bumps [`StateVersion`]. The snapshot carries the version it
+//! was taken at, each event carries the version it produced, and a client
+//! discards events at or below its snapshot's version. The daemon can then
+//! subscribe first and snapshot second, which loses nothing, and the duplicate
+//! window resolves on the client with a comparison rather than a lock.
+
+// Every client-side transport lives under `endpoint`, whatever it is made of:
+// a Unix socket, a Windows named pipe, or — where the front end is a page — a
+// WebSocket. That is the whole of the platform split on this side (see
+// /AGENTS.md); everything above it gets [`Link`] and never mentions any of
+// them.
+#[cfg(not(target_family = "wasm"))]
+pub mod client;
+mod endpoint;
+/// Where a frame ends, and how long one may be — the framing this crate
+/// exists to put around the domain types.
+pub mod framing;
+mod link;
+#[cfg(feature = "legacy-protocol")]
+mod protocol;
+/// How a tab with no session finds the tab that has one.
+pub mod tabs;
+mod transport;
+/// The browser's own answer to "is that other agent still there".
+#[cfg(target_family = "wasm")]
+pub mod web_locks;
+#[cfg(windows)]
+pub mod windows_user;
+
+#[cfg(not(target_family = "wasm"))]
+pub use client::IpcClient;
+#[cfg(target_family = "wasm")]
+pub use endpoint::tab;
+#[cfg(target_family = "wasm")]
+pub use endpoint::web;
+#[cfg(not(target_family = "wasm"))]
+pub use endpoint::{Endpoint, Hangup, Reader, Writer};
+pub use framing::{
+    FrameRead, FrameResult, MAX_DAEMON_FRAME_BYTES, MAX_REQUEST_BYTES, read_frame, read_frame_with,
+};
+pub use link::Link;
+#[cfg(feature = "legacy-protocol")]
+pub use protocol::{
+    AccountIdentity, AccountOverview, AccountStatus, AccountsSnapshot, AvatarDemand, CallAction,
+    CallDeviceAction, CallDeviceReply, CameraPreviewFrame, ChatAction, ChatSummary, ClientRequest,
+    ClientScope, ConnectionState, ContactSummary, DaemonEvent, DaemonMessage, Download,
+    EditMessage, EnsureAvatars, FileMatch, GroupMembers, InstallPlugin, LoadChats, LoadMessages,
+    MarkAudioPlayed, MarkRead, MarkStatusWatched, MessagePreview, PageCursor, PairingCode,
+    ProtocolError, Request, RequestId, RevokeMessage, SendAudio, SendMedia, SendReaction, SendText,
+    StateSnapshot, StateVersion, Typing, VotePoll,
+};
+pub use transport::{
+    ACCOUNT_STAGED_INFIX, DEFAULT_WEB_PORT, MAX_STAGED_BYTES, PROTOCOL_VERSION, STAGED_PREFIX,
+    WEB_MEDIA_PATH, WEB_SOCKET_PATH, account_id, account_prefix_of, account_sockets, endpoint_path,
+    endpoint_path_for_account, is_account_staged_key, is_global_staged_key, is_staged_key,
+    key_local_name, lock_path, media_dir, media_path, staged_key, state_dir, web_token_path,
+};
+pub use velo_wire as wire;
+// The `AccountId`-shaped helpers, gated with the domain crate they name.
+#[cfg(feature = "legacy-protocol")]
+pub use transport::{
+    account_id_of, account_staged_key, account_staged_prefix, account_staged_prefix_of,
+};

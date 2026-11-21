@@ -1,0 +1,628 @@
+//! Bulk arrivals: a history sync payload, a batch a hook has already
+//! committed, and what hydrating a large history costs.
+
+// Tests exercise the raw buffa API.
+#![allow(clippy::disallowed_methods)]
+
+mod common;
+
+use common::*;
+
+/// A message can create the row before the conversation snapshot arrives.
+/// History supplies the initial mute/archive state, but an explicit app-state
+/// update (including false/NULL) outranks any stale snapshot replay.
+#[tokio::test]
+async fn history_prefills_live_row_without_overwriting_appstate() {
+    let (_store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("first"),
+            incoming_info(PEER, PEER, "MSG-PREF", 1_700_000_000),
+        )],
+    )
+    .await;
+    assert!(
+        chat_store
+            .notification_metadata(&jid(PEER))
+            .await
+            .unwrap()
+            .unwrap()
+            .allowed
+    );
+
+    let snapshot = |muted: bool, archived: bool| {
+        history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(1_700_000_000);
+                constructed.mute_end_time = muted.then_some(1_900_000_000);
+                constructed.archived = Some(archived);
+                constructed
+            }];
+            constructed
+        })
+    };
+    feed(&chat_store, [snapshot(true, true)]).await;
+    let state = chat_store
+        .notification_metadata(&jid(PEER))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(state.muted);
+    assert!(state.archived);
+    assert!(!state.allowed);
+
+    // A later history chunk may still refresh both fields before any
+    // app-state event has established a newer authoritative value.
+    feed(&chat_store, [snapshot(false, false)]).await;
+    assert!(
+        chat_store
+            .notification_metadata(&jid(PEER))
+            .await
+            .unwrap()
+            .unwrap()
+            .allowed
+    );
+
+    feed(
+        &chat_store,
+        [
+            Event::MuteUpdate(
+                wacore::types::events::MuteUpdate::builder()
+                    .jid(jid(PEER))
+                    .timestamp(ts(1_700_000_100))
+                    .action(Box::new({
+                        let mut constructed: wa::sync_action_value::MuteAction = Default::default();
+                        constructed.muted = Some(false);
+                        constructed
+                    }))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+            Event::ArchiveUpdate(
+                wacore::types::events::ArchiveUpdate::builder()
+                    .jid(jid(PEER))
+                    .timestamp(ts(1_700_000_100))
+                    .action(Box::new({
+                        let mut constructed: wa::sync_action_value::ArchiveChatAction =
+                            Default::default();
+                        constructed.archived = Some(false);
+                        constructed
+                    }))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+        ],
+    )
+    .await;
+    feed(&chat_store, [snapshot(true, true)]).await;
+    let state = chat_store
+        .notification_metadata(&jid(PEER))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!state.muted);
+    assert!(!state.archived);
+    assert!(state.allowed);
+}
+
+#[tokio::test]
+async fn missing_preference_options_do_not_unmute_or_unarchive() {
+    let (_store, chat_store) = test_store().await;
+    let snapshot = |muted: bool, archived: Option<bool>| {
+        history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                // Present zero is an explicit unmute on the wire, not a
+                // missing preference.
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(1_700_000_000);
+                constructed.mute_end_time = Some(if muted { 1_900_000_000 } else { 0 });
+                constructed.archived = archived;
+                constructed
+            }];
+            constructed
+        })
+    };
+    feed(&chat_store, [snapshot(true, Some(true))]).await;
+    feed(
+        &chat_store,
+        [
+            Event::MuteUpdate(
+                wacore::types::events::MuteUpdate::builder()
+                    .jid(jid(PEER))
+                    .timestamp(ts(1_700_000_100))
+                    .action(Box::new(wa::sync_action_value::MuteAction::default()))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+            Event::ArchiveUpdate(
+                wacore::types::events::ArchiveUpdate::builder()
+                    .jid(jid(PEER))
+                    .timestamp(ts(1_700_000_100))
+                    .action(Box::new(wa::sync_action_value::ArchiveChatAction::default()))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+        ],
+    )
+    .await;
+    let state = chat_store
+        .notification_metadata(&jid(PEER))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(state.muted);
+    assert!(state.archived);
+
+    feed(&chat_store, [snapshot(true, None)]).await;
+    assert!(
+        chat_store
+            .notification_metadata(&jid(PEER))
+            .await
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+
+    // An explicit unmute and unarchive from history still apply: the missing
+    // actions above must not have marked either preference app-state authoritative.
+    feed(&chat_store, [snapshot(false, Some(false))]).await;
+    let state = chat_store
+        .notification_metadata(&jid(PEER))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!state.muted);
+    assert!(!state.archived);
+    assert!(state.allowed);
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    let chat = chats.iter().find(|chat| chat.jid == jid(PEER)).unwrap();
+    assert!(chat.muted_until.is_none());
+}
+
+#[tokio::test]
+async fn history_sync_materializes_without_clobbering_live_rows() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    // A live copy arrives first (e.g. offline drain beat the history chunk).
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("live copy"),
+            incoming_info(PEER, PEER, "MSG-H1", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    let make_wmi = |id: &str, from_me: bool, ts: u64, text: &str| {
+        let mut constructed: wa::WebMessageInfo = Default::default();
+        constructed.key = MessageField::some({
+            let mut constructed: wa::MessageKey = Default::default();
+            constructed.remote_jid = Some(PEER.into());
+            constructed.from_me = Some(from_me);
+            constructed.id = Some(id.into());
+            constructed
+        });
+        constructed.message = MessageField::from_box(Box::new(wa::Message::text(text)));
+        constructed.message_timestamp = Some(ts);
+        constructed.status = Some(wa::web_message_info::Status::READ);
+        constructed.push_name = Some("Alice Example".into());
+        constructed
+    };
+    let history = {
+        let mut constructed: wa::HistorySync = Default::default();
+        constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+        constructed.conversations = vec![
+            // Fresh chat (no live row): mute/pin land via the INSERT path.
+            // Wire values are unix seconds; the store must convert to ms.
+            {
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = "559900000004@s.whatsapp.net".to_string();
+                constructed.conversation_timestamp = Some(1_700_000_500);
+                constructed.mute_end_time = Some(1_800_000_000);
+                constructed.pinned = Some(1_700_000_800);
+                constructed.username = Some("alice_example".to_string());
+                constructed.unread_count = Some(7);
+                constructed.marked_as_unread = Some(true);
+                constructed
+            },
+            {
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.to_string();
+                constructed.name = Some("Alice".into());
+                constructed.conversation_timestamp = Some(1_700_000_900);
+                constructed.unread_count = Some(0);
+                constructed.messages = vec![
+                    {
+                        let mut constructed: wa::HistorySyncMsg = Default::default();
+                        constructed.message = MessageField::some(make_wmi(
+                            "MSG-H1",
+                            false,
+                            1_700_000_000,
+                            "stale history copy",
+                        ));
+                        constructed
+                    },
+                    {
+                        let mut constructed: wa::HistorySyncMsg = Default::default();
+                        constructed.message =
+                            MessageField::some(make_wmi("MSG-H2", true, 1_700_000_900, "sent"));
+                        constructed
+                    },
+                ];
+                constructed
+            },
+        ];
+        constructed.pushnames = vec![{
+            let mut constructed: wa::Pushname = Default::default();
+            constructed.id = Some("559900000003@s.whatsapp.net".into());
+            constructed.pushname = Some("Bob Example".into());
+            constructed
+        }];
+        constructed
+    };
+
+    feed(&chat_store, [history_sync_event(history)]).await;
+
+    // Chat identity from history; live message content preserved.
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats.len(), 2);
+    let alice = chats
+        .iter()
+        .find(|c| c.jid == jid(PEER))
+        .expect("alice chat");
+    assert_eq!(alice.name.as_deref(), Some("Alice"));
+    // History backfills the denormalized preview (newest materialized row).
+    assert_eq!(alice.last_message_preview.as_deref(), Some("sent"));
+    assert_eq!(alice.last_message_kind, Some(MessageKind::Text));
+    // Seconds-to-ms conversion: a future mute/pin must not decode as 1970.
+    let muted = chats
+        .iter()
+        .find(|c| c.jid == jid("559900000004@s.whatsapp.net"))
+        .expect("muted chat");
+    assert_eq!(muted.name.as_deref(), Some("alice_example"));
+    assert_eq!(muted.unread_count, -1);
+    assert!(muted.muted_until.unwrap().year() > 2020);
+    assert!(muted.pinned_at.unwrap().year() > 2020);
+
+    let live = chat_store.message(&chat, "MSG-H1").await.unwrap().unwrap();
+    assert_eq!(live.text.as_deref(), Some("live copy"));
+
+    let hist = chat_store.message(&chat, "MSG-H2").await.unwrap().unwrap();
+    assert!(hist.from_me);
+    assert_eq!(hist.text.as_deref(), Some("sent"));
+    assert_eq!(hist.status, MessageStatus::Read);
+
+    // Pushnames from the remainder landed.
+    let bob = chat_store
+        .contact(&jid("559900000003@s.whatsapp.net"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bob.push_name.as_deref(), Some("Bob Example"));
+}
+
+fn hook_committed_event(id: &str) -> Event {
+    Event::Messages(
+        MessageBatch::builder()
+            .messages(Arc::from([InboundMessage::builder()
+                .message(Arc::new(wa::Message::text("already durable")))
+                .info(Arc::new(incoming_info(PEER, PEER, id, 1_700_000_000)))
+                .build()]))
+            .origin(BatchOrigin::Live)
+            .hook_committed(true)
+            .build(),
+    )
+}
+
+/// Once the host declares that its hook feeds this store, a batch the hook
+/// committed must not be applied a second time — the duplicate pass is a full
+/// proto UPDATE plus an FTS delete+insert plus a doubled invalidation fan-out,
+/// not a cheap no-op.
+#[tokio::test]
+async fn hook_committed_batch_is_skipped_when_opted_in() {
+    let (_store, chat_store) = test_store().await;
+    chat_store.skip_hook_committed_batches(true);
+
+    feed(&chat_store, [hook_committed_event("MSG-HOOKED")]).await;
+
+    assert!(chat_store.chats(false, 10).await.unwrap().is_empty());
+    assert!(
+        chat_store
+            .message(&jid(PEER), "MSG-HOOKED")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// The marker alone means "some hook committed this", not "this store already
+/// has it". A host whose hook persists elsewhere still needs every batch, so
+/// the default must materialize it — skipping would lose acknowledged
+/// messages out of history, previews and subscriptions.
+#[tokio::test]
+async fn hook_committed_batch_is_materialized_by_default() {
+    let (_store, chat_store) = test_store().await;
+
+    feed(&chat_store, [hook_committed_event("MSG-OTHER-HOOK")]).await;
+
+    assert_eq!(
+        chat_store
+            .message(&jid(PEER), "MSG-OTHER-HOOK")
+            .await
+            .unwrap()
+            .expect("a hook that writes elsewhere leaves this store the only materializer")
+            .text
+            .as_deref(),
+        Some("already durable")
+    );
+}
+
+/// The producers that bypass the commit pipeline (newsletters, PDO recovery)
+/// leave the marker unset, and this handler stays their only materializer.
+#[tokio::test]
+async fn unmarked_batch_is_still_materialized() {
+    let (_store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("only copy"),
+            incoming_info(PEER, PEER, "MSG-UNHOOKED", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    assert_eq!(
+        chat_store
+            .message(&jid(PEER), "MSG-UNHOOKED")
+            .await
+            .unwrap()
+            .expect("row")
+            .text
+            .as_deref(),
+        Some("only copy")
+    );
+}
+
+/// A stopwatch rather than an assertion: what a front end's attach pays to
+/// read the history it is about to draw.
+///
+/// Ignored by default because it is a measurement — it asserts only that the
+/// two paths agree, which is the part worth keeping honest. Run it with
+/// `cargo test -p velo-chat-store -- --ignored --nocapture hydration_costs`.
+#[tokio::test]
+#[ignore = "a measurement, not an assertion"]
+async fn history_hydration_costs() {
+    const CHATS: usize = 30;
+    const MESSAGES: usize = 50;
+
+    let (_store, chat_store) = test_store().await;
+
+    let mut events = Vec::new();
+    for c in 0..CHATS {
+        let chat = format!("55990000{c:04}@s.whatsapp.net");
+        for m in 0..MESSAGES {
+            let id = format!("M-{c}-{m}");
+            events.push(message_event(
+                wa::Message::text("mensagem"),
+                incoming_info(&chat, &chat, &id, 1_700_000_000 + (m as i64)),
+            ));
+            // A tenth of the page carries one, which is generous: most
+            // messages have none, and that is exactly what the per-message
+            // query was spending a pooled read to discover.
+            if m % 10 == 0 {
+                events.push(message_event(
+                    {
+                        let mut constructed: wa::Message = Default::default();
+                        constructed.reaction_message = MessageField::some({
+                            let mut constructed: wa::message::ReactionMessage = Default::default();
+                            constructed.key = MessageField::some({
+                                let mut constructed: wa::MessageKey = Default::default();
+                                constructed.id = Some(id.clone());
+                                constructed.remote_jid = Some(chat.clone());
+                                constructed.from_me = Some(false);
+                                constructed
+                            });
+                            constructed.text = Some("👍".into());
+                            constructed
+                        });
+                        constructed
+                    },
+                    incoming_info(&chat, &chat, &format!("R-{c}-{m}"), 1_700_000_100),
+                ));
+            }
+        }
+    }
+    // Respect bounded synchronous writer admission when seeding the measurement.
+    let materialize_started = wacore::time::Instant::now();
+    for chunk in events.chunks(128) {
+        feed(&chat_store, chunk.iter().cloned()).await;
+    }
+    eprintln!(
+        "materialize 1650 synthetic events: {:?}",
+        materialize_started.elapsed()
+    );
+
+    let entries = chat_store.chats(false, 100).await.unwrap();
+    assert_eq!(entries.len(), CHATS);
+
+    let started = wacore::time::Instant::now();
+    let mut pages = Vec::new();
+    for entry in &entries {
+        let page = chat_store
+            .messages(&entry.jid, None, MESSAGES as i64)
+            .await
+            .unwrap();
+        pages.push((entry.jid.clone(), page));
+    }
+    let per_chat_pages = started.elapsed();
+
+    let started = wacore::time::Instant::now();
+    let batched_pages = chat_store
+        .pages(
+            entries
+                .iter()
+                .map(|entry| (entry.jid.clone(), MESSAGES as i64))
+                .collect(),
+        )
+        .await
+        .unwrap();
+    let one_read_pages = started.elapsed();
+
+    // What an attach reads now: the newest rows the daemon needs of each
+    // chat, rather than a page of timeline nobody has asked to see.
+    let started = wacore::time::Instant::now();
+    let attach = chat_store
+        .pages(entries.iter().map(|entry| (entry.jid.clone(), 8)).collect())
+        .await
+        .unwrap();
+    let attach_read = started.elapsed();
+    assert_eq!(attach.len(), batched_pages.len(), "the same chats");
+    assert_eq!(batched_pages.len(), pages.len(), "the same chats");
+    for (chat, page) in &pages {
+        assert_eq!(
+            batched_pages[&chat.to_string()].len(),
+            page.len(),
+            "the same page for {chat}"
+        );
+    }
+
+    let started = wacore::time::Instant::now();
+    let mut one_by_one = 0usize;
+    for (chat, page) in &pages {
+        for message in page {
+            one_by_one += chat_store.reactions(chat, &message.id).await.unwrap().len();
+        }
+    }
+    let per_message = started.elapsed();
+
+    let started = wacore::time::Instant::now();
+    let mut batched = 0usize;
+    for (chat, page) in &pages {
+        let ids: Vec<String> = page.iter().map(|m| m.id.clone()).collect();
+        batched += chat_store
+            .reactions_for(chat, ids)
+            .await
+            .unwrap()
+            .values()
+            .map(Vec::len)
+            .sum::<usize>();
+    }
+    let per_chat = started.elapsed();
+
+    assert_eq!(one_by_one, batched, "the two paths read the same reactions");
+    println!(
+        "{CHATS} chats x {MESSAGES} messages\n  \
+         reactions: per-message {per_message:?} -> per-chat {per_chat:?}\n  \
+         pages:     per-chat {per_chat_pages:?} -> one read {one_read_pages:?}\n  \
+         attach:    8 per chat in one read {attach_read:?}"
+    );
+}
+
+/// The counterfactual gate: a stored name survives a nameless sync.
+///
+/// A live group row holds a name the metadata pass wrote; a later history
+/// chunk for the same conversation carries none. History is the stale copy,
+/// so the chunk must not erase what it does not know — and a chunk that
+/// does carry a name still updates.
+#[tokio::test]
+async fn history_without_name_does_not_erase_existing_name() {
+    let (_store, chat_store) = test_store().await;
+    let group = jid(GROUP);
+
+    // A live group message creates the nameless row production showed.
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("oi"),
+            incoming_info(GROUP, GROUP, "MSG-G1", 1_700_000_000),
+        )],
+    )
+    .await;
+    assert_eq!(
+        chat_store
+            .chat(&group)
+            .await
+            .unwrap()
+            .expect("group row")
+            .name,
+        None
+    );
+
+    // The metadata pass writes the subject.
+    chat_store
+        .set_chat_name(&group, "Trip planning".to_string())
+        .expect("queue the resolved name");
+    chat_store.flush().await.expect("flush");
+    assert_eq!(
+        chat_store
+            .chat(&group)
+            .await
+            .unwrap()
+            .expect("named group row")
+            .name
+            .as_deref(),
+        Some("Trip planning")
+    );
+
+    // A history chunk for the same conversation carries no name at all.
+    let history = {
+        let mut constructed: wa::HistorySync = Default::default();
+        constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+        constructed.conversations = vec![{
+            let mut constructed: wa::Conversation = Default::default();
+            constructed.id = GROUP.to_string();
+            constructed.conversation_timestamp = Some(1_700_000_100);
+            constructed.unread_count = Some(0);
+            constructed
+        }];
+        constructed
+    };
+    feed(&chat_store, [history_sync_event(history)]).await;
+    assert_eq!(
+        chat_store
+            .chat(&group)
+            .await
+            .unwrap()
+            .expect("group row after nameless sync")
+            .name
+            .as_deref(),
+        Some("Trip planning"),
+        "a nameless history chunk must not erase the stored name"
+    );
+
+    // And a chunk that does carry a name still updates over it.
+    let renamed = {
+        let mut constructed: wa::HistorySync = Default::default();
+        constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+        constructed.conversations = vec![{
+            let mut constructed: wa::Conversation = Default::default();
+            constructed.id = GROUP.to_string();
+            constructed.name = Some("Trip planning v2".into());
+            constructed.conversation_timestamp = Some(1_700_000_200);
+            constructed.unread_count = Some(0);
+            constructed
+        }];
+        constructed
+    };
+    feed(&chat_store, [history_sync_event(renamed)]).await;
+    assert_eq!(
+        chat_store
+            .chat(&group)
+            .await
+            .unwrap()
+            .expect("group row after named sync")
+            .name
+            .as_deref(),
+        Some("Trip planning v2")
+    );
+}

@@ -1,0 +1,124 @@
+# `cargo xtask <task>` — the repository's own tooling, which used to be shell
+# scripts. `xtask/` carries its own `[workspace]` and is excluded from the root
+# one, exactly as `examples/` is, so that the Pages job which checks out that
+# one directory can build it without resolving this workspace's graph; that is
+# also why the alias names a manifest rather than a package, and why it wants
+# to be run from the repository root.
+[alias]
+xtask = ["run", "--quiet", "--manifest-path", "xtask/Cargo.toml", "--"]
+
+[env]
+# The C the wasm build links, which is SQLite's amalgamation.
+#
+# `--shared-memory` under the wasm target below is not optional — gpui_web
+# runs its executor on real workers — and the linker refuses it against any
+# object not built for threads: "--shared-memory is disallowed by sqlite3.o
+# because it was not compiled with 'atomics' or 'bulk-memory' features". So
+# the C is built with them too. They say nothing about SQLite's own locking,
+# which stays off (`SQLITE_THREADSAFE=0` in that crate): one agent owns the
+# database, and these are about what the *module* may do rather than what the
+# library may be asked to do.
+#
+# `cc` reads this per target, so it reaches the wasm build and nothing else.
+CFLAGS_wasm32_unknown_unknown = "-matomics -mbulk-memory"
+# Trim bundled-SQLite subsystems nothing here touches. FTS5 stays: the chat
+# store's `search` feature builds its index on it. Shared cache stays:
+# sqlite-storage's in-memory mode shares one DB across the pool via
+# `cache=shared` URIs. JSON and extension loading are unused by
+# diesel/sqlite-storage/chat-store; dropping loadable extensions also removes a
+# dlopen surface. STAT4/DBSTAT/RTREE/FTS3/SOUNDEX are upstream-default-off
+# features libsqlite3-sys turns on; none are exercised here.
+#
+# `SQLITE_OMIT_DEPRECATED` is the one that removes symbols the pre-generated
+# bindings still declare, so it is a link error rather than a compile error
+# and only when something reaches one. Checked against diesel 2.3 and
+# sqlite-storage, whose whole FFI surface is `bind_*`, `column_*`, `value_*`,
+# `result_*`, `prepare_v3`, `step`, `reset`, `finalize`, `open_v2`, `close`,
+# `exec`, `errmsg`, `extended_errcode`, `changes`, `free`,
+# `create_function_v2`, `create_collation_v2`, `aggregate_context`,
+# `context_db_handle`, `db_handle`, `user_data`, `serialize` and
+# `deserialize`: none deprecated. What this removes and nothing references is
+# `sqlite3_trace`, `sqlite3_profile`, `sqlite3_aggregate_count`,
+# `sqlite3_expired`, `sqlite3_transfer_bindings`, `sqlite3_global_recover`,
+# `sqlite3_thread_cleanup`, `sqlite3_memory_alarm` and
+# `sqlite3_soft_heap_limit`. Re-check the list when diesel's minor moves.
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_STAT4 -USQLITE_ENABLE_DBSTAT_VTAB -USQLITE_SOUNDEX -DSQLITE_OMIT_JSON -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_PROGRESS_CALLBACK"
+
+[target.x86_64-unknown-linux-gnu]
+# lld folds byte-identical sections with --icf=all. Fat LTO leaves a lot of
+# them: `cargo bsize` counted 315 KiB across 1309 groups, including three
+# copies of waproto's `Message::clone` at 73 KiB each. The library's own
+# workspace does the same thing, and measures it as a win there too.
+#
+# Scoped to this target so macOS and Windows keep their platform linkers.
+rustflags = [
+    "-Clink-arg=-fuse-ld=lld",
+    "-Clink-arg=-Wl,--icf=all",
+    # These two were written down as a pair that removes the unwind tables and
+    # pays a register to keep backtraces walkable without them. Measured, the
+    # pair does something else entirely, and both halves are worth stating
+    # because the conclusion is the same and the reasoning is not.
+    #
+    # `-Cforce-unwind-tables=no` removes nothing here. Under `panic = "abort"`
+    # rustc already answers no to "must emit unwind tables", so the flag has
+    # nothing left to turn off, and LLVM emits the CFI regardless: the window
+    # carries 1,149,608 bytes of `.eh_frame` and 219,404 of `.eh_frame_hdr`,
+    # and 27,467 FDEs cover 21,027,231 of its 21,152,913 bytes of `.text` —
+    # 99.4%. A probe built with the flag and without it is byte-identical. It
+    # stays because it is free and because a future rustc may honour it; what
+    # it is not is 2.6 MB.
+    #
+    # `-Cforce-frame-pointers=yes` is then not the price of that removal but
+    # what makes the tables that stayed cheap to encode. With `rbp` as the
+    # frame pointer a function's CFA is one rule for its whole body; without
+    # it the rule has to be re-expressed against a moving `rsp`. Dropping the
+    # flag was measured at **+703,616 bytes** on the window and **+443,136**
+    # on the daemon — `.eh_frame` +482,184 (+42%) and `.text` +221,280 — so
+    # it earns its register several times over.
+    #
+    # What would actually remove the tables is `objcopy` after the link, and
+    # it is not done: `RUST_BACKTRACE` walks them through `_Unwind_Backtrace`
+    # even under `panic = "abort"`, and frame pointers are not a substitute
+    # because std's backtrace does not read them. A crash report is worth
+    # more than 1.1 MB.
+    "-Cforce-unwind-tables=no",
+    "-Cforce-frame-pointers=yes",
+    # Drop the legacy SysV .hash section; glibc has preferred .gnu.hash since
+    # 2.5 and lld emits both by default.
+    "-Clink-arg=-Wl,--hash-style=gnu",
+    # lld's own optimization level, which is not the compiler's: at -O2 it
+    # tail-merges mergeable string sections, so a literal that is the suffix
+    # of another stops being stored twice. Nothing about the generated code
+    # changes — this is the linker deciding where bytes go — which is why it
+    # sits beside `--icf=all` rather than being weighed against it.
+    "-Clink-arg=-Wl,-O2",
+]
+
+# The web front end. Everything here is what `gpui_web` requires of a page: it
+# runs its background executor on real workers, which on wasm means threads
+# over a `SharedArrayBuffer` — so the module has to be built with the atomics
+# proposal on, import its memory rather than define it, and export the thread
+# local symbols the worker bootstrap initializes. Without these the module
+# links, loads, and then has no executor.
+#
+# `build-std` is deliberately NOT set here. It has to be passed on the command
+# line (`-Z build-std=std,panic_abort`, which `cargo xtask web build` and the Pages
+# workflow both do), because a `[unstable]` table in this file applies to
+# every build — including the native one, which is meant to stay on stable.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    # Web Locks, which is how one tab claims the account the way a daemon
+    # claims a directory. The API is shipped in every browser that matters;
+    # what is unstable is `web-sys`'s binding for it, and this is the flag
+    # that crate asks for. Contained to this target, like everything else
+    # here.
+    "--cfg", "web_sys_unstable_apis",
+    "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+    "-C", "link-arg=--shared-memory",
+    "-C", "link-arg=--max-memory=1073741824",
+    "-C", "link-arg=--import-memory",
+    "-C", "link-arg=--export=__wasm_init_tls",
+    "-C", "link-arg=--export=__tls_size",
+    "-C", "link-arg=--export=__tls_align",
+    "-C", "link-arg=--export=__tls_base",
+]

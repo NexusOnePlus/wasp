@@ -1,0 +1,106 @@
+[package]
+name = "velo-audio"
+description = "Capture, playback and Opus encoding for voice messages and calls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+velo-core = { workspace = true }
+anyhow = { workspace = true }
+async-channel = "2.5.0"
+# Portable, because `call_ending` is: the rule it states is about which half of
+# a call's audio the engine let go of, which is the same question on both
+# platforms even though only one of them has a device behind it.
+futures-lite = "2.6.1"
+log = { workspace = true }
+# The container, which is not the codec: `ogg` is plain Rust and builds for
+# every target here, so `ogg_opus` packages packets from libopus on a desktop
+# and from the browser's own encoder in a page, into the identical stream.
+ogg = "0.9.2"
+# The one channel shape that is the same on both targets: `Recording::Pending`
+# is a oneshot, and tokio's own would pull a runtime a page does not have.
+futures-channel = "0.3.34"
+
+portable-atomic = { workspace = true }
+# Channels and timers only on the web, where there is no thread pool to build
+# a multi-threaded runtime on. The feature list below adds the rest.
+tokio = { workspace = true, features = ["sync"] }
+wacore = { workspace = true }
+
+# The sound card, and the codec that talks to it. `cpal` does have a WebAudio
+# backend and would compile — `opus`, `ogg` and `ringbuf` sit behind it here
+# anyway, because libopus is C and a voice note that cannot be encoded is not
+# one worth capturing. See `src/web/mod.rs`.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+cpal = "0.18.2"
+# Kept on the same major as the library's voip-libopus dependency: two
+# semver-incompatible wrappers would each link their own copy of libopus.
+opus = "0.4.0"
+ringbuf = "0.5.3"
+symphonia = { version = "0.6.1", default-features = false, features = ["all"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# Playback, through the decoder and mixer a browser already has.
+[target.'cfg(target_family = "wasm")'.dependencies]
+# Not called from here: `wacore` reaches for OS entropy and neither major of
+# `getrandom` will build for the web until its backend is named. Declared in
+# every crate that is built for wasm on its own, because feature unification
+# only reaches as far as the package being built.
+getrandom = { workspace = true }
+getrandom_02 = { workspace = true }
+js-sys = "0.3.106"
+# The page's loop, which is the only executor there is here. Web only: the
+# desktop half of this crate spawns nothing — a capture runs on the device
+# thread cpal gives it. See `src/web/mod.rs`.
+velo-platform = { workspace = true }
+wasm-bindgen = "0.2.129"
+# `JsFuture`, for the promises the encoder and the decoder hand back. The
+# spawn beside it comes from `velo-platform`.
+wasm-bindgen-futures = "0.4.79"
+web-sys = { version = "0.3.106", features = [
+    "AudioBuffer",
+    "AudioBufferSourceNode",
+    "AudioContext",
+    "AudioDestinationNode",
+    "AudioNode",
+    "AudioParam",
+    "AudioScheduledSourceNode",
+    # Capture, and the browser's own Opus encoder standing in for libopus.
+    # ScriptProcessorNode rather than AudioWorklet: a worklet is loaded from a
+    # JavaScript module file, and the one hand-written JS file in this tree is
+    # the service worker, which exists because nothing else can set a header.
+    "AudioContextOptions",
+    "AudioContextState",
+    "AudioData",
+    "AudioDataCopyToOptions",
+    "AudioDataInit",
+    "AudioEncoder",
+    "AudioEncoderConfig",
+    "AudioEncoderInit",
+    "AudioProcessingEvent",
+    "AudioSampleFormat",
+    "EncodedAudioChunk",
+    "MediaDevices",
+    "MediaStream",
+    "MediaStreamAudioSourceNode",
+    "MediaStreamConstraints",
+    "Event",
+    "MediaStreamTrack",
+    "MediaStreamTrackState",
+    "Navigator",
+    "ScriptProcessorNode",
+    "Window",
+    "DomException",
+] }
+# Racing the call's teardown against its own playout drain. Same crate the
+# session uses for the same shape.
+
+[lints]
+workspace = true
+
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+wasm-bindgen-test = "0.3.79"

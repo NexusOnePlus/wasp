@@ -1,0 +1,449 @@
+//! UI events for communication between client and UI.
+
+use serde::{Deserialize, Serialize};
+
+use super::call::{CallId, IncomingCall};
+use super::chat::ChatMessage;
+use super::presence::{Availability, ComposingKind};
+use super::system_notice::SystemNotice;
+
+pub use wacore::types::presence::ReceiptType;
+
+/// One thing the session has to say.
+///
+/// Also the daemon's wire format: a front end in another process receives
+/// these rather than a parallel set of protocol structs that would have to be
+/// kept in step with them. The one thing that does not cross is media bytes,
+/// which travel through the daemon's cache — see
+/// [`MediaContent::cache_key`](super::chat::MediaContent::cache_key).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiEvent {
+    InitComplete,
+    /// Durable history hydrated from the chat store at startup.
+    HistoryLoaded {
+        chats: Vec<crate::Chat>,
+        /// Whether `chats` is the store's whole display list (the load came
+        /// back under its limit). Only then can absence from the list mean
+        /// archived/deleted; a truncated load says nothing about the tail.
+        complete: bool,
+        /// Where the chat list continues, when this load stopped at its limit.
+        ///
+        /// The same opaque token a page request answers with — a string here
+        /// because what it *is* belongs to the side that writes it, and this
+        /// crate is the one both sides share. A front end holds it and hands
+        /// it back; it is the position this load ended at, so the next page
+        /// is the one after these rows rather than these rows again.
+        ///
+        /// `None` says nothing about the end of the list: a complete load has
+        /// no position after it, and a load about named chats is not a
+        /// position in anything.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<String>,
+    },
+    QrCode {
+        code: String,
+        timeout_secs: u64,
+    },
+    PairCode {
+        code: String,
+        timeout_secs: u64,
+    },
+    PairSuccess,
+    Connected,
+    Disconnected(String),
+    /// The server rejected the stored credentials; the session is over and
+    /// local state has to be wiped before pairing again.
+    LoggedOut(String),
+    MessageReceived {
+        chat_jid: String,
+        message: Box<ChatMessage>,
+        sender_name: Option<String>,
+        /// Durable display name of the conversation when the store can
+        /// resolve one. Separate from `sender_name` (a group participant) and
+        /// `notification_title` (which may be formatted as a mention alert).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_name: Option<String>,
+        /// A live, committed message permitted by durable conversation
+        /// policy. A mute blocks personal mentions as well.
+        /// Missing from an older daemon's frame means unknown and suppresses
+        /// the alert; the GUI still owns focus and duplicate filtering.
+        #[serde(default)]
+        notification_allowed: bool,
+        /// Resolved from durable chat metadata when available, so a message
+        /// arriving before GUI hydration does not title the banner with a JID
+        /// or a generated group placeholder.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notification_title: Option<String>,
+        /// The store's archive answer. `None` means not known (including an
+        /// older daemon frame), distinct from an explicit unarchive. A live
+        /// mention in an unmuted archived chat can alert without restoring it
+        /// to the active conversation list.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notification_archived: Option<bool>,
+        /// Durable mute deadline in unix milliseconds, including for live
+        /// arrivals before the chat-list reload. Meaningful when archive
+        /// metadata is known; None then explicitly means unmuted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_muted_until_ms: Option<i64>,
+    },
+    ReceiptReceived {
+        chat_jid: String,
+        message_ids: Vec<String>,
+        #[serde(with = "receipt_wire")]
+        receipt_type: ReceiptType,
+    },
+    /// The client assigned the real WhatsApp id to a just-sent message; the UI
+    /// renames its optimistic bubble so receipts/reactions keyed by the real
+    /// id land on it.
+    MessageIdAssigned {
+        chat_jid: String,
+        local_id: String,
+        message_id: String,
+    },
+    /// A send attempt failed after the optimistic bubble was already renamed
+    /// to its real id; the UI marks that bubble failed instead of leaving it
+    /// pending forever.
+    SendFailed {
+        chat_jid: String,
+        message_id: String,
+        reason: String,
+    },
+    AvatarReady {
+        jid: String,
+        key: String,
+    },
+    /// An avatar resolution, download, or materialization failed.
+    AvatarFailed {
+        jid: String,
+        retryable: bool,
+    },
+    /// The session resolved profile-picture metadata for a batch of chats.
+    ///
+    /// Its own event rather than a field on `HistoryLoaded`, which is the
+    /// whole point: a profile picture is relatively stable, and coupling its
+    /// lookup to store reloads meant every receipt and acknowledgement queried
+    /// WhatsApp for metadata that had not moved. The daemon answers this by
+    /// fetching the bytes, committing the durable descriptor only once they
+    /// land, and publishing [`AvatarReady`](Self::AvatarReady).
+    ///
+    /// Batched, and one event per batch, because the queue between the session
+    /// and the daemon is bounded: one event per chat would flood a lane sized
+    /// for a history load and drop most of a large account's pictures.
+    AvatarsResolved {
+        resolutions: Vec<AvatarResolution>,
+    },
+    ReactionReceived {
+        chat_jid: String,
+        message_id: String,
+        sender: String,
+        emoji: String,
+    },
+    /// Someone started or stopped composing in a chat.
+    ///
+    /// The notice expires on its own (see [`crate::PresenceRegistry`]): the
+    /// matching stop is not guaranteed to arrive, so the UI must not wait for
+    /// one before it stops claiming somebody is typing.
+    ChatPresence {
+        chat_jid: String,
+        sender_jid: String,
+        /// The sender's push name, when the server offered one.
+        sender_name: Option<String>,
+        /// `None` means they stopped.
+        composing: Option<ComposingKind>,
+    },
+    /// A contact came online, or went away.
+    PresenceUpdated {
+        jid: String,
+        availability: Availability,
+    },
+    IncomingCall(IncomingCall),
+    OutgoingCallStarted {
+        call_id: CallId,
+        recipient_jid: String,
+        /// The id the front end invented for this placement, before the
+        /// server had one.
+        ///
+        /// What makes the rename land on the attempt it belongs to. Matching
+        /// on the recipient instead let a late answer for an abandoned call
+        /// rename a *second* call to the same person — which then held an id
+        /// nobody was ringing under, while the abandoned one rang on with
+        /// nothing on this side holding it.
+        placeholder_id: CallId,
+        /// What the offer that went out actually was.
+        ///
+        /// Not what was asked for: a video call whose camera would not open
+        /// is placed as a voice call rather than not placed at all, and this
+        /// is the first moment anything knows which of the two happened.
+        is_video: bool,
+    },
+    OutgoingCallFailed {
+        recipient_jid: String,
+        error: String,
+    },
+    #[allow(dead_code)]
+    CallAccepted(CallId),
+    /// What an incoming call was actually answered *as*.
+    ///
+    /// The offer says what kind of call it is and the state is built from
+    /// that the moment the answer is given — but a camera that will not open
+    /// answers it as a voice call rather than refusing it, and only this side
+    /// knows which of the two happened. Without it every window keeps the
+    /// video layout open on a call with no picture in it and writes the
+    /// conversation's record as a video call.
+    CallAnswered {
+        call_id: CallId,
+        is_video: bool,
+    },
+    /// The media never came up, and why.
+    ///
+    /// The one thing a call's own event stream says that nothing else does:
+    /// a relay that would not dial, an engine that would not build, a
+    /// provider that refused. It is followed by the call ending, so without
+    /// it a call simply vanishes a moment after it was placed and the reason
+    /// — which the library took the trouble to publish — is thrown away.
+    ///
+    /// Not `OutgoingCallFailed`, which names a recipient and so can only
+    /// speak for a call that was placed: media is built on the accepting
+    /// side too, and this is the same failure there.
+    CallMediaFailed {
+        call_id: CallId,
+        reason: String,
+    },
+    /// The camera would not open, and why.
+    ///
+    /// The call carries on without it — answered as voice, placed as voice,
+    /// or left without the upgrade that was asked for — so without this the
+    /// person sees a voice call (or a camera button that did nothing) and
+    /// the reason dies in the daemon's log, which on some platforms is
+    /// nowhere a user can look at all. Said wherever the open fails after
+    /// video was asked for: the answer path, the placement path, and the
+    /// mid-call upgrade.
+    ///
+    /// Said only once the call is confirmed continuing. The open races
+    /// cancellation on every path — a call hung up, called off, or
+    /// superseded while its camera opened — and a notice for a call that
+    /// never continued would be news about nothing.
+    ///
+    /// Not [`CallMediaFailed`](Self::CallMediaFailed), which is followed by
+    /// the call ending: this one is followed by the call carrying on.
+    CallVideoUnavailable {
+        call_id: CallId,
+        reason: String,
+    },
+    CallEnded(CallId),
+    /// What the microphone really is, once the newest request has reached it.
+    ///
+    /// A front end asks to mute and draws it at once, but the announcement to
+    /// the peer can fail, and the library commits the two directions around
+    /// that announcement rather than at one point — a mute applies before it,
+    /// an unmute only once it is out — precisely so the microphone is never
+    /// live while the peer is shown a muted one. The side that pays is the
+    /// front end, which is now drawing a state the device is not in.
+    ///
+    /// So the session reads the device and says what it found, whether or not
+    /// that is news. Saying it only on a disagreement would be unversioned:
+    /// a failed request's answer could land after the retry behind it had
+    /// already succeeded and, finding agreement, said nothing — leaving the
+    /// failure's answer standing over the success's device. Speaking every
+    /// time makes the last request to reach the device the last to be heard,
+    /// and the ordinary case is still free, because a call state that does
+    /// not change publishes no frame.
+    CallMuteChanged {
+        call_id: CallId,
+        muted: bool,
+    },
+    /// One of a call's two cameras went on or off.
+    ///
+    /// Said for both directions and by the same rule mute follows: the side
+    /// that owns the device reports what it *did*, rather than a front end
+    /// deriving it from frames arriving or stopping. Frames are lossy and a
+    /// pause looks exactly like a peer who has turned their camera off, so a
+    /// state read off the stream would flicker.
+    CallVideoChanged {
+        call_id: CallId,
+        stream: crate::VideoStream,
+        on: bool,
+    },
+    /// The peer asked to turn this call into a video one — or stopped
+    /// asking.
+    ///
+    /// Distinct from [`CallVideoChanged`](Self::CallVideoChanged) because
+    /// nothing has changed yet: it is a question, and the answer is a person
+    /// turning their own camera on (or not). The token that binds an answer
+    /// to *this* request stays in the session, which is the only place that
+    /// can use it.
+    ///
+    /// `pending: false` withdraws it. A request can be cancelled or time out
+    /// at the peer's end, and a question nobody is asking any more must stop
+    /// being drawn: without this the camera control would go on claiming
+    /// somebody was waiting for the rest of the call.
+    CallVideoRequested {
+        call_id: CallId,
+        pending: bool,
+    },
+    /// The call is over here because another of this account's devices
+    /// answered or refused it. Not a missed call: the device that took it has
+    /// the entry, and this one has nothing true to write down.
+    CallEndedElsewhere(CallId),
+    /// This call is over and there is nothing honest to write down about it.
+    ///
+    /// For a call the *daemon* had already staged before the session refused
+    /// it: the front end drew a card, the state said the call was connecting,
+    /// and then nothing happened. Ending it on its own would be indexed as an
+    /// ordinary call — a zero-second one, in the conversation, for a call
+    /// nobody ever answered.
+    ///
+    /// A separate event rather than a flag on [`Self::CallEnded`] because it
+    /// is a different fact: `CallEnded` says a call finished, and this says
+    /// there was none. It reaches [`CallState::mark_unrecorded`], which is the
+    /// same door the daemon uses when it refuses a call a window has drawn.
+    CallUnrecorded(CallId),
+    /// Who this device is linked as.
+    ///
+    /// Sent on connect and whenever the push name changes, rather than only
+    /// at pairing: the name lives in the device store, and a client attaching
+    /// after a restart never saw the pairing that set it. Without it the
+    /// account row had nothing to show and claimed "not linked" over a linked
+    /// session.
+    AccountUpdated {
+        /// The push name, when the account has one.
+        name: Option<String>,
+        /// The account's own JID, for the number under the name.
+        jid: Option<String>,
+        /// The same account's LID, when it has one.
+        ///
+        /// Both, because a chat is keyed by whichever alias the server used:
+        /// the conversation with your own number can arrive as a LID while
+        /// the account announces a phone number, and neither string matches
+        /// the other.
+        lid: Option<String>,
+    },
+    /// Something happened *to* a chat rather than in it: a group renamed, a
+    /// member added, the settings changed.
+    ///
+    /// Its own event rather than a `MessageReceived` carrying a system
+    /// notice, because it is not a message: it must not raise an unread
+    /// badge, and nothing ever acknowledges or replies to it.
+    SystemNotice {
+        chat_jid: String,
+        /// Stable within one notification, so a redelivery does not stack a
+        /// second identical row.
+        notice_id: String,
+        at: chrono::DateTime<chrono::Utc>,
+        notice: SystemNotice,
+    },
+    Error(String),
+    /// Control events were lost. The daemon must replace this session while
+    /// retaining its credentials and durable history.
+    SessionResyncRequired(String),
+}
+
+/// One chat's resolved profile picture, inside [`UiEvent::AvatarsResolved`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvatarResolution {
+    pub jid: String,
+    pub outcome: AvatarOutcome,
+}
+
+/// What a metadata lookup decided that some other part has to act on.
+///
+/// Typed rather than "an id, empty when absent", because the difference
+/// between "no picture" and "could not tell" is the whole of whether a known
+/// avatar may be erased. That is exactly the ambiguity the library used to
+/// have and now does not, so it is carried through rather than flattened again
+/// on this side.
+///
+/// Only the two outcomes with an action are here. `Unchanged`, a refusal and a
+/// rate limit all leave the previous picture standing, so they are not
+/// published: the resolver remembers the chat as asked and nothing downstream
+/// has anything to do. A future outcome the library adds is read as one of
+/// those until this side decides otherwise, and the wildcard in the resolver
+/// is what guarantees it cannot arrive as `NotFound`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AvatarOutcome {
+    /// A picture to fetch and cache.
+    Found {
+        picture_id: String,
+        /// Signed and short-lived. Never persisted, never serialized: the
+        /// daemon is its only reader, and a credential does not belong in a
+        /// frame any front end could log.
+        #[serde(default, skip_serializing)]
+        source: Option<String>,
+    },
+    /// WhatsApp says this chat has no picture. The one destructive answer.
+    NotFound,
+}
+
+/// A receipt type as WhatsApp spells it, which is the only spelling that
+/// survives a round trip.
+///
+/// The library's own `Serialize` writes the variant's Rust name and its
+/// `Deserialize` reads a wire string, and the two tables never meet: `"Read"`
+/// comes back as `Other("Read")`, and an `Other` goes out as a map that the
+/// string-only reader then refuses, taking the whole frame with it. So the
+/// wire carries `as_wire_str`/`parse`, which are inverses by construction.
+mod receipt_wire {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::ReceiptType;
+
+    pub(super) fn serialize<S: Serializer>(
+        receipt: &ReceiptType,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(receipt.as_wire_str())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ReceiptType, D::Error> {
+        let wire = String::deserialize(deserializer)?;
+        Ok(ReceiptType::parse(&wire))
+    }
+}
+
+#[cfg(test)]
+mod notification_wire_tests {
+    use super::UiEvent;
+
+    #[test]
+    fn older_message_frame_without_policy_is_not_allowed_to_alert() {
+        let event = UiEvent::MessageReceived {
+            chat_jid: "group@g.us".into(),
+            message: Box::new(crate::fixtures::message(
+                "MESSAGE-1",
+                "member@example.invalid",
+                "example",
+            )),
+            sender_name: None,
+            chat_name: Some("Example group".into()),
+            notification_allowed: true,
+            notification_title: Some("Example group".into()),
+            notification_archived: Some(true),
+            chat_muted_until_ms: None,
+        };
+        let mut wire = serde_json::to_value(event).unwrap();
+        let fields = wire
+            .get_mut("message_received")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        fields.remove("notification_allowed");
+        fields.remove("chat_name");
+        fields.remove("notification_title");
+        fields.remove("notification_archived");
+        let older: UiEvent = serde_json::from_value(wire).unwrap();
+        assert!(matches!(
+            older,
+            UiEvent::MessageReceived {
+                notification_allowed: false,
+                chat_name: None,
+                notification_title: None,
+                notification_archived: None,
+                chat_muted_until_ms: None,
+                ..
+            }
+        ));
+    }
+}

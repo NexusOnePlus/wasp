@@ -1,0 +1,76 @@
+//! SQLite-backed chat/message history for whatsapp-rust.
+//!
+//! This crate materializes the client's event stream (messages, receipts,
+//! edits, revokes, reactions, history sync, app-state chat updates) into
+//! queryable tables in the SAME database file as the device store, so a UI or
+//! stateful bot survives a restart without re-syncing. It has no UI
+//! dependencies — it is a data layer any consumer can opt into.
+//!
+//! Design:
+//! - **Event-sourced**: register [`ChatStore::handler`] on the client; a
+//!   single writer task applies batched events transactionally, in order.
+//! - **Proto as source of truth**: each message row stores the encoded
+//!   `wa::Message` plus denormalized columns for listing/search — new proto
+//!   fields never require a migration.
+//! - **Query + invalidation**: read via the async query API (keyset
+//!   pagination), subscribe to [`types::StoreChange`] to know when to re-query.
+//!   No second in-memory cache of rows.
+//! - **Shared file, shared pool**: writes go through
+//!   [`SqliteStore::shared`](whatsapp_rust_sqlite_storage::SqliteStore),
+//!   so there is exactly one WAL writer per database file.
+//!
+//! ```ignore
+//! let chat_store = ChatStore::new(&sqlite_store).await?;
+//! let _chat_subscription = client.subscribe_handler(chat_store.handler());
+//!
+//! let chats = chat_store.chats(false, 50).await?;
+//! let page = chat_store.messages(&chats[0].jid, None, 40).await?;
+//! // Archive selection happens before the page limit in both ordered runs.
+//! let archived = chat_store.chats_page(ChatArchiveFilter::Archived, None, 50).await?;
+//! // Stored archived rows with positive unread counters, across every page.
+//! let archived_unread_rows = chat_store.archived_unread_total().await?;
+//! let mut changes = chat_store.subscribe();
+//! ```
+
+mod contacts_text;
+mod error;
+#[cfg(feature = "search")]
+mod file_index;
+#[cfg(feature = "search")]
+mod fts;
+mod lid;
+mod materialize;
+mod point_lookup;
+mod queries;
+mod schema;
+mod spawn;
+mod storage_proto;
+mod store;
+pub mod types;
+
+pub use contacts_text::shared_contacts_text;
+pub use error::{ChatStoreError, Result, db_err};
+#[cfg(feature = "search")]
+pub use file_index::FileHit;
+pub use materialize::{
+    is_control_only, message_kind, normalized_message, poll_creation_message,
+    supported_poll_creation_message,
+};
+pub use queries::MessageReadState;
+pub use store::ChatStore;
+pub use store::retirement::AccountRetirement;
+pub use store::shared_history::PendingHistoryBundle;
+pub use types::{
+    ArrivalCursor, AvatarDescriptor, ChannelMuteSnapshot, ChatArchiveFilter, ChatCursor, ChatEntry,
+    ChatNameExpected, ChatNameWrite, ChatNotificationMetadata, ContactEntry, GroupHierarchyWrite,
+    MediaRef, MessageCoverage, MessageCursor, MessageKind, MessageStatus, ReactionEntry,
+    ReceiptEntry, StoreChange, StoredMessage,
+};
+
+mod business;
+mod display;
+pub use business::{
+    BusinessMedia, business_content, business_contexts, business_media, hydrated_template,
+    interactive_business,
+};
+pub use display::{message_fallback, sticker_pack_text};

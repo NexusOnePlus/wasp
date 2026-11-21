@@ -1,0 +1,280 @@
+//! Where a frame ends, and how long one may be.
+//!
+//! The wire is newline-delimited JSON, and both ends have to agree on the two
+//! things that are not in the JSON: the delimiter, and the point past which a
+//! stream with no delimiter in it is not a frame anybody is going to finish
+//! sending. That agreement is this module, which is what this crate is for.
+//!
+//! What is *not* here is one read function for both ends, and the reason is
+//! the same one the endpoint split has: the daemon reads inside a runtime,
+//! from an `AsyncRead` it selects over, and a front end parks a thread in a
+//! blocking read. The bound, the outcome and the resynchronization rules are
+//! written once; the loop around them is a platform each.
+
+use std::io::{BufRead, Read, Result};
+
+/// Longest single frame a client may send.
+///
+/// Per frame, not per connection: a reader capped for its whole lifetime
+/// would give a long-lived front end an artificial EOF once its small, valid
+/// requests happened to add up. Requests are tiny; a megabyte is far past any
+/// legitimate one and still cheap to refuse.
+pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// Longest single frame a daemon may send.
+///
+/// Much larger than a request, because this direction carries a history load:
+/// a hundred chats of fifty rows of JSON, with media externalized to files
+/// but every name, preview and quote inline. Five thousand rows, and this
+/// leaves fifty kilobytes for each of them — far past what a conversation
+/// looks like, and the point is that it is far past it, because the failure
+/// on this side is not a dropped frame. A frame over the cap ends the
+/// connection, the front end reconnects, and it asks for the same history
+/// again: rejecting a load the daemon legitimately built is a loop, where the
+/// unbounded read this replaced was one window dying once.
+///
+/// So it is a bound on a stream that has gone wrong rather than a policy
+/// about what a load may contain. What it does *not* prove is that no
+/// legitimate load can reach it: WhatsApp will carry a message of 64 KiB, and
+/// five thousand of those would be several times this. Proving it needs the
+/// protocol to say so — `HistoryLoaded` split across frames, or a cap on the
+/// text a row carries — which is a change to the wire rather than to this
+/// constant.
+pub const MAX_DAEMON_FRAME_BYTES: usize = 256 * 1024 * 1024;
+
+/// The outcome of reading one frame.
+#[derive(Debug)]
+pub enum FrameRead {
+    Line(String),
+    /// Well-framed bytes that are not text. Answerable, so a connection
+    /// survives a peer with an encoding bug.
+    NotUtf8,
+    /// No newline within the cap. The stream cannot be resynchronized, since
+    /// there is no way to tell where this frame was meant to end, so this
+    /// ends the connection — unlike the other two, which are recoverable.
+    TooLong,
+}
+
+/// The outcome of [`read_frame_with`], containing the callback's owned result.
+///
+/// Framing errors have the same meaning as in [`FrameRead`]. Keeping this
+/// separate leaves the original enum's variants usable without type annotations.
+#[derive(Debug)]
+pub enum FrameResult<T> {
+    Line(T),
+    NotUtf8,
+    TooLong,
+}
+
+/// Read one newline-delimited frame, bounded independently of every other.
+///
+/// Returns `None` at end of stream. Reads bytes rather than lines because a
+/// frame with invalid UTF-8 is a malformed frame the peer can recover from,
+/// not a reason to drop a connection.
+///
+/// `buf` belongs to the connection rather than to one call, so bytes a
+/// previous call left behind are the front of a frame that has not arrived
+/// yet and count against this frame's budget.
+pub fn read_frame<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    limit: usize,
+) -> Result<Option<FrameRead>> {
+    Ok(
+        read_frame_with(reader, buf, limit, str::to_owned)?.map(|frame| match frame {
+            FrameResult::Line(line) => FrameRead::Line(line),
+            FrameResult::NotUtf8 => FrameRead::NotUtf8,
+            FrameResult::TooLong => FrameRead::TooLong,
+        }),
+    )
+}
+
+/// Read a frame and parse its text directly from the connection buffer.
+///
+/// The callback runs only for a complete UTF-8 frame, without the newline.
+/// Its result must own anything it keeps: the buffer is cleared after the
+/// callback and reused by the next read. This avoids a full-frame copy while
+/// keeping the allocation available for repeated large frames.
+///
+/// Partial prefixes, limits, EOF and I/O errors behave as in [`read_frame`].
+pub fn read_frame_with<R: BufRead, T>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    limit: usize,
+    parse: impl FnOnce(&str) -> T,
+) -> Result<Option<FrameResult<T>>> {
+    let carried = buf.len();
+    if carried >= limit {
+        buf.clear();
+        return Ok(Some(FrameResult::TooLong));
+    }
+
+    let read = {
+        let mut limited = Read::take(Read::by_ref(reader), (limit - carried) as u64);
+        limited.read_until(b'\n', buf)?
+    };
+
+    if read == 0 {
+        // End of stream. A carried prefix here is a frame the peer never
+        // finished sending, and there is nobody left to answer.
+        buf.clear();
+        return Ok(None);
+    }
+
+    if buf.last() != Some(&b'\n') {
+        // `read_until` stops at the delimiter, at the cap, or at EOF. Without
+        // a delimiter it was one of the other two, and they are not the same
+        // answer: a frame that hit the cap leaves a peer that is still there
+        // and deserves to be told, while one that hit EOF is a peer that went
+        // away mid-frame.
+        let hit_the_cap = buf.len() == limit;
+        buf.clear();
+        return Ok(hit_the_cap.then_some(FrameResult::TooLong));
+    }
+
+    buf.pop();
+    let frame = match std::str::from_utf8(buf) {
+        Ok(line) => FrameResult::Line(parse(line)),
+        Err(_) => FrameResult::NotUtf8,
+    };
+    buf.clear();
+    Ok(Some(frame))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frames(bytes: &[u8], limit: usize) -> Vec<Option<FrameRead>> {
+        let mut reader = std::io::BufReader::new(bytes);
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        loop {
+            let frame = read_frame(&mut reader, &mut buf, limit).expect("a byte slice cannot fail");
+            let end = frame.is_none();
+            out.push(frame);
+            if end {
+                return out;
+            }
+        }
+    }
+
+    /// A peer that never sends a newline used to be read into a `String` that
+    /// grew until the process died.
+    #[test]
+    fn a_frame_that_never_ends_is_refused_rather_than_buffered() {
+        let flood = vec![b'x'; 4096];
+        let read = frames(&flood, 64);
+        assert!(matches!(read[0], Some(FrameRead::TooLong)));
+    }
+
+    #[test]
+    fn frames_are_bounded_one_at_a_time() {
+        let read = frames(b"one\ntwo\n", 8);
+        assert!(matches!(&read[0], Some(FrameRead::Line(l)) if l == "one"));
+        assert!(matches!(&read[1], Some(FrameRead::Line(l)) if l == "two"));
+        assert!(read[2].is_none());
+    }
+
+    #[test]
+    fn bytes_that_are_not_text_are_answerable() {
+        let read = frames(&[0xff, 0xfe, b'\n'], 64);
+        assert!(matches!(read[0], Some(FrameRead::NotUtf8)));
+    }
+
+    #[test]
+    fn borrowed_parsing_matches_owned_frames_and_reuses_capacity() {
+        for bytes in [
+            b"one\ntwo\n".as_slice(),
+            b"\n\r\n",
+            b"unterminated",
+            b"1234567\nnext\n",
+            b"12345678\n",
+            b"\xff\nvalid\n",
+            b"\xc3\xa9\n",
+        ] {
+            for capacity in [1, 3, 8192] {
+                let mut owned = std::io::BufReader::with_capacity(capacity, bytes);
+                let mut borrowed = std::io::BufReader::with_capacity(capacity, bytes);
+                let mut owned_buf = Vec::new();
+                let mut borrowed_buf = Vec::with_capacity(32);
+                for _ in 0..bytes.len() + 1 {
+                    let expected = read_frame(&mut owned, &mut owned_buf, 8).unwrap();
+                    let actual = read_frame_with(&mut borrowed, &mut borrowed_buf, 8, |line| {
+                        line.as_bytes().to_vec()
+                    })
+                    .unwrap();
+                    assert!(borrowed_buf.is_empty());
+                    assert_eq!(borrowed_buf.capacity(), 32);
+                    match (expected, actual) {
+                        (Some(FrameRead::Line(a)), Some(FrameResult::Line(b))) => {
+                            assert_eq!(a.as_bytes(), b);
+                        }
+                        (Some(FrameRead::NotUtf8), Some(FrameResult::NotUtf8))
+                        | (Some(FrameRead::TooLong), Some(FrameResult::TooLong)) => {}
+                        (None, None) => break,
+                        pair => panic!("different outcomes: {pair:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn carried_prefix_counts_toward_limit_and_is_parsed_once() {
+        for (prefix, suffix, expected) in [
+            (b"pre".as_slice(), b"fix\n".as_slice(), Some("prefix")),
+            (b"1234567", b"\n", Some("1234567")),
+            (b"12345678", b"\n", None),
+            (b"1234567", b"x\n", None),
+            (b"pre", b"", None),
+        ] {
+            let mut buf = prefix.to_vec();
+            let mut reader = std::io::BufReader::with_capacity(1, suffix);
+            let mut calls = 0;
+            let actual = read_frame_with(&mut reader, &mut buf, 8, |line| {
+                calls += 1;
+                line.to_owned()
+            })
+            .unwrap();
+            assert!(buf.is_empty());
+            assert_eq!(calls, usize::from(expected.is_some()));
+            if let Some(expected) = expected {
+                assert!(matches!(actual, Some(FrameResult::Line(line)) if line == expected));
+            } else {
+                assert!(matches!(actual, None | Some(FrameResult::TooLong)));
+            }
+        }
+    }
+
+    #[test]
+    fn io_error_keeps_prefix_for_retry() {
+        struct Interrupted(bool);
+        impl std::io::Read for Interrupted {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    Err(std::io::ErrorKind::WouldBlock.into())
+                } else {
+                    self.0 = true;
+                    out[0] = b'a';
+                    Ok(1)
+                }
+            }
+        }
+        let mut reader = std::io::BufReader::with_capacity(1, Interrupted(false));
+        let mut buf = Vec::new();
+        assert!(read_frame_with(&mut reader, &mut buf, 8, |_| panic!("incomplete")).is_err());
+        assert_eq!(buf, b"a");
+        let result = read_frame_with(&mut b"b\n".as_slice(), &mut buf, 8, str::to_owned).unwrap();
+        assert!(matches!(result, Some(FrameResult::Line(line)) if line == "ab"));
+    }
+
+    #[test]
+    fn owned_variants_keep_their_original_type_inference_and_imports() {
+        use FrameRead::{NotUtf8, TooLong};
+        let invalid = NotUtf8;
+        let oversized = TooLong;
+        assert!(matches!(invalid, FrameRead::NotUtf8));
+        assert!(matches!(oversized, FrameRead::TooLong));
+    }
+}

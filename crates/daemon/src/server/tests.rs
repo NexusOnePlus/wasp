@@ -1,0 +1,2587 @@
+//! Native only, and not for want of trying.
+//!
+//! These drive [`super::serve_client`] over a `tokio::io::duplex` and take the
+//! startup lock, so they need `tokio::spawn` — which wants a `Send` future the
+//! wasm bridge's state deliberately is not — and a socket path a page has no
+//! filesystem for. The web half of this crate has tests of its own that run in
+//! a browser; see `plugins/web/tests.rs`.
+
+use tokio::io::AsyncBufReadExt as _;
+use velo_ipc::{ClientScope, PROTOCOL_VERSION};
+
+use super::accept::{acquire_startup_lock, prepare_state_dir, reject};
+use super::handshake::{Attached, check_hello, handshake, read_frame};
+use super::requests::handle_request;
+use super::*;
+use crate::session_bridge::{CommandOutcome, Outbox, SessionCommand};
+
+/// Every request gets exactly one answer, the ones that fail included.
+/// A frame that could not be encoded used to be no frame at all, and the
+/// view that asked waited on it forever with nothing logged.
+#[test]
+fn an_answer_that_cannot_be_encoded_is_still_an_answer() {
+    let frame = always(
+        Some(velo_ipc::RequestId::from(7u64)),
+        Err(anyhow::anyhow!("the encoder gave up")),
+    )
+    .expect("there is always a frame");
+    let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid json");
+    assert_eq!(parsed["type"], "error");
+    assert_eq!(parsed["error"]["error"], "malformed");
+    assert_eq!(parsed["id"], 7);
+}
+
+fn hello(protocol: u32, session_events: bool) -> String {
+    serde_json::to_string(&ClientRequest::Hello {
+        protocol,
+        scope: ClientScope::Account {
+            account: velo_core::AccountId::LEGACY,
+        },
+        session_events,
+        owns_window: true,
+        call_video: true,
+    })
+    .unwrap()
+}
+
+fn attached(session_events: bool, owns_window: bool, call_video: bool) -> Attached {
+    Attached {
+        session_events,
+        scope: ClientScope::Account {
+            account: velo_core::AccountId::LEGACY,
+        },
+        owns_window,
+        call_video,
+        read_only: false,
+        is_wire: false,
+        wire_hello_id: None,
+        wire_account: None,
+        account_selection: false,
+    }
+}
+
+#[test]
+fn a_matching_hello_is_accepted() {
+    assert_eq!(
+        check_hello(&hello(PROTOCOL_VERSION, false)),
+        Ok(attached(false, true, true))
+    );
+}
+
+#[tokio::test]
+async fn a_control_connection_lists_accounts_and_rejects_account_requests() {
+    let registry = AccountRegistry::new();
+    let hub = connected_hub();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        velo_core::AccountId::LEGACY,
+        hub,
+        no_plugins(),
+        commands,
+    ))));
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(Box::new(server), registry));
+    let control = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Control,
+        session_events: false,
+        owns_window: true,
+        call_video: false,
+    }))
+    .unwrap();
+
+    client
+        .write_all(format!("{control}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    let first: DaemonMessage = serde_json::from_str(&line).unwrap();
+    assert!(
+        matches!(
+            first,
+            DaemonMessage::ControlHello { accounts, .. } if accounts.accounts.len() == 1
+        ),
+        "unexpected control greeting: {line}"
+    );
+
+    let list = serde_json::to_string(&Request {
+        id: Some(9),
+        request: ClientRequest::ListAccounts,
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{list}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(matches!(
+        serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+        DaemonMessage::Accounts { id: 9, snapshot } if snapshot.accounts.len() == 1
+    ));
+
+    let account_request = serde_json::to_string(&Request {
+        id: Some(10),
+        request: ClientRequest::Snapshot,
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{account_request}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(matches!(
+        serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+        DaemonMessage::Error {
+            id: Some(10),
+            error: ProtocolError::Refused { .. },
+        }
+    ));
+    served.abort();
+}
+
+#[tokio::test]
+async fn an_account_connection_is_bound_to_the_requested_runtime() {
+    let registry = AccountRegistry::new();
+    let account_a = StateHub::for_account(velo_core::AccountId::LEGACY);
+    let account_b_id = velo_core::AccountId::new(2).expect("positive account id");
+    let account_b = StateHub::for_account(account_b_id);
+    account_b.apply(crate::state::Change::live(
+        velo_ipc::DaemonEvent::ConnectionChanged(velo_ipc::ConnectionState::Disconnected {
+            reason: "account b".to_string(),
+        }),
+    ));
+    let (commands_a, _taken_a) = bridge(CommandOutcome::Accepted);
+    let (commands_b, _taken_b) = bridge(CommandOutcome::Accepted);
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        velo_core::AccountId::LEGACY,
+        account_a,
+        no_plugins(),
+        commands_a,
+    ))));
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        account_b_id,
+        account_b,
+        no_plugins(),
+        commands_b,
+    ))));
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(Box::new(server), registry));
+    let hello = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Account {
+            account: account_b_id,
+        },
+        session_events: false,
+        owns_window: false,
+        call_video: false,
+    }))
+    .unwrap();
+    client
+        .write_all(format!("{hello}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(matches!(
+        serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+        DaemonMessage::Hello { snapshot, .. }
+            if matches!(
+                snapshot.connection,
+                velo_ipc::ConnectionState::Disconnected { ref reason }
+                    if reason == "account b"
+            )
+    ));
+    served.abort();
+}
+
+/// A runtime that has accepted a stop/reset/remove cannot take a new front
+/// end: between that acceptance and its removal from the registry there is a
+/// window in which the session, plugins and command channel are all coming
+/// down, and a connection attached there would watch a hub nothing answers
+/// on. Refused rather than bound.
+#[tokio::test]
+async fn a_stopping_account_refuses_a_new_connection() {
+    let registry = AccountRegistry::new();
+    let account = velo_core::AccountId::LEGACY;
+    let hub = StateHub::for_account(account);
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    let runtime = Arc::new(AccountRuntime::new(account, hub, no_plugins(), commands));
+    let _ = runtime
+        .lifecycle()
+        .set_disposition(crate::session_bridge::AccountDisposition::Reset);
+    assert!(registry.insert(runtime));
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(Box::new(server), registry));
+    let hello = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Account { account },
+        session_events: false,
+        owns_window: false,
+        call_video: false,
+    }))
+    .unwrap();
+    client
+        .write_all(format!("{hello}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Error {
+                error: ProtocolError::NoSession { .. },
+                ..
+            }
+        ),
+        "a runtime the user is resetting must not accept a connection"
+    );
+    served.abort();
+}
+
+/// `CreateAccount` needs a supervisor attached to the registry it is served
+/// through; every other control test in this file builds a bare
+/// `AccountRegistry::new()` (no `AccountSupervisor` over it), which is
+/// exactly the shape `embedded.rs` and every focused test here use, so the
+/// refusal has to be graceful rather than a panic.
+#[tokio::test]
+async fn create_account_is_refused_without_a_supervisor_attached() {
+    let registry = AccountRegistry::new();
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(Box::new(server), registry));
+
+    let control = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Control,
+        session_events: false,
+        owns_window: true,
+        call_video: false,
+    }))
+    .unwrap();
+    client
+        .write_all(format!("{control}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap(); // ControlHello
+
+    let create = serde_json::to_string(&Request {
+        id: Some(1),
+        request: ClientRequest::CreateAccount,
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{create}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Error {
+                id: Some(1),
+                error: ProtocolError::Refused { .. },
+            }
+        ),
+        "unexpected answer: {line}"
+    );
+    served.abort();
+}
+
+/// `ResetAccount`/`RemoveAccount` reuse the target account's own
+/// `Action::ForgetSession` teardown path, dispatched by the supervisor through
+/// *its* command channel rather than the control connection's (which has
+/// none): this pins that the right runtime hears it, with the right
+/// disposition, and that an unknown id is refused rather than silently
+/// accepted.
+#[tokio::test]
+async fn a_control_connection_resets_and_removes_a_named_account() {
+    use super::*;
+
+    let registry = AccountRegistry::new();
+    // The lifecycle is the supervisor's to run, so the registry needs one.
+    let stores = Arc::new(velo_session::StoreRegistry::new(format!(
+        "file:memdb_control_lifecycle_{}?mode=memory&cache=shared",
+        std::process::id()
+    )));
+    // Held for the test's lifetime: the registry's back-pointer is `Weak`, so
+    // a dropped supervisor would leave `change_account` with nowhere to go.
+    let _supervisor = crate::account::AccountSupervisor::new(Arc::clone(&registry), stores, 4);
+
+    let target_id = velo_core::AccountId::new(2).expect("positive account id");
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        target_id,
+        StateHub::for_account(target_id),
+        no_plugins(),
+        commands,
+    ))));
+    // Registered before the connection opens, along with the reset target
+    // above: registering it *during* the conversation would race this
+    // connection's own `AccountsChanged` push against the next request's
+    // answer, and this test is about the answers, not that push.
+    let other_id = velo_core::AccountId::new(3).expect("positive account id");
+    let (commands, taken_other) = bridge(CommandOutcome::Accepted);
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        other_id,
+        StateHub::for_account(other_id),
+        no_plugins(),
+        commands,
+    ))));
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(
+        Box::new(server),
+        Arc::clone(&registry),
+    ));
+    let control = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Control,
+        session_events: false,
+        owns_window: true,
+        call_video: false,
+    }))
+    .unwrap();
+    client
+        .write_all(format!("{control}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap(); // ControlHello
+
+    let reset = serde_json::to_string(&Request {
+        id: Some(5),
+        request: ClientRequest::ResetAccount { account: target_id },
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{reset}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Accepted { id: Some(5) }
+        ),
+        "unexpected answer to ResetAccount: {line}"
+    );
+    assert!(matches!(
+        taken.await.unwrap(),
+        Some(Action::ForgetSession(
+            crate::session_bridge::AccountDisposition::Reset
+        ))
+    ));
+
+    // A second target, this time removed rather than reset.
+    let remove = serde_json::to_string(&Request {
+        id: Some(6),
+        request: ClientRequest::RemoveAccount { account: other_id },
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{remove}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Accepted { id: Some(6) }
+        ),
+        "unexpected answer to RemoveAccount: {line}"
+    );
+    assert!(matches!(
+        taken_other.await.unwrap(),
+        Some(Action::ForgetSession(
+            crate::session_bridge::AccountDisposition::Remove
+        ))
+    ));
+
+    // An id nothing is registered under is refused rather than silently
+    // accepted.
+    let unknown_id = velo_core::AccountId::new(99).expect("positive account id");
+    let reset_unknown = serde_json::to_string(&Request {
+        id: Some(7),
+        request: ClientRequest::ResetAccount {
+            account: unknown_id,
+        },
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{reset_unknown}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Error {
+                id: Some(7),
+                error: ProtocolError::NoSession { .. },
+            }
+        ),
+        "unexpected answer for an unknown account: {line}"
+    );
+    served.abort();
+}
+
+/// The control plane answers the process-wide requests the GUI's account
+/// connection used to send and be refused for.
+///
+/// `SetLogLevel`, `ShowWindow`, `ReloadPlugins` and `ListInstalledPlugins`
+/// are all control requests, so an account connection refuses them with "this
+/// request belongs to the control plane" — which is only a working answer if
+/// there *is* a control plane that serves them. This pins that there is: each
+/// is answered rather than refused as unwired.
+#[tokio::test]
+async fn the_control_plane_answers_the_process_wide_requests() {
+    use super::*;
+
+    let registry = AccountRegistry::new();
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(
+        Box::new(server),
+        Arc::clone(&registry),
+    ));
+    let control = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Control,
+        session_events: false,
+        owns_window: true,
+        call_video: false,
+    }))
+    .unwrap();
+    client
+        .write_all(format!("{control}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap(); // ControlHello
+
+    // An acknowledgement, not a refusal: `SetLogLevel` is the process's.
+    let level = serde_json::to_string(&Request {
+        id: Some(3),
+        request: ClientRequest::SetLogLevel {
+            level: velo_core::LogLevel::Info,
+        },
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{level}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Accepted { id: Some(3) }
+        ),
+        "unexpected answer to SetLogLevel: {line}"
+    );
+
+    // `ShowWindow` relays and acknowledges: nobody is attached to raise, so
+    // the launch path runs and the answer is still an acknowledgement.
+    let show = serde_json::to_string(&Request {
+        id: Some(4),
+        request: ClientRequest::ShowWindow,
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{show}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Accepted { id: Some(4) }
+        ),
+        "unexpected answer to ShowWindow: {line}"
+    );
+
+    // `ListInstalledPlugins` answers out of band, on the connection's outbox,
+    // because it is a directory read.
+    let list = serde_json::to_string(&Request {
+        id: Some(5),
+        request: ClientRequest::ListInstalledPlugins,
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{list}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::InstalledPlugins { id: 5, .. }
+        ),
+        "unexpected answer to ListInstalledPlugins: {line}"
+    );
+
+    served.abort();
+}
+
+/// Window ownership and call-video subscription are independent capabilities.
+#[test]
+fn a_client_can_subscribe_to_video_without_owning_a_window() {
+    let account = serde_json::to_string(&ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Account {
+            account: velo_core::AccountId::LEGACY,
+        },
+        session_events: true,
+        owns_window: false,
+        call_video: true,
+    })
+    .unwrap();
+    assert_eq!(check_hello(&account), Ok(attached(true, false, true)));
+}
+
+/// Window ownership defaults on a scoped hello, so a client that omits the
+/// field gets the documented answer: it owns a window. See
+/// [`ClientRequest::Hello`].
+#[test]
+fn a_client_owns_a_window_unless_it_says_otherwise() {
+    let silent = format!(
+        r#"{{"request":"hello","protocol":{PROTOCOL_VERSION},"scope":{{"scope":"account","account":1}}}}"#
+    );
+    assert_eq!(check_hello(&silent), Ok(attached(false, true, false)));
+
+    let watcher = format!(
+        r#"{{"request":"hello","protocol":{PROTOCOL_VERSION},"scope":{{"scope":"account","account":1}},"owns_window":false}}"#
+    );
+    assert_eq!(check_hello(&watcher), Ok(attached(false, false, false)));
+}
+
+/// The session stream is opt-in: a tray that never asked must not be sent
+/// every message in the account.
+#[test]
+fn the_session_stream_is_only_served_when_asked_for() {
+    assert_eq!(
+        check_hello(&hello(PROTOCOL_VERSION, true)),
+        Ok(attached(true, true, true))
+    );
+    let line = hello(PROTOCOL_VERSION, false);
+    assert_eq!(check_hello(&line), Ok(attached(false, true, true)));
+}
+
+/// A client speaking another version must be turned away before it is
+/// handed a snapshot it cannot parse, and before the daemon acts on
+/// commands it may be misreading.
+#[test]
+fn a_mismatched_hello_is_rejected_with_both_versions() {
+    let rejection =
+        check_hello(&hello(PROTOCOL_VERSION + 1, false)).expect_err("a mismatch is turned away");
+    let reply: DaemonMessage = serde_json::from_str(&rejection.unwrap()).unwrap();
+    match reply {
+        DaemonMessage::Error {
+            error: ProtocolError::VersionMismatch { client, daemon },
+            ..
+        } => {
+            assert_eq!(client, PROTOCOL_VERSION + 1);
+            assert_eq!(daemon, PROTOCOL_VERSION);
+        }
+        other => panic!("expected a version mismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_daemon_before_manual_whatsapp_retry_is_rejected() {
+    let rejection = check_hello(&hello(39, false)).expect_err("v39 cannot carry ReconnectSession");
+    assert!(matches!(
+        serde_json::from_str::<DaemonMessage>(&rejection.unwrap()).unwrap(),
+        DaemonMessage::Error {
+            error: ProtocolError::VersionMismatch {
+                client: 39,
+                daemon: PROTOCOL_VERSION
+            },
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn manual_whatsapp_retry_reaches_the_session_while_offline() {
+    let hub = connected_hub();
+    hub.apply(crate::state::Change::live(
+        velo_ipc::DaemonEvent::ConnectionChanged(velo_ipc::ConnectionState::Disconnected {
+            reason: "synthetic drop".into(),
+        }),
+    ));
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    let answer = handle_request(
+        bare(ClientRequest::ReconnectSession),
+        &hub,
+        &no_plugins(),
+        &commands,
+        &outbox(),
+    )
+    .await;
+    assert!(matches!(
+        parse(answer.frame),
+        DaemonMessage::Accepted { .. }
+    ));
+    assert!(matches!(
+        taken.await.unwrap(),
+        Some(Action::ReconnectSession)
+    ));
+}
+
+#[test]
+fn state_is_not_served_before_a_hello() {
+    let line = serde_json::to_string(&ClientRequest::Snapshot).unwrap();
+    let rejection = check_hello(&line).expect_err("anything else is turned away");
+    let reply: DaemonMessage = serde_json::from_str(&rejection.unwrap()).unwrap();
+    assert!(matches!(
+        reply,
+        DaemonMessage::Error {
+            error: ProtocolError::Malformed { .. },
+            ..
+        }
+    ));
+}
+
+/// A connected session: the state a command is allowed to run against.
+fn connected_hub() -> Arc<StateHub> {
+    let hub = StateHub::new();
+    hub.apply(crate::state::Change::live(
+        velo_ipc::DaemonEvent::ConnectionChanged(velo_ipc::ConnectionState::Connected),
+    ));
+    hub
+}
+
+fn bare(request: ClientRequest) -> Request {
+    Request::bare(request)
+}
+
+/// A connection's own answer channel. Tests that do not read it only
+/// need it to exist.
+fn outbox() -> Outbox {
+    tokio::sync::mpsc::channel(OUTBOX_CAPACITY).0
+}
+
+/// A host with nothing loaded, for the requests that are not about
+/// plugins — which is every request but one.
+fn no_plugins() -> Arc<velo_plugin_host::Plugins> {
+    Arc::new(velo_plugin_host::Plugins::nothing_loaded(Arc::new(|_| {})))
+}
+
+fn parse(frame: Option<String>) -> DaemonMessage {
+    serde_json::from_str(&frame.expect("every request gets an answer")).unwrap()
+}
+
+/// A stand-in bridge: takes one command and answers it. The join handle
+/// yields what it was asked to do, so a test can assert on both halves.
+fn bridge(outcome: CommandOutcome) -> (Commands, tokio::task::JoinHandle<Option<Action>>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(MAX_CLIENTS);
+    let task = tokio::spawn(async move {
+        let SessionCommand { action, reply } = rx.recv().await?;
+        let _ = reply.send(outcome);
+        Some(action)
+    });
+    (tx, task)
+}
+
+fn live_bridge() -> (Commands, tokio::task::JoinHandle<()>) {
+    let (commands, mut receiver) = tokio::sync::mpsc::channel::<SessionCommand>(MAX_CLIENTS);
+    let task = tokio::spawn(async move {
+        while let Some(command) = receiver.recv().await {
+            let _ = command.reply.send(CommandOutcome::Accepted);
+        }
+    });
+    (commands, task)
+}
+
+/// The follow-up this replaced: these parsed and were answered
+/// `Unsupported`. They now reach the session.
+#[tokio::test]
+async fn a_command_reaches_the_session_rather_than_being_refused() {
+    let hub = connected_hub();
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+
+    let request = bare(ClientRequest::SendText(Box::new(velo_ipc::SendText {
+        jid: "a@s.whatsapp.net".into(),
+        text: "hi".into(),
+        local_id: None,
+        quoted: None,
+    })));
+    let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
+    assert!(matches!(
+        parse(answer.frame),
+        DaemonMessage::Accepted { .. }
+    ));
+    assert!(!answer.shutdown);
+    assert!(matches!(
+        taken.await.unwrap(),
+        Some(Action::SendText(velo_ipc::SendText { jid, text, .. }))
+            if jid == "a@s.whatsapp.net" && text == "hi"
+    ));
+}
+
+/// The payload moves rather than being unpacked and rebuilt, so what the
+/// session is handed is the struct the client sent. A field dropped between
+/// the two compiles and arrives as a document called "file" with no type on
+/// it, which is why this asserts on the fields rather than on the variant.
+#[tokio::test]
+async fn a_picked_file_reaches_the_session_as_it_was_described() {
+    let hub = connected_hub();
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+
+    // Every optional field carries a value, because the ones that default to
+    // `None` are exactly the ones a handler can drop without failing anything.
+    let sent = velo_ipc::SendMedia {
+        jid: "a@s.whatsapp.net".into(),
+        upload: "u-local-1".into(),
+        kind: velo_core::OutgoingMedia::Image,
+        mime_type: "image/jpeg".into(),
+        file_name: "praia.jpg".into(),
+        caption: Some("olha isso".into()),
+        local_id: Some("local-1".into()),
+        quoted: Some(velo_core::QuotedMessage {
+            message_id: "3EB0A".into(),
+            sender: "b@s.whatsapp.net".into(),
+            sender_name: "quem quer que seja".into(),
+            preview: "a linha citada".into(),
+            kind: None,
+        }),
+    };
+    let answer = handle_request(
+        bare(ClientRequest::SendMedia(Box::new(sent.clone()))),
+        &hub,
+        &no_plugins(),
+        &commands,
+        &outbox(),
+    )
+    .await;
+    assert!(matches!(
+        parse(answer.frame),
+        DaemonMessage::Accepted { .. }
+    ));
+    // Compared whole rather than field by field: the payload *moves*, so what
+    // this is really asserting is that nothing was rebuilt on the way — and a
+    // field added later is covered without anybody remembering to add it here.
+    assert_eq!(taken.await.unwrap().map(describe), Some(sent));
+}
+
+/// The media send inside an action, or nothing. A helper rather than a
+/// `matches!`, so the assertion above can be an equality.
+fn describe(action: Action) -> velo_ipc::SendMedia {
+    match action {
+        Action::SendMedia(request) => request,
+        other => panic!("that is not a media send: {other:?}"),
+    }
+}
+
+/// GUI message mutations are addressed, unlike a queued send: the session's
+/// network result, not admission into the bridge, must answer the request.
+#[tokio::test]
+async fn gui_edit_and_delete_reach_the_session_without_an_early_ack() {
+    let hub = connected_hub();
+    let plugins = no_plugins();
+    for request in [
+        ClientRequest::EditMessage(velo_ipc::EditMessage {
+            jid: "a@s.whatsapp.net".into(),
+            message_id: "EDIT-1".into(),
+            new_text: "after".into(),
+        }),
+        ClientRequest::RevokeMessage(velo_ipc::RevokeMessage {
+            jid: "a@s.whatsapp.net".into(),
+            message_id: "DELETE-1".into(),
+            for_everyone: false,
+        }),
+        ClientRequest::RevokeMessage(velo_ipc::RevokeMessage {
+            jid: "a@s.whatsapp.net".into(),
+            message_id: "DELETE-EVERYONE-1".into(),
+            for_everyone: true,
+        }),
+    ] {
+        let (commands, taken) = bridge(CommandOutcome::Accepted);
+        let answer = handle_request(
+            Request {
+                id: Some(42),
+                request,
+            },
+            &hub,
+            &plugins,
+            &commands,
+            &outbox(),
+        )
+        .await;
+        assert!(
+            answer.frame.is_none(),
+            "the bridge has not completed the mutation"
+        );
+        match taken.await.unwrap().unwrap() {
+            Action::EditMessage { id, request, .. } => {
+                assert_eq!(id, 42);
+                assert_eq!(request.message_id, "EDIT-1");
+                assert_eq!(request.new_text, "after");
+            }
+            Action::RevokeMessage { id, request, .. } => {
+                assert_eq!(id, 42);
+                assert_eq!(
+                    request.for_everyone,
+                    request.message_id == "DELETE-EVERYONE-1"
+                );
+            }
+            action => panic!("unexpected action: {action:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn gui_message_mutations_require_an_answer_id() {
+    let hub = connected_hub();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    for request in [
+        ClientRequest::EditMessage(velo_ipc::EditMessage {
+            jid: "a@s.whatsapp.net".into(),
+            message_id: "EDIT-1".into(),
+            new_text: "after".into(),
+        }),
+        ClientRequest::RevokeMessage(velo_ipc::RevokeMessage {
+            jid: "a@s.whatsapp.net".into(),
+            message_id: "DELETE-1".into(),
+            for_everyone: true,
+        }),
+    ] {
+        let answer = handle_request(bare(request), &hub, &no_plugins(), &commands, &outbox()).await;
+        assert!(matches!(
+            parse(answer.frame),
+            DaemonMessage::Error {
+                id: None,
+                error: ProtocolError::Malformed { .. },
+            }
+        ));
+    }
+}
+
+/// `Accepted` has to mean the session took it, not that a queue did. The
+/// account can drop between the check at the door and the moment the
+/// bridge picks the command up, and a client told yes on admission alone
+/// would never learn its message went nowhere.
+#[tokio::test]
+async fn a_refusal_at_execution_time_reaches_the_client() {
+    // Connected as far as this connection can see, and refused anyway:
+    // exactly the race the answer channel exists for.
+    let hub = connected_hub();
+    let (commands, _taken) = bridge(CommandOutcome::Refused("has moved on".into()));
+
+    let request = bare(ClientRequest::MarkRead(velo_ipc::MarkRead {
+        jid: "a@s.whatsapp.net".into(),
+        through_message_id: None,
+    }));
+    let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
+    assert!(matches!(
+        parse(answer.frame),
+        DaemonMessage::Error {
+            error: ProtocolError::Refused { ref detail },
+            ..
+        } if detail == "has moved on"
+    ));
+}
+
+/// The other way a command can come back: the account went away while the
+/// request was in the bridge's hands. A different answer, because a client
+/// can see that state coming and wait it out rather than change anything.
+#[tokio::test]
+async fn a_session_lost_mid_command_is_reported_as_such() {
+    let hub = connected_hub();
+    let (commands, _taken) = bridge(CommandOutcome::NoSession("not connected".into()));
+
+    let request = bare(ClientRequest::SendText(Box::new(velo_ipc::SendText {
+        jid: "a@s.whatsapp.net".into(),
+        text: "hi".into(),
+        local_id: None,
+        quoted: None,
+    })));
+    let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
+    assert!(matches!(
+        parse(answer.frame),
+        DaemonMessage::Error {
+            error: ProtocolError::NoSession { .. },
+            ..
+        }
+    ));
+}
+
+/// Accepting a send the account cannot carry out would answer `Accepted`
+/// and then fail out of sight, where the client can never learn of it.
+#[tokio::test]
+async fn a_command_is_refused_while_there_is_no_session_to_carry_it() {
+    // Fresh hub: `Connecting`, which is what a daemon looks like before it
+    // has an account and after it loses one.
+    let hub = StateHub::new();
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+
+    let request = bare(ClientRequest::SendText(Box::new(velo_ipc::SendText {
+        jid: "a@s.whatsapp.net".into(),
+        text: "hi".into(),
+        local_id: None,
+        quoted: None,
+    })));
+    let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
+    assert!(matches!(
+        parse(answer.frame),
+        DaemonMessage::Error {
+            error: ProtocolError::NoSession { .. },
+            ..
+        }
+    ));
+
+    drop(commands);
+    assert!(
+        taken.await.unwrap().is_none(),
+        "nothing was queued behind the no"
+    );
+}
+
+/// The acknowledgement has to be on the wire before the daemon is asked
+/// to stop, or the shutdown races the answer and a client that asked
+/// politely sees EOF where the protocol promised it a reply. Signalling
+/// is therefore the caller's job, after the write.
+#[tokio::test]
+async fn a_shutdown_is_acknowledged_before_it_is_carried_out() {
+    let hub = connected_hub();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+
+    let answer = handle_request(
+        bare(ClientRequest::Shutdown),
+        &hub,
+        &no_plugins(),
+        &commands,
+        &outbox(),
+    )
+    .await;
+    assert!(matches!(
+        parse(answer.frame),
+        DaemonMessage::Accepted { .. }
+    ));
+    assert!(answer.shutdown, "and only then is the daemon asked to stop");
+}
+
+/// A frame that does not parse is the client's bug, not a reason to drop
+/// its connection: it gets told, and its next request still works. Driven
+/// through the connection, because parsing is what the connection does —
+/// `handle_request` is handed a request that already parsed.
+#[tokio::test]
+async fn a_malformed_frame_is_answered_and_does_not_end_the_connection() {
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let hub = connected_hub();
+    let (commands, _taken) = live_bridge();
+
+    let served = tokio::spawn(serve_client(
+        server,
+        Arc::clone(&hub),
+        no_plugins(),
+        commands,
+    ));
+    client
+        .write_all(format!("{}\n", hello(PROTOCOL_VERSION, false)).as_bytes())
+        .await
+        .unwrap();
+
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap(); // the snapshot
+
+    reader
+        .get_mut()
+        .write_all(b"not json at all\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Error {
+                error: ProtocolError::Malformed { .. },
+                ..
+            }
+        ),
+        "expected a complaint, got {line}"
+    );
+
+    // Still usable: the next request is answered rather than the
+    // connection being gone.
+    let snapshot = serde_json::to_string(&Request::bare(ClientRequest::Snapshot)).unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{snapshot}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(matches!(
+        serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+        DaemonMessage::Hello { .. }
+    ));
+    served.abort();
+}
+
+/// The daemon owns no window, so this is a relay: whoever has one is the
+/// only party that can raise it.
+#[tokio::test]
+async fn a_window_request_is_published_rather_than_acted_on() {
+    let hub = StateHub::new();
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    let mut signals = hub.subscribe_signals();
+
+    let request = bare(ClientRequest::ShowWindow);
+    let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
+    assert!(matches!(
+        parse(answer.frame),
+        DaemonMessage::Accepted { .. }
+    ));
+
+    let frame: DaemonMessage = serde_json::from_str(&signals.recv().await.unwrap()).unwrap();
+    assert_eq!(frame, DaemonMessage::ShowWindow);
+
+    drop(commands);
+    assert!(
+        taken.await.unwrap().is_none(),
+        "the session has no part in a window"
+    );
+}
+
+/// The cap is per frame, not per connection: a long-lived client sending
+/// small valid requests must never hit an artificial EOF because they
+/// added up.
+#[tokio::test]
+async fn the_size_cap_applies_to_each_frame_separately() {
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let mut reader = BufReader::new(server);
+    let mut buf = Vec::new();
+
+    // More total bytes than the cap, in frames far below it.
+    let frame = "x".repeat(1000);
+    let frames = (velo_ipc::MAX_REQUEST_BYTES / 1000) + 10;
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt as _;
+        for _ in 0..frames {
+            let _ = client.write_all(frame.as_bytes()).await;
+            let _ = client.write_all(b"\n").await;
+        }
+    });
+
+    for i in 0..frames {
+        match read_frame(&mut reader, &mut buf).await {
+            Ok(Some(velo_ipc::FrameRead::Line(line))) => assert_eq!(line.len(), 1000),
+            other => panic!("frame {i} of {frames} was cut short: {other:?}"),
+        }
+    }
+}
+
+/// A frame that is not text is the client's bug, and it can recover from
+/// being told. Dropping the connection would take its valid requests with
+/// it.
+#[tokio::test]
+async fn invalid_utf8_is_a_recoverable_frame_not_a_dead_connection() {
+    let (mut client, server) = tokio::io::duplex(1024);
+    let mut reader = BufReader::new(server);
+    let mut buf = Vec::new();
+
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt as _;
+        let _ = client.write_all(&[0xff, 0xfe, b'\n']).await;
+        let _ = client.write_all(b"{\"request\":\"snapshot\"}\n").await;
+    });
+
+    assert!(matches!(
+        read_frame(&mut reader, &mut buf).await,
+        Ok(Some(velo_ipc::FrameRead::NotUtf8))
+    ));
+    // The stream survives it.
+    assert!(matches!(
+        read_frame(&mut reader, &mut buf).await,
+        Ok(Some(velo_ipc::FrameRead::Line(_)))
+    ));
+}
+
+/// The reader is a `select!` branch, so it loses races with the update
+/// stream mid-frame. What it already consumed has to survive that, or a
+/// client's command comes back as a parse error for a frame it sent
+/// correctly — and only when the account happened to be busy.
+#[tokio::test]
+async fn a_frame_interrupted_by_an_update_is_not_lost() {
+    let (mut client, server) = tokio::io::duplex(1024);
+    let mut reader = BufReader::new(server);
+    let mut buf = Vec::new();
+
+    client.write_all(b"{\"request\":\"snap").await.unwrap();
+
+    // The read polls first, consumes what is there, and then parks
+    // because the frame is not finished; the ready branch wins.
+    tokio::select! {
+        biased;
+        frame = read_frame(&mut reader, &mut buf) => {
+            panic!("an unterminated frame must not complete: {frame:?}");
+        }
+        () = std::future::ready(()) => {}
+    }
+    assert!(!buf.is_empty(), "the prefix was consumed and kept");
+
+    client.write_all(b"shot\"}\n").await.unwrap();
+    match read_frame(&mut reader, &mut buf).await {
+        Ok(Some(velo_ipc::FrameRead::Line(line))) => {
+            assert!(
+                matches!(
+                    serde_json::from_str::<ClientRequest>(&line),
+                    Ok(ClientRequest::Snapshot)
+                ),
+                "the frame reassembled as it was sent: {line}"
+            );
+        }
+        other => panic!("the prefix was dropped: {other:?}"),
+    }
+}
+
+/// The cap covers a frame, not a read. Letting a carried prefix start the
+/// budget over would make the limit a suggestion: a client could send a
+/// megabyte at a time forever and never trip it.
+#[tokio::test]
+async fn a_carried_prefix_still_counts_against_the_cap() {
+    let (client, server) = tokio::io::duplex(1024);
+    let mut reader = BufReader::new(server);
+    // As if a cancelled read had already consumed a full frame's worth.
+    let mut buf = vec![b'x'; velo_ipc::MAX_REQUEST_BYTES];
+
+    assert!(matches!(
+        read_frame(&mut reader, &mut buf).await,
+        Ok(Some(velo_ipc::FrameRead::TooLong))
+    ));
+    assert!(buf.is_empty(), "a refused frame leaves nothing behind");
+    drop(client);
+}
+
+/// An encoding bug in the opening frame is as recoverable as one after it.
+/// Closing on it silently leaves the client unable to tell a rejected
+/// hello from a dead socket.
+#[tokio::test]
+async fn a_hello_that_is_not_text_is_answered_rather_than_dropped() {
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let (reader, mut writer) = tokio::io::split(server);
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::new();
+
+    let hello = hello(PROTOCOL_VERSION, false);
+    client.write_all(&[0xff, 0xfe, b'\n']).await.unwrap();
+    client.write_all(hello.as_bytes()).await.unwrap();
+    client.write_all(b"\n").await.unwrap();
+
+    assert!(
+        handshake(&mut reader, &mut writer, &mut buf)
+            .await
+            .unwrap()
+            .is_some(),
+        "the client recovered and was let in"
+    );
+
+    let mut answer = String::new();
+    BufReader::new(client).read_line(&mut answer).await.unwrap();
+    assert!(matches!(
+        serde_json::from_str::<DaemonMessage>(&answer).unwrap(),
+        DaemonMessage::Error {
+            error: ProtocolError::Malformed { .. },
+            ..
+        }
+    ));
+}
+
+/// The regression this replaced: a summary-only client was handed its
+/// snapshot and then dropped, because the branch serving session events
+/// ended the connection on a closed channel and opting out produced one.
+#[tokio::test]
+async fn a_client_that_wants_only_summaries_stays_connected() {
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let hub = connected_hub();
+    let (commands, _taken) = live_bridge();
+
+    let served = tokio::spawn(serve_client(
+        server,
+        Arc::clone(&hub),
+        no_plugins(),
+        commands,
+    ));
+    client
+        .write_all(format!("{}\n", hello(PROTOCOL_VERSION, false)).as_bytes())
+        .await
+        .unwrap();
+
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Hello { .. }
+        ),
+        "expected a snapshot, got {line}"
+    );
+
+    // Still there: a summary reaches it rather than an EOF.
+    hub.apply(crate::state::Change::live(
+        velo_ipc::DaemonEvent::ChatRemoved {
+            jid: "a@s.whatsapp.net".into(),
+        },
+    ));
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Update { .. }
+        ),
+        "the connection was dropped instead: {line}"
+    );
+    served.abort();
+}
+
+/// The other half: a client that asked for events gets them, and the
+/// summary stream keeps working alongside.
+#[tokio::test]
+async fn a_client_that_asked_for_events_receives_them() {
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let hub = connected_hub();
+    let (commands, _taken) = live_bridge();
+
+    let served = tokio::spawn(serve_client(
+        server,
+        Arc::clone(&hub),
+        no_plugins(),
+        commands,
+    ));
+    client
+        .write_all(format!("{}\n", hello(PROTOCOL_VERSION, true)).as_bytes())
+        .await
+        .unwrap();
+
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap(); // the hello
+
+    hub.publish_session(
+        serde_json::to_string(&DaemonMessage::Session {
+            event: Box::new(velo_core::UiEvent::Connected),
+        })
+        .unwrap(),
+    );
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Session { .. }
+        ),
+        "expected a session event, got {line}"
+    );
+    served.abort();
+}
+
+/// A wire client has no snapshot flow, so a lag is recovered by reconnecting
+/// and not by asking for state. It used to be sent a legacy `Resync` — which
+/// has no wire spelling, so it was dropped — and then gated on a `Snapshot`
+/// request the wire protocol cannot make, stopping its stream for good. The
+/// lag now ends the connection, which is the whole recovery.
+#[tokio::test]
+async fn a_wire_client_that_lags_is_disconnected_rather_than_stalled() {
+    use velo_wire::envelope::RequestEnvelope;
+    use velo_wire::request::ClientRequest as WireRequest;
+
+    let (mut client, server) = tokio::io::duplex(1024);
+    let hub = connected_hub();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    let served = tokio::spawn(serve_client(
+        server,
+        Arc::clone(&hub),
+        no_plugins(),
+        commands,
+    ));
+
+    let wire_hello = serde_json::to_string(&RequestEnvelope {
+        id: 1,
+        request: WireRequest::Hello {
+            local_account: None,
+            account_selection: false,
+            protocol: velo_wire::envelope::CURRENT_PROTOCOL_VERSION,
+            client_name: "test".into(),
+            read_only: false,
+            session_events: false,
+        },
+    })
+    .unwrap();
+    client
+        .write_all(format!("{wire_hello}\n").as_bytes())
+        .await
+        .unwrap();
+
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap(); // the hello acknowledgement
+
+    // Overrun the broadcast ring without yielding, so the server's receiver is
+    // behind before it is ever polled.
+    for i in 0..2000 {
+        hub.apply(crate::state::Change::live(
+            velo_ipc::DaemonEvent::ChatRemoved {
+                jid: format!("{i}@s.whatsapp.net"),
+            },
+        ));
+    }
+
+    // Drain to the end, asserting no legacy `Resync` reaches a wire client.
+    // Each read is bounded: a server that stalled instead of closing leaves
+    // this parked in a read with nothing to end it, and a hung test reports
+    // nothing. The frames are already in the socket, so the timeout only ever
+    // fires on the stall it is there to catch.
+    let mut drained = 0usize;
+    loop {
+        line.clear();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("the connection stalled instead of closing after the lag");
+        match read {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                assert!(
+                    !line.contains("\"type\":\"resync\""),
+                    "a wire client was sent a legacy Resync: {line}"
+                );
+                drained += 1;
+                assert!(drained <= 2000, "the connection did not end after the lag");
+            }
+        }
+    }
+    served.abort();
+}
+
+/// Forgetting the session is the only way out of dead credentials, and
+/// dead credentials are a state the account is unreachable in. Gating it
+/// on a connection refuses it exactly when it is wanted.
+#[test]
+fn the_local_actions_do_not_need_a_connection() {
+    assert!(
+        !Action::ForgetSession(crate::session_bridge::AccountDisposition::Reset).needs_network()
+    );
+    assert!(!Action::ReloadHistory.needs_network());
+    // A view is one local row and no stanza, over history a disconnected
+    // window can still read — and the ring it watched is already drawn.
+    assert!(
+        !Action::MarkStatusWatched(velo_ipc::MarkStatusWatched {
+            message_ids: vec!["3EB0".into()],
+        })
+        .needs_network()
+    );
+    assert!(
+        Action::SendText(velo_ipc::SendText {
+            jid: "a@s.whatsapp.net".into(),
+            text: "hi".into(),
+            local_id: None,
+            quoted: None,
+        })
+        .needs_network()
+    );
+}
+
+/// Pairing is the connection attempt itself: the account is in `Pairing`,
+/// never `Connected`, for the whole of it, so a live-connection gate would
+/// refuse the one request that is trying to establish one.
+#[test]
+fn requesting_a_pair_code_does_not_need_a_live_connection() {
+    let action = Action::Wire {
+        id: 1,
+        request: velo_wire::request::ClientRequest::RequestPairCode {
+            phone: "5511999999999".into(),
+        },
+        answer_to: outbox(),
+    };
+    assert!(!action.needs_network());
+    // Still a write: it mints credentials on the server, so a read-only
+    // connection must not be able to ask for one.
+    let Action::Wire { request, .. } = &action else {
+        unreachable!("built as a wire action");
+    };
+    assert!(request.is_mutation());
+}
+
+/// Network dependency is classified per request, not inferred from whether
+/// it writes: a local mutation works with no connection, and a network read
+/// needs one.
+#[test]
+fn wire_requests_classify_their_network_dependency() {
+    use velo_wire::request::ClientRequest as R;
+
+    let action = |request: R| Action::Wire {
+        id: 1,
+        request,
+        answer_to: outbox(),
+    };
+
+    // Local mutations: the store or the cache, no stanza.
+    for request in [
+        R::CleanupChats,
+        R::PurgeMessages { chat_jid: None },
+        R::TagContact {
+            jid: "a@s.whatsapp.net".into(),
+            tag: "x".into(),
+        },
+        R::ClearMediaCache,
+    ] {
+        assert!(!action(request.clone()).needs_network(), "{request:?}");
+    }
+
+    // Network reads: a live connection is what makes them answerable.
+    for request in [
+        R::ListChannels,
+        R::GetProfile { jid: None },
+        R::GetBusinessProfile {
+            jid: "a@s.whatsapp.net".into(),
+        },
+        R::CheckContact {
+            phone: "5511999999999".into(),
+        },
+        R::GetChannelInfo {
+            channel_jid: "1@newsletter".into(),
+        },
+    ] {
+        assert!(action(request.clone()).needs_network(), "{request:?}");
+    }
+}
+
+/// A clear-cache reset must survive being offline.
+///
+/// The reset itself is local — it forgets what the resolver knows — while the
+/// pass it schedules needs the network and tolerates its absence. Refusing the
+/// action offline would lose the reset rather than defer it, leaving the
+/// descriptors pointing at bytes the clear just deleted until the next
+/// connection revalidates on its own. So it is admitted disconnected, the same
+/// as a history reload.
+#[test]
+fn a_clear_cache_avatar_reset_is_admitted_while_disconnected() {
+    assert!(
+        !Action::RefreshAvatars.needs_network(),
+        "the reset is local; the pass it schedules waits for the network on its own"
+    );
+}
+
+/// A connection's own answer channel, with the end that reads it.
+///
+/// Everything about a plugin folder is answered *later*, on this channel,
+/// rather than from the connection's loop — a thirty-two megabyte read and
+/// write in that loop is a window served no state and no call video for as
+/// long as the disk takes. So these tests read the answer where it really
+/// arrives.
+fn answers() -> (Outbox, tokio::sync::mpsc::Receiver<String>) {
+    tokio::sync::mpsc::channel(OUTBOX_CAPACITY)
+}
+
+/// The one answer, wherever it came from: the loop's own frame if there is
+/// one, and otherwise the outbox this request will answer on.
+async fn answered(
+    answer: super::requests::Answer,
+    rx: &mut tokio::sync::mpsc::Receiver<String>,
+) -> DaemonMessage {
+    let frame = match answer.frame {
+        Some(frame) => frame,
+        None => tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("every request gets exactly one answer")
+            .expect("and the outbox is still open"),
+    };
+    serde_json::from_str(&frame).expect("a daemon frame")
+}
+
+/// A module is staged and the frame names it, exactly as a file being sent
+/// is — so a frame naming something that is *not* a staged payload is one the
+/// daemon must not act on. The cache holds this account's downloaded photos
+/// under keys derived from content it has already published, so without this
+/// a client could name one of those and have the daemon move it into the
+/// folder it loads code from.
+#[tokio::test]
+async fn a_plugin_install_takes_nothing_but_a_staged_payload() {
+    let hub = connected_hub();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    let (outbox, mut answers) = answers();
+
+    let request = Request {
+        id: Some(11),
+        request: ClientRequest::InstallPlugin(velo_ipc::InstallPlugin {
+            file_name: "autoreply.wasm".into(),
+            // A download's key, which is the daemon's own cache and not a
+            // key space a front end writes.
+            upload: "f-3EB0A".into(),
+        }),
+    };
+    let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox).await;
+    assert!(
+        matches!(
+            answered(answer, &mut answers).await,
+            DaemonMessage::Error {
+                id: Some(11),
+                error: ProtocolError::Refused { .. },
+            }
+        ),
+        "a key outside the staged space is refused rather than read"
+    );
+}
+
+/// And one that names a staged key with nothing under it is refused too,
+/// rather than installing an empty module or answering success.
+#[tokio::test]
+async fn a_plugin_install_whose_payload_never_arrived_is_refused() {
+    let hub = connected_hub();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    let (outbox, mut answers) = answers();
+
+    let request = Request {
+        id: Some(12),
+        request: ClientRequest::InstallPlugin(velo_ipc::InstallPlugin {
+            file_name: "autoreply.wasm".into(),
+            upload: velo_ipc::staged_key(&format!("no-such-plugin-{}", std::process::id())),
+        }),
+    };
+    let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox).await;
+    assert!(matches!(
+        answered(answer, &mut answers).await,
+        DaemonMessage::Error {
+            id: Some(12),
+            error: ProtocolError::Refused { .. },
+        }
+    ));
+}
+
+/// Both plugin questions whose answer *is* the thing asked for need an
+/// address to answer under, like a download and a page of history: an answer
+/// with no id on it is a frame no waiter can claim.
+#[tokio::test]
+async fn the_plugin_answers_that_are_the_answer_need_an_id() {
+    let hub = connected_hub();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    let (outbox, mut answers) = answers();
+
+    for request in [
+        ClientRequest::InstallPlugin(velo_ipc::InstallPlugin {
+            file_name: "autoreply.wasm".into(),
+            upload: velo_ipc::staged_key("plugin-1"),
+        }),
+        ClientRequest::ListInstalledPlugins,
+    ] {
+        let named = format!("{request:?}");
+        let answer = handle_request(bare(request), &hub, &no_plugins(), &commands, &outbox).await;
+        assert!(
+            matches!(
+                answered(answer, &mut answers).await,
+                DaemonMessage::Error {
+                    id: None,
+                    error: ProtocolError::Malformed { .. },
+                }
+            ),
+            "{named} was answered without an address"
+        );
+    }
+}
+
+/// Nothing about a plugin folder goes to the session: it is the daemon's own
+/// directory, and installing into it touches no account. A removal is
+/// acknowledged when the file is gone, which is what lets the window ask for
+/// the folder again straight afterwards and get the answer it just caused.
+#[tokio::test]
+async fn removing_a_plugin_is_answered_without_the_session() {
+    // Deliberately not connected: none of these needs the network, and a
+    // front end that could only manage its plugins while online would be one
+    // that cannot take out the plugin that is breaking the connection.
+    let hub = StateHub::new();
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    let (outbox, mut answers) = answers();
+
+    let request = Request {
+        id: Some(13),
+        request: ClientRequest::RemovePlugin {
+            plugin: format!("never-installed-{}", std::process::id()),
+        },
+    };
+    let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox).await;
+    assert!(
+        matches!(
+            answered(answer, &mut answers).await,
+            DaemonMessage::Accepted { id: Some(13) }
+        ),
+        "removing what is not there is the answer a second press deserves"
+    );
+    drop(commands);
+    assert!(
+        taken.await.unwrap().is_none(),
+        "and nothing was asked of the session"
+    );
+}
+
+#[tokio::test]
+async fn an_ensure_avatars_request_dispatches_to_session_bridge() {
+    let hub = connected_hub();
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    let (outbox, mut answers) = answers();
+
+    let request = Request {
+        id: Some(99),
+        request: ClientRequest::EnsureAvatars(velo_ipc::EnsureAvatars {
+            items: vec![velo_core::AvatarDemand {
+                jid: "123@s.whatsapp.net".into(),
+                known_picture_id: Some("pic_1".into()),
+                cache_key: Some("a-123".into()),
+                need_bytes: false,
+                cache_miss: false,
+            }],
+        }),
+    };
+
+    let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox).await;
+    assert!(matches!(
+        answered(answer, &mut answers).await,
+        DaemonMessage::Accepted { id: Some(99) }
+    ));
+    drop(commands);
+    let command = taken.await.unwrap().expect("a command was dispatched");
+    match command {
+        Action::EnsureAvatars(items) => {
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].jid, "123@s.whatsapp.net");
+            assert_eq!(items[0].known_picture_id.as_deref(), Some("pic_1"));
+            assert!(!items[0].need_bytes);
+        }
+        other => panic!("expected Action::EnsureAvatars, got {other:?}"),
+    }
+}
+
+/// A refused command names the request it refused. Before ids, the only
+/// way to report a refused send was to invent a failure against the
+/// message the client happened to have drawn.
+#[tokio::test]
+async fn a_refusal_names_the_request_it_refused() {
+    // Not connected, so the send is refused at the door.
+    let hub = StateHub::new();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+
+    let request = Request {
+        id: Some(42),
+        request: ClientRequest::SendText(Box::new(velo_ipc::SendText {
+            jid: "a@s.whatsapp.net".into(),
+            text: "hi".into(),
+            local_id: Some("local_1".into()),
+            quoted: None,
+        })),
+    };
+    let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
+    assert!(matches!(
+        parse(answer.frame),
+        DaemonMessage::Error {
+            id: Some(42),
+            error: ProtocolError::NoSession { .. },
+        }
+    ));
+}
+
+/// A peer that connects and says nothing costs a task and a descriptor
+/// for as long as it likes. A reconnect loop doing it takes the listener
+/// down, and the daemon treats a dead listener as fatal.
+#[tokio::test(start_paused = true)]
+async fn a_client_that_never_speaks_does_not_hold_its_slot_forever() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let hub = StateHub::new();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+
+    // Returns rather than parking forever; the paused clock reaches the
+    // handshake deadline as soon as nothing else can run.
+    serve_client(server, hub, no_plugins(), commands)
+        .await
+        .unwrap();
+
+    let mut answer = String::new();
+    BufReader::new(client).read_line(&mut answer).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&answer).unwrap(),
+            DaemonMessage::Error {
+                error: ProtocolError::Malformed { .. },
+                ..
+            }
+        ),
+        "and it is told why: {answer}"
+    );
+}
+
+/// A client turned away has to be able to tell "full" from "broken", or
+/// it retries against a daemon that will keep refusing it.
+#[tokio::test]
+async fn a_refused_client_is_told_the_daemon_is_full() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    reject(server).await;
+
+    let mut answer = String::new();
+    BufReader::new(client).read_line(&mut answer).await.unwrap();
+    assert!(matches!(
+        serde_json::from_str::<DaemonMessage>(&answer).unwrap(),
+        DaemonMessage::Error {
+            error: ProtocolError::TooManyClients { limit },
+            ..
+        } if limit == MAX_CLIENTS
+    ));
+}
+
+/// Two daemons starting together can both see a stale socket; the lock is
+/// what stops the second from unlinking the first's freshly bound one.
+///
+/// # Why the release is waited for rather than asserted outright
+///
+/// `flock` is released when the *last* descriptor on the open file
+/// description closes, and a `fork` anywhere in this process duplicates
+/// every one of them: between the fork and the exec that clears them,
+/// a child holds a copy of this lock and closing ours releases nothing.
+/// Measured outside the suite at ~5% of attempts against a single
+/// spawning thread, and it is what failed this test on macOS while Linux
+/// got away with it.
+///
+/// [`crate::one_at_a_time`] keeps this away from the tests that spawn,
+/// which is worth doing on its own — but it cannot cover a fork this
+/// crate does not make, and a test that fails when some library forks
+/// beside it is testing the wrong thing. The property is that the lock
+/// does not *outlive its holder*: a copy in a child that is microseconds
+/// from exec is not the holder, so the wait is what separates the two.
+/// A lock genuinely never released still fails, which is the bug this
+/// test exists for.
+#[test]
+fn the_startup_lock_is_exclusive() {
+    let _exclusive = crate::one_at_a_time();
+    let dir = std::env::temp_dir().join(format!("velo-lock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("daemon.sock");
+
+    let first = acquire_startup_lock(&socket).expect("first daemon takes the lock");
+    assert!(
+        acquire_startup_lock(&socket).is_err(),
+        "a second daemon must not get in"
+    );
+
+    // Released with the handle, so a restart is not blocked by the last
+    // run.
+    //
+    // Retried, and not because the property is doubtful: on an idle
+    // machine the first attempt succeeds and this loop never sleeps. It
+    // is here because the immediate assertion failed twice on the macOS
+    // runner and nowhere else, which a single attempt reports as "the
+    // lock outlived its holder" — a claim about this code that the
+    // evidence does not support, since re-acquiring works everywhere it
+    // can be reproduced.
+    //
+    // The likeliest mechanism is that a `flock` belongs to the *open file
+    // description*, which `fork` duplicates: a child spawned by another
+    // test in this binary (`window::tests::launching` starts a shell that
+    // sleeps) holds this descriptor from the moment it is forked until it
+    // execs, so dropping the handle here releases nothing until it does.
+    // That is a hypothesis — it did not reproduce under load here — which
+    // is why this waits for the lock rather than asserting anything about
+    // why it was briefly unavailable. What it still refuses is a lock
+    // that is never released.
+    drop(first);
+    // The library's clock, which is what this repo uses everywhere: a
+    // test that moved time would move this with it.
+    let deadline = wacore::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut last = None;
+    let regained = loop {
+        match acquire_startup_lock(&socket) {
+            Ok(lock) => break Some(lock),
+            Err(e) if wacore::time::Instant::now() < deadline => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                last = Some(e);
+                break None;
+            }
+        }
+    };
+    assert!(
+        regained.is_some(),
+        "lock outlived its holder: {}",
+        last.map_or_else(|| "no reason given".to_string(), |e| e.to_string())
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The fallback directory sits at a predictable path in a world-writable
+/// place, so a symlink planted there must not be followed.
+///
+/// Unix only, and not for want of porting: on Windows the state directory
+/// is under the user's own profile, so there is no world-writable parent
+/// for anyone to plant anything in, and `prepare_state_dir` has nothing
+/// to check.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_socket_dir_is_refused() {
+    let base = std::env::temp_dir().join(format!("velo-symlink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let target = base.join("elsewhere");
+    std::fs::create_dir_all(&target).unwrap();
+    let link = base.join("sockdir");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let err = prepare_state_dir(&link).expect_err("a symlink must be refused");
+    assert!(
+        err.to_string().contains("not a directory"),
+        "unexpected reason: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A directory we already own is reused, and tightened if it is loose.
+///
+/// Unix only, for the same reason as the symlink check above.
+#[cfg(unix)]
+#[test]
+fn a_loose_but_owned_dir_is_tightened_rather_than_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("velo-loose-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    prepare_state_dir(&dir).expect("our own directory is usable");
+
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "left readable by other users");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn wire_hello_and_diagnostics_flow() {
+    use velo_wire::envelope::{RequestEnvelope, ResponseEnvelope, ResponseResult};
+    use velo_wire::request::ClientRequest as WireRequest;
+    use velo_wire::response::DaemonResponse as WireResponse;
+
+    let wire_hello = serde_json::to_string(&RequestEnvelope {
+        id: 1,
+        request: WireRequest::Hello {
+            local_account: None,
+            account_selection: false,
+            protocol: velo_wire::envelope::CURRENT_PROTOCOL_VERSION,
+            client_name: "test-client".into(),
+            read_only: true,
+            session_events: false,
+        },
+    })
+    .unwrap();
+
+    let attached = check_hello(&wire_hello).expect("wire hello must be accepted");
+    assert!(attached.is_wire);
+    assert!(attached.read_only);
+    assert_eq!(attached.wire_hello_id, Some(1));
+
+    let hub = connected_hub();
+    let plugins = no_plugins();
+    let (commands, _) = bridge(CommandOutcome::Accepted);
+    let outbox = outbox();
+
+    // Doctor check
+    let doctor_req = RequestEnvelope {
+        id: 2,
+        request: WireRequest::DoctorCheck,
+    };
+    let ans = handle_wire_request(doctor_req, &hub, &plugins, &commands, &outbox).await;
+    let resp: ResponseEnvelope = serde_json::from_str(&ans.frame.unwrap()).unwrap();
+    assert_eq!(resp.id, Some(2));
+    assert!(
+        matches!(resp.result, ResponseResult::Ok { payload } if matches!(*payload, WireResponse::Doctor(_)))
+    );
+
+    // Storage usage
+    let storage_req = RequestEnvelope {
+        id: 3,
+        request: WireRequest::GetStorageUsage,
+    };
+    let ans = handle_wire_request(storage_req, &hub, &plugins, &commands, &outbox).await;
+    let resp: ResponseEnvelope = serde_json::from_str(&ans.frame.unwrap()).unwrap();
+    assert_eq!(resp.id, Some(3));
+    assert!(
+        matches!(resp.result, ResponseResult::Ok { payload } if matches!(*payload, WireResponse::Storage(_)))
+    );
+
+    // Verify is_mutation flag
+    assert!(
+        WireRequest::SendText {
+            to: "123".into(),
+            message: "hi".into(),
+            reply_to: None,
+            mentions: vec![],
+            enqueue_only: false,
+        }
+        .is_mutation()
+    );
+    assert!(!WireRequest::DoctorCheck.is_mutation());
+    assert!(!WireRequest::GetStatus.is_mutation());
+    assert!(!WireRequest::GetStorageUsage.is_mutation());
+    assert!(
+        !WireRequest::ListChats {
+            limit: 10,
+            offset: None,
+            query: None,
+            archived: false
+        }
+        .is_mutation()
+    );
+    assert!(
+        !WireRequest::ListContacts {
+            query: None,
+            limit: 10
+        }
+        .is_mutation()
+    );
+    assert!(
+        !WireRequest::SearchMessages {
+            query: "hello".into(),
+            chat_jid: None,
+            has_media: false,
+            limit: 10
+        }
+        .is_mutation()
+    );
+
+    // Query requests are dispatched out-of-band to the session bridge
+    let list_chats_req = RequestEnvelope {
+        id: 4,
+        request: WireRequest::ListChats {
+            limit: 10,
+            offset: None,
+            query: None,
+            archived: false,
+        },
+    };
+    let ans = handle_wire_request(list_chats_req, &hub, &plugins, &commands, &outbox).await;
+    // out_of_band returns None for frame because the bridge responds directly via outbox
+    assert!(ans.frame.is_none());
+}
+
+/// One wire request reaches the session bridge as an [`Action::Wire`].
+async fn assert_wire_routed(
+    hub: &Arc<StateHub>,
+    plugins: &Arc<velo_plugin_host::Plugins>,
+    request: velo_wire::request::ClientRequest,
+) {
+    use velo_wire::envelope::RequestEnvelope;
+
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    let env = RequestEnvelope {
+        id: 11,
+        request: request.clone(),
+    };
+    let ans = handle_wire_request(env, hub, plugins, &commands, &outbox()).await;
+    assert!(
+        ans.frame.is_none(),
+        "expected out-of-band dispatch for {request:?}"
+    );
+    match taken.await.unwrap() {
+        Some(Action::Wire { request: got, .. }) => assert_eq!(got, request),
+        other => panic!("expected an Action::Wire, got {other:?}"),
+    }
+}
+
+/// The Phase 4 surface reaches the session instead of being refused as
+/// unsupported: sends, chat mutations, presence and single-chat reads.
+#[tokio::test]
+async fn wire_phase4_requests_reach_the_session() {
+    use velo_wire::dto::PresenceState;
+    use velo_wire::request::ClientRequest as WireRequest;
+
+    let hub = connected_hub();
+    let plugins = no_plugins();
+    let chat = "559900000001@s.whatsapp.net".to_string();
+
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::SendText {
+            to: chat.clone(),
+            message: "oi".into(),
+            reply_to: None,
+            mentions: vec![],
+            enqueue_only: false,
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::SendReaction {
+            chat_jid: chat.clone(),
+            message_id: "3EB0A".into(),
+            emoji: "👍".into(),
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::SendMedia {
+            to: chat.clone(),
+            file_path: "/tmp/foto.jpg".into(),
+            caption: None,
+            mime_type: None,
+            as_document: false,
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::SendAudio {
+            to: chat.clone(),
+            file_path: "/tmp/audio.ogg".into(),
+            ptt: true,
+        },
+    )
+    .await;
+    assert_wire_routed(&hub, &plugins, WireRequest::GetChat { jid: chat.clone() }).await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::MarkRead {
+            chat_jid: chat.clone(),
+            through_message_id: None,
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::MarkUnread {
+            chat_jid: chat.clone(),
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::PinChat {
+            chat_jid: chat.clone(),
+            pin: true,
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::MuteChat {
+            chat_jid: chat.clone(),
+            mute_duration_seconds: None,
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::ArchiveChat {
+            chat_jid: chat.clone(),
+            archive: true,
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::SetPresence {
+            chat_jid: Some(chat.clone()),
+            state: PresenceState::Recording,
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::SetPresence {
+            chat_jid: None,
+            state: PresenceState::Available,
+        },
+    )
+    .await;
+}
+
+/// The Phase 5/6 surface reaches the session instead of being refused:
+/// edits, polls, groups, channels, profile, contacts, media and history.
+#[tokio::test]
+async fn wire_phase56_requests_reach_the_session() {
+    use velo_wire::request::ClientRequest as WireRequest;
+
+    let hub = connected_hub();
+    let plugins = no_plugins();
+    let chat = "559900000001@s.whatsapp.net".to_string();
+    let group = "1234567890@g.us".to_string();
+
+    for request in [
+        WireRequest::EditMessage {
+            chat_jid: chat.clone(),
+            message_id: "3EB0A".into(),
+            new_text: "editado".into(),
+        },
+        WireRequest::RevokeMessage {
+            chat_jid: chat.clone(),
+            message_id: "3EB0A".into(),
+            for_everyone: true,
+        },
+        WireRequest::ForwardMessage {
+            source_chat_jid: chat.clone(),
+            message_id: "3EB0A".into(),
+            target_chat_jid: chat.clone(),
+        },
+        WireRequest::SendPoll {
+            to: chat.clone(),
+            question: "almoço?".into(),
+            options: vec!["pizza".into(), "sushi".into()],
+            selectable_count: 1,
+        },
+        WireRequest::VotePoll {
+            chat_jid: chat.clone(),
+            poll_id: "3EB0A".into(),
+            selected_option_indices: vec![0],
+        },
+        WireRequest::ListPolls {
+            chat_jid: None,
+            limit: 10,
+        },
+        WireRequest::GetPoll {
+            chat_jid: chat.clone(),
+            poll_id: "3EB0A".into(),
+        },
+        WireRequest::SendLocation {
+            to: chat.clone(),
+            latitude: -23.5,
+            longitude: -46.6,
+            name: None,
+        },
+        WireRequest::SendStatus {
+            text: "bom dia".into(),
+        },
+        WireRequest::SendSticker {
+            to: chat.clone(),
+            file_path: "/tmp/fig.webp".into(),
+        },
+        WireRequest::ListStarredMessages { limit: 10 },
+        WireRequest::ListGroups,
+        WireRequest::GetGroupInfo {
+            group_jid: group.clone(),
+        },
+        WireRequest::CreateGroup {
+            subject: "grupo".into(),
+            participants: vec![],
+        },
+        WireRequest::SetGroupTopic {
+            group_jid: group.clone(),
+            topic: "assunto".into(),
+        },
+        WireRequest::SetGroupDescription {
+            group_jid: group.clone(),
+            description: "descrição".into(),
+        },
+        WireRequest::ManageGroupParticipant {
+            group_jid: group.clone(),
+            participant_jid: chat.clone(),
+            action: velo_wire::dto::GroupParticipantAction::Add,
+        },
+        WireRequest::GetGroupInviteLink {
+            group_jid: group.clone(),
+            reset: false,
+        },
+        WireRequest::JoinGroup {
+            invite_code: "AbCdEf".into(),
+        },
+        WireRequest::LeaveGroup {
+            group_jid: group.clone(),
+        },
+        WireRequest::SetGroupPermissions {
+            group_jid: group.clone(),
+            announce_only: false,
+            locked: false,
+        },
+        WireRequest::ListGroupJoinRequests {
+            group_jid: group.clone(),
+        },
+        WireRequest::ManageGroupJoinRequest {
+            group_jid: group.clone(),
+            participant_jid: chat.clone(),
+            approve: true,
+        },
+        WireRequest::ListChannels,
+        WireRequest::GetChannelInfo {
+            channel_jid: "123@newsletter".into(),
+        },
+        WireRequest::JoinChannel {
+            channel_jid: "123@newsletter".into(),
+        },
+        WireRequest::LeaveChannel {
+            channel_jid: "123@newsletter".into(),
+        },
+        WireRequest::GetProfile { jid: None },
+        WireRequest::GetBusinessProfile { jid: chat.clone() },
+        WireRequest::SetProfileAbout {
+            about: "recado".into(),
+        },
+        WireRequest::SetProfileName {
+            name: "nome".into(),
+        },
+        WireRequest::SetProfilePicture {
+            file_path: "/tmp/foto.jpg".into(),
+        },
+        WireRequest::RemoveProfilePicture,
+        WireRequest::CheckContact {
+            phone: "559900000001".into(),
+        },
+        WireRequest::GetContact { jid: chat.clone() },
+        WireRequest::RefreshContacts { jid: None },
+        WireRequest::SetContactAlias {
+            jid: chat.clone(),
+            alias: Some("apelido".into()),
+        },
+        WireRequest::TagContact {
+            jid: chat.clone(),
+            tag: "trabalho".into(),
+        },
+        WireRequest::UntagContact {
+            jid: chat.clone(),
+            tag: "trabalho".into(),
+        },
+        WireRequest::DownloadMedia {
+            chat_jid: chat.clone(),
+            message_id: "3EB0A".into(),
+            destination: None,
+        },
+        WireRequest::RetryMedia {
+            chat_jid: chat.clone(),
+            message_id: "3EB0A".into(),
+        },
+        WireRequest::HistoryCoverage { chat_jid: None },
+        WireRequest::BackfillMedia {
+            chat_jid: None,
+            limit: 10,
+        },
+        WireRequest::CleanupChats,
+        WireRequest::PurgeMessages { chat_jid: None },
+    ] {
+        assert_wire_routed(&hub, &plugins, request).await;
+    }
+}
+
+/// A backfill reloads the history lane first, then dispatches to the
+/// session: two commands, in that order.
+#[tokio::test]
+async fn wire_history_backfill_reloads_then_dispatches() {
+    use velo_wire::envelope::RequestEnvelope;
+    use velo_wire::request::ClientRequest as WireRequest;
+
+    let hub = connected_hub();
+    let plugins = no_plugins();
+    let (commands, mut incoming): (Commands, _) = tokio::sync::mpsc::channel(8);
+    // A bridge that takes every command and accepts it, recording the order.
+    let taken = tokio::spawn(async move {
+        let mut actions = Vec::new();
+        while let Some(cmd) = incoming.recv().await {
+            let _ = cmd.reply.send(CommandOutcome::Accepted);
+            actions.push(cmd.action);
+            if actions.len() == 2 {
+                break;
+            }
+        }
+        actions
+    });
+    let env = RequestEnvelope {
+        id: 14,
+        request: WireRequest::HistoryBackfill {
+            chat_jid: "559900000001@s.whatsapp.net".into(),
+            count: 50,
+        },
+    };
+    let ans = handle_wire_request(env, &hub, &plugins, &commands, &outbox()).await;
+    assert!(ans.frame.is_none(), "the session answers out-of-band");
+    let actions = taken.await.expect("the stand-in bridge");
+    assert!(matches!(actions.first(), Some(Action::ReloadHistory)));
+    assert!(matches!(
+        actions.get(1),
+        Some(Action::Wire {
+            request: WireRequest::HistoryBackfill { .. },
+            ..
+        })
+    ));
+}
+
+/// Forgetting the session rides the legacy action and answers a wire Ack,
+/// not an out-of-band dispatch.
+#[tokio::test]
+async fn wire_forget_session_answers_a_wire_ack() {
+    use velo_wire::envelope::{RequestEnvelope, ResponseEnvelope, ResponseResult};
+    use velo_wire::request::ClientRequest as WireRequest;
+
+    let hub = connected_hub();
+    let plugins = no_plugins();
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    let env = RequestEnvelope {
+        id: 12,
+        request: WireRequest::ForgetSession,
+    };
+    let ans = handle_wire_request(env, &hub, &plugins, &commands, &outbox()).await;
+    let frame = ans.frame.expect("a direct answer");
+    let parsed: ResponseEnvelope = serde_json::from_str(&frame).expect("a wire envelope");
+    assert!(matches!(parsed.result, ResponseResult::Ok { .. }));
+    assert!(matches!(
+        taken.await.unwrap(),
+        Some(Action::ForgetSession(
+            crate::session_bridge::AccountDisposition::Reset
+        ))
+    ));
+}
+
+/// Listing accounts answers directly, without touching the session bridge.
+#[tokio::test]
+async fn wire_list_accounts_answers_directly() {
+    use velo_wire::envelope::{RequestEnvelope, ResponseEnvelope, ResponseResult};
+    use velo_wire::request::ClientRequest as WireRequest;
+
+    let hub = connected_hub();
+    let plugins = no_plugins();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    let env = RequestEnvelope {
+        id: 13,
+        request: WireRequest::ListAccounts,
+    };
+    let ans = handle_wire_request(env, &hub, &plugins, &commands, &outbox()).await;
+    let frame = ans.frame.expect("a direct answer");
+    let parsed: ResponseEnvelope = serde_json::from_str(&frame).expect("a wire envelope");
+    assert!(matches!(parsed.result, ResponseResult::Ok { .. }));
+}
+
+#[tokio::test]
+async fn terminal_offline_requests_never_reach_the_session_channel() {
+    let hub = StateHub::new();
+    hub.apply(crate::state::Change::live(
+        velo_ipc::DaemonEvent::ConnectionChanged(velo_ipc::ConnectionState::LoggedOut {
+            message: "synthetic unlink".into(),
+        }),
+    ));
+    let (commands, mut received) = tokio::sync::mpsc::channel(8);
+    let destination = outbox();
+    let actions = vec![
+        Action::EnsureAvatars(vec![]),
+        Action::Wire {
+            id: 2,
+            request: velo_wire::request::ClientRequest::GetProfile {
+                jid: Some("999000@s.whatsapp.net".into()),
+            },
+            answer_to: destination.clone(),
+        },
+        Action::SendText(velo_ipc::SendText {
+            jid: "999000@s.whatsapp.net".into(),
+            text: "must stay local".into(),
+            local_id: None,
+            quoted: None,
+        }),
+    ];
+    for action in actions {
+        assert!(matches!(
+            super::requests::dispatch(&hub, &commands, action).await,
+            Err(ProtocolError::NoSession { .. })
+        ));
+        assert!(matches!(
+            received.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn replacing_an_account_runtime_closes_old_frontend_attachments() {
+    let registry = AccountRegistry::new();
+    let (commands, receiver) = tokio::sync::mpsc::channel(MAX_CLIENTS);
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        velo_core::AccountId::LEGACY,
+        connected_hub(),
+        no_plugins(),
+        commands,
+    ))));
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(Box::new(server), registry));
+    let request = Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Account {
+            account: velo_core::AccountId::LEGACY,
+        },
+        session_events: false,
+        owns_window: false,
+        call_video: false,
+    });
+    client
+        .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    assert!(reader.read_line(&mut line).await.unwrap() > 0);
+    drop(receiver);
+    tokio::time::timeout(std::time::Duration::from_secs(1), served)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    line.clear();
+    assert_eq!(reader.read_line(&mut line).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn offline_and_terminal_audio_observations_reach_only_the_local_action() {
+    for state in [
+        velo_ipc::ConnectionState::Disconnected {
+            reason: "synthetic offline".into(),
+        },
+        velo_ipc::ConnectionState::LoggedOut {
+            message: "synthetic unlink".into(),
+        },
+    ] {
+        let hub = StateHub::new();
+        hub.apply(crate::state::Change::live(
+            velo_ipc::DaemonEvent::ConnectionChanged(state),
+        ));
+        let (commands, taken) = bridge(CommandOutcome::Accepted);
+        let answer = handle_request(
+            bare(ClientRequest::MarkAudioPlayed(velo_ipc::MarkAudioPlayed {
+                jid: "559900000001@s.whatsapp.net".into(),
+                message_id: "SYNTHETIC-AUDIO".into(),
+            })),
+            &hub,
+            &no_plugins(),
+            &commands,
+            &outbox(),
+        )
+        .await;
+        assert!(matches!(
+            parse(answer.frame),
+            DaemonMessage::Accepted { .. }
+        ));
+        let action = taken.await.unwrap().unwrap();
+        assert!(matches!(action, Action::MarkAudioPlayed(_)));
+        assert!(!action.needs_network());
+        assert!(!hub.connection().is_connected());
+    }
+}
+
+#[tokio::test]
+async fn scoped_wire_hello_confirms_successor_and_never_rebinds_after_selection_changes() {
+    use velo_wire::{
+        envelope::{RequestEnvelope, ResponseEnvelope, ResponseResult},
+        request::ClientRequest as WireRequest,
+        response::DaemonResponse as WireResponse,
+    };
+    let registry = AccountRegistry::new();
+    let successor = velo_core::AccountId::new(2).unwrap();
+    let hub = StateHub::for_account(successor);
+    hub.apply(crate::state::Change::live(
+        velo_ipc::DaemonEvent::ConnectionChanged(velo_ipc::ConnectionState::Connected),
+    ));
+    let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+    registry.insert(Arc::new(AccountRuntime::new(
+        successor,
+        Arc::clone(&hub),
+        no_plugins(),
+        commands,
+    )));
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(
+        Box::new(server),
+        Arc::clone(&registry),
+    ));
+    let hello = RequestEnvelope {
+        id: 1,
+        request: WireRequest::Hello {
+            protocol: velo_wire::envelope::CURRENT_PROTOCOL_VERSION,
+            client_name: "synthetic".into(),
+            local_account: None,
+            account_selection: true,
+            read_only: true,
+            session_events: false,
+        },
+    };
+    client
+        .write_all(format!("{}\n", serde_json::to_string(&hello).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(serde_json::from_str::<ResponseEnvelope>(&line).unwrap().result,
+        ResponseResult::Ok { payload } if *payload == WireResponse::AccountSelected { local_account: 2 })
+    );
+
+    // A different account now owns a window. The established connection still
+    // reads the selected successor, rather than following a new default.
+    let other_id = velo_core::AccountId::new(3).unwrap();
+    let other = StateHub::for_account(other_id);
+    let _window = other.attach_window();
+    let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+    registry.insert(Arc::new(AccountRuntime::new(
+        other_id,
+        other,
+        no_plugins(),
+        commands,
+    )));
+    let request = RequestEnvelope {
+        id: 2,
+        request: WireRequest::GetStatus,
+    };
+    reader
+        .get_mut()
+        .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(serde_json::from_str::<ResponseEnvelope>(&line).unwrap().result,
+        ResponseResult::Ok { payload } if matches!(*payload, WireResponse::Status(ref status) if status.state == "connected"))
+    );
+    served.abort();
+}

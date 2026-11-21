@@ -1,0 +1,291 @@
+//! Linking a phone: the QR code, the pair code, and the steps to reach them.
+
+use std::sync::Arc;
+
+use gpui::{App, Image, ImageFormat, ImageSource, IntoElement, ParentElement, Styled, div, img};
+use gpui_component::ActiveTheme as _;
+
+use super::centered_view;
+use crate::components::parts;
+use crate::theme::{ActiveProductTheme as _, Metrics};
+use velo_core::{CachedQrCode, Issued, Lifetime};
+
+/// The QR code as PNG bytes, built once each time the code rotates.
+///
+/// `None` means it could not be drawn, and both ways of getting there are
+/// said out loud: the screen has nothing else to show for it, and the only
+/// thing the user sees is a code that never appears.
+pub fn generate_qr_png(data: &str) -> Option<Vec<u8>> {
+    use image::ImageEncoder;
+    use qrcode::QrCode;
+
+    let code = match QrCode::new(data.as_bytes()) {
+        Ok(code) => code,
+        Err(e) => {
+            log::warn!("the server's pairing payload would not fit in a QR code: {e}");
+            return None;
+        }
+    };
+    let image = code.render::<image::Luma<u8>>().build();
+
+    let mut png_bytes = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
+    if let Err(e) = encoder.write_image(
+        image.as_raw(),
+        image.width(),
+        image.height(),
+        image::ExtendedColorType::L8,
+    ) {
+        log::warn!("could not encode the QR code: {e}");
+        return None;
+    }
+
+    Some(png_bytes)
+}
+
+pub fn render_pairing_view(
+    qr_code: Option<&Issued<CachedQrCode>>,
+    pair_code: Option<Issued<String>>,
+    retained: Option<gpui::Entity<crate::app::WhatsAppApp>>,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let metrics = cx.product().metrics;
+
+    centered_view("pairing-screen", metrics.space_xxl())
+        .children(retained.map(|entity| {
+            gpui_component::button::Button::new("pairing-retained-history")
+                .label(crate::tr!(BackToRetainedHistory))
+                .on_click(move |_, window, cx| {
+                    entity.update(cx, |app, cx| app.open_retained_history(window, cx));
+                })
+        }))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(metrics.space_md())
+                .child(
+                    div()
+                        .text_size(metrics.text_title())
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(cx.theme().foreground)
+                        .child(crate::tr!(LinkYourPhone)),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.text_secondary())
+                        .text_color(cx.theme().muted_foreground)
+                        .child(crate::tr!(ThisDeviceStaysLinkedUntilYouUnlinkIt)),
+                ),
+        )
+        .child(render_steps(metrics, cx))
+        .child(render_qr(qr_code.map(|qr| &qr.value), metrics, cx))
+        // Each bar under the credential it describes. Drawn once at the foot
+        // of the screen it could only ever have described one of them, and
+        // the other was left claiming its neighbour's remaining life.
+        .child(render_expiry(
+            qr_code.map(|qr| qr.life),
+            crate::tr!(CodeRefreshesIn),
+            metrics,
+            cx,
+        ))
+        .children(pair_code.map(|code| {
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(metrics.space_md())
+                .child(render_pair_code(code.value, metrics, cx))
+                .child(render_expiry(
+                    Some(code.life),
+                    crate::tr!(CodeExpiresIn),
+                    metrics,
+                    cx,
+                ))
+        }))
+}
+
+/// What to do on the phone, in order.
+///
+/// The QR code is meaningless without them: it is the last step, not the
+/// instruction.
+fn render_steps(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
+    let steps: [&str; 3] = [
+        crate::tr!(OpenWhatsappOnYourPhone),
+        crate::tr!(GoToSettingsLinkedDevices),
+        crate::tr!(TapLinkADeviceAndScanThisCode),
+    ];
+    let subtle = parts::subtle(cx);
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(metrics.space_md())
+        .children(steps.into_iter().enumerate().map(move |(ix, step)| {
+            div()
+                .flex()
+                .items_center()
+                .gap(metrics.space_lg())
+                .child(
+                    div()
+                        .size(metrics.space_xxl())
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .bg(cx.theme().secondary)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_size(metrics.text_meta())
+                        .text_color(subtle)
+                        .child((ix + 1).to_string()),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.text_secondary())
+                        .text_color(cx.theme().muted_foreground)
+                        .child(step),
+                )
+        }))
+}
+
+fn render_qr(
+    qr_code: Option<&CachedQrCode>,
+    metrics: Metrics,
+    _cx: &App,
+) -> impl IntoElement + use<> {
+    let size = metrics.qr_size();
+
+    div()
+        .size(size)
+        // A light frame, not a bare raster: the code needs its quiet zone to
+        // scan, and on a dark window it has to supply its own.
+        .p(metrics.space_lg())
+        .bg(gpui::white())
+        .rounded(metrics.radius_lg())
+        .flex()
+        .justify_center()
+        .items_center()
+        .child(match qr_code {
+            Some(cached) => {
+                let image = Image::from_bytes(ImageFormat::Png, cached.png_bytes.as_ref().clone());
+                img(ImageSource::Image(Arc::new(image)))
+                    .size_full()
+                    .into_any_element()
+            }
+            None => div()
+                // Sits on the QR code's white raster, not on a themed
+                // surface, so it is not a theme colour to resolve.
+                .text_color(gpui::black())
+                .text_size(metrics.text_small())
+                .child(crate::tr!(WaitingForACode))
+                .into_any_element(),
+        })
+}
+
+/// The typed alternative, spaced so it can be read aloud or copied by eye.
+fn render_pair_code(code: String, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
+    let subtle = parts::subtle(cx);
+
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(metrics.space_md())
+        .child(
+            div()
+                .text_size(metrics.text_small())
+                .text_color(subtle)
+                .child(crate::tr!(OrEnterThisCodeOnYourPhone)),
+        )
+        .child(div().flex().gap(metrics.space_md()).children(
+            code.chars().filter(|c| !c.is_whitespace()).map(|ch| {
+                div()
+                    .px(metrics.space_lg())
+                    .py(metrics.space_md())
+                    .rounded(metrics.radius_md())
+                    .bg(cx.theme().secondary)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(metrics.text_heading())
+                    .text_color(cx.theme().foreground)
+                    .child(ch.to_string())
+            }),
+        ))
+}
+
+/// How much of the code's life is left, as a bar rather than a sentence.
+///
+/// "Expires in 48 seconds" is a number that has to be re-read to mean
+/// anything; a bar draining is legible without reading it at all.
+fn render_expiry(
+    life: Option<Lifetime>,
+    verb: &'static str,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let (left, remaining) = life
+        .map(|life| life.left_at(wacore::time::now_utc()))
+        .unwrap_or((0, 0.0));
+    let subtle = parts::subtle(cx);
+    // Running out is worth noticing before it happens.
+    let colour = if remaining < 0.25 {
+        cx.theme().warning
+    } else {
+        cx.theme().primary
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(metrics.space_md())
+        .w(metrics.qr_size())
+        .child(
+            div()
+                .w_full()
+                .h(metrics.space_xs())
+                .rounded_full()
+                .bg(cx.theme().secondary)
+                .child(
+                    div()
+                        .h_full()
+                        .w(gpui::relative(remaining))
+                        .rounded_full()
+                        .bg(colour),
+                ),
+        )
+        .child(
+            div()
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_size(metrics.text_micro())
+                .text_color(subtle)
+                .child(if left > 0 {
+                    format!("{verb} {left}s")
+                } else {
+                    crate::tr!(Refreshing).to_string()
+                }),
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_qr_png;
+
+    /// A payload the encoder refuses answers `None` rather than a picture,
+    /// which is the case the caller has to keep the previous code for. QR
+    /// version 40 at the lowest correction level holds under 3 KiB, so this
+    /// is past every one of them.
+    #[test]
+    fn a_payload_that_will_not_fit_is_refused_rather_than_drawn() {
+        assert!(generate_qr_png(&"x".repeat(8192)).is_none());
+        assert!(
+            generate_qr_png("2@abcd,efgh,ijkl,1").is_some(),
+            "and an ordinary pairing payload is drawn"
+        );
+    }
+}

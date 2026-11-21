@@ -1,0 +1,3957 @@
+//! Tests for the session's WhatsApp client.
+
+use std::collections::HashMap;
+
+use super::calls::CallRegistry;
+use super::history::{
+    LoadedHistory, ReloadScope, apply_status_views, merge_alias_history_messages,
+};
+use super::paging::{
+    ReadBoundary, chat_cursor, message_cursor, parse_chat_cursor, parse_message_cursor,
+    read_message_range,
+};
+use super::{ChatStore, Client, NameBook, SqliteStore, WhatsAppClient};
+use crate::StoreRegistry;
+use std::sync::Arc;
+use velo_chat_store::{ChatEntry, StoreChange};
+use velo_core::{Chat, ChatMessage, MessageStatus, fallback_chat_name};
+use whatsapp_rust::PresencePolicy;
+use whatsapp_rust::buffa::MessageField;
+use whatsapp_rust::wacore::proto_helpers::MessageBuilderExt;
+use whatsapp_rust::wacore::types::events::{Event, ServerAck};
+use whatsapp_rust::wacore_binary::Jid;
+use whatsapp_rust::waproto::whatsapp as wa;
+
+#[tokio::test]
+async fn status_pages_use_each_updates_watched_state_across_cursors() {
+    let (store, client) = test_session("status-page-watched-state").await;
+    let jid = "status@broadcast";
+    for (id, time) in [
+        ("old", 1_700_000_000),
+        ("watched", 1_700_000_001),
+        ("new", 1_700_000_002),
+    ] {
+        feed(
+            &store,
+            from(jid, TEST_PEER, Some("Ana"), wa::Message::text(id), id, time),
+        )
+        .await;
+    }
+    store
+        .mark_status_watched(&jid.parse().unwrap(), vec!["watched".into()])
+        .unwrap();
+    store.flush().await.unwrap();
+    let mut before = None;
+    let mut seen = Vec::new();
+    loop {
+        let page = WhatsAppClient::message_page(
+            &store,
+            &client,
+            &book_with(&store),
+            jid.into(),
+            before,
+            1,
+        )
+        .await
+        .unwrap();
+        seen.extend(
+            page.items
+                .into_iter()
+                .map(|message| (message.id, message.is_read)),
+        );
+        before = page.next;
+        if before.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![
+            ("new".into(), false),
+            ("watched".into(), true),
+            ("old".into(), false)
+        ]
+    );
+}
+
+#[test]
+/// Offline history cannot displace connection or on-demand history events.
+fn offline_history_burst_does_not_fill_control_mailbox() {
+    use whatsapp_rust::wacore::types::events::{Connected, EventHandler, LazyHistorySync};
+    let (handler, incoming, stats) = super::interested_channel(super::CONTROL_EVENT_KINDS, 64);
+    for _ in 0..512 {
+        handler.handle_event(Arc::new(Event::HistorySync(Box::new(
+            LazyHistorySync::new(Vec::<u8>::new().into(), 0, 0, None, None),
+        ))));
+    }
+    handler.handle_event(Arc::new(Event::Connected(Connected::builder().build())));
+    handler.handle_event(Arc::new(Event::HistorySync(Box::new(
+        LazyHistorySync::new(Vec::<u8>::new().into(), 0, 0, None, None)
+            .with_peer_data_request_session_id(Some("synthetic-request".into())),
+    ))));
+    assert_eq!(
+        stats.stats().dropped_full,
+        0,
+        "history chunks must not displace control events"
+    );
+    assert!(matches!(
+        &*incoming.try_recv().unwrap(),
+        Event::Connected(_)
+    ));
+    assert!(
+        matches!(&*incoming.try_recv().unwrap(), Event::HistorySync(sync) if sync.peer_data_request_session_id() == Some("synthetic-request"))
+    );
+    assert!(incoming.try_recv().is_err());
+    assert_eq!(stats.stats().dropped_full, 0);
+}
+
+/// The control subscription is only one observer of history sync. Filtering it
+/// must not prevent the independent store subscriber from materializing a row.
+#[tokio::test]
+async fn offline_history_still_reaches_store_when_control_filters_it() {
+    use whatsapp_rust::wacore::types::events::{CoreEventBus, LazyHistorySync};
+    let (store, _) = test_session("history-control-independent-store").await;
+    let bus = CoreEventBus::new();
+    let (control, incoming, _) = super::interested_channel(super::CONTROL_EVENT_KINDS, 64);
+    let _control = bus.subscribe_handler(control);
+    let _store = bus.subscribe_handler(store.handler());
+    // Zlib-compressed synthetic HistorySync{RECENT, conversation{id:TEST_PEER,
+    // name:"Synthetic"}}. It contains no user data.
+    let compressed: Vec<u8> = vec![
+        120, 156, 227, 96, 22, 210, 224, 146, 54, 53, 181, 180, 52, 128, 0, 67, 135, 98, 189, 242,
+        140, 196, 146, 226, 196, 130, 2, 189, 188, 212, 146, 44, 206, 224, 202, 188, 146, 140, 212,
+        146, 204, 100, 0, 225, 140, 12, 180,
+    ];
+    bus.dispatch(Event::HistorySync(Box::new(LazyHistorySync::new(
+        compressed.into(),
+        44,
+        3,
+        None,
+        None,
+    ))));
+    store.flush().await.expect("commit synthetic history");
+    let jid = TEST_PEER.parse().expect("synthetic JID");
+    assert!(
+        store.chat(&jid).await.unwrap().is_some(),
+        "the store materializes the history"
+    );
+    assert!(
+        incoming.try_recv().is_err(),
+        "the no-op control copy was filtered"
+    );
+}
+
+#[tokio::test]
+async fn a_remote_delete_failure_skips_local_writes() {
+    let result = super::mutations::delete_and_record(
+        async { Err::<(), _>("synthetic remote failure") },
+        || panic!("a refused remote delete must not update the local store"),
+        async { panic!("a refused remote delete must not flush the local store") },
+    )
+    .await;
+
+    assert_eq!(result, Err("synthetic remote failure".to_string()));
+}
+
+#[tokio::test]
+async fn a_sent_delete_succeeds_when_the_local_writer_has_stopped() {
+    let (chat_store, _) = test_session("sent-delete-stopped-writer").await;
+    chat_store.close().await.expect("stop local writer");
+    let chat: Jid = TEST_PEER.parse().expect("synthetic chat");
+
+    let result = super::mutations::delete_and_record(
+        async { Ok::<_, String>(()) },
+        || chat_store.record_revoke(&chat, "SENT-DELETE", wacore::time::now_utc()),
+        async { panic!("an unqueued delete must not await a flush") },
+    )
+    .await;
+
+    assert_eq!(result, Ok(()));
+}
+
+#[tokio::test]
+async fn a_sent_delete_succeeds_when_the_local_batch_fails() {
+    use std::cell::Cell;
+
+    let recorded = Cell::new(false);
+    let result = super::mutations::delete_and_record(
+        async { Ok::<_, String>(()) },
+        || {
+            recorded.set(true);
+            Ok(())
+        },
+        async {
+            assert!(recorded.get(), "flush must follow the queued local update");
+            Err(velo_chat_store::ChatStoreError::WriteBatchFailed(
+                "synthetic rollback".to_string(),
+            ))
+        },
+    )
+    .await;
+
+    assert_eq!(result, Ok(()));
+}
+
+#[tokio::test]
+async fn a_delete_waits_for_the_remote_answer_then_the_local_flush() {
+    use std::cell::Cell;
+
+    let remotely_deleted = Cell::new(false);
+    let flushed = Cell::new(false);
+    let result = super::mutations::delete_and_record(
+        async {
+            remotely_deleted.set(true);
+            Ok::<_, String>(())
+        },
+        || {
+            assert!(
+                remotely_deleted.get(),
+                "local writes must follow remote success"
+            );
+            Ok(())
+        },
+        async {
+            flushed.set(true);
+            Ok(())
+        },
+    )
+    .await;
+
+    assert_eq!(result, Ok(()));
+    assert!(
+        flushed.get(),
+        "successful local persistence must finish before returning"
+    );
+}
+
+#[test]
+fn live_nonrenderable_fallback_uses_the_shared_message_kind() {
+    let poll = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.poll_creation_message_v5 = MessageField::some(Default::default());
+        constructed
+    };
+    let album = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.album_message = MessageField::some(Default::default());
+        constructed
+    };
+    let product = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.product_message = MessageField::some(Default::default());
+        constructed
+    };
+
+    assert_eq!(
+        super::live_content_fallback(&poll, false),
+        "This poll is not supported yet. Open it in WhatsApp on your phone."
+    );
+    assert_eq!(
+        super::live_content_fallback(&album, false),
+        "Media album. Open it in WhatsApp on your phone."
+    );
+    assert_eq!(
+        super::live_content_fallback(&product, false),
+        "Product. Open it in WhatsApp on your phone."
+    );
+    assert_eq!(
+        super::live_content_fallback(&wa::Message::default(), false),
+        "This message is not supported yet. Open it in WhatsApp on your phone."
+    );
+    assert_eq!(super::live_content_fallback(&product, true), "");
+}
+
+/// A name book with nothing behind its handle: the history paths hand the
+/// store in with every call, and only the live paths read it from there.
+fn book() -> NameBook {
+    NameBook::new(None)
+}
+
+/// A name book that can reach the address book, the way the live paths do.
+fn book_with(store: &Arc<ChatStore>) -> NameBook {
+    NameBook::new(Some(store.clone()))
+}
+
+#[tokio::test]
+async fn persistent_companion_uses_manual_presence() {
+    let store = SqliteStore::open("file:velo-presence-policy?mode=memory&cache=shared")
+        .await
+        .expect("in-memory store");
+    let bot = super::persistent_companion(whatsapp_rust::bot::Bot::builder())
+        .with_backend(store)
+        .build()
+        .await
+        .expect("offline bot");
+
+    assert_eq!(bot.client().presence_policy(), PresencePolicy::Manual);
+}
+
+/// A previously available session must explicitly retract that state on
+/// reconnect; `Manual` alone prevents future automatic announcements but does
+/// not retract presence already known to the server.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn connected_companion_announces_unavailable() {
+    let fixture = whatsapp_rust::test_support::CallFixture::new()
+        .await
+        .expect("synthetic connected session");
+    let before = fixture.outgoing_stanzas().expect("outbound stanzas").len();
+
+    super::announce_background_presence(fixture.client())
+        .await
+        .expect("unavailable presence");
+
+    let sent = fixture.outgoing_stanzas().expect("outbound stanzas");
+    assert!(
+        sent[before..].iter().any(|node| {
+            let stanza = node.as_node_ref();
+            stanza.tag == "presence"
+                && stanza.attrs().optional_string("type").as_deref() == Some("unavailable")
+        }),
+        "reconnect must retract an older available state"
+    );
+    fixture.shutdown().await.expect("fixture shutdown");
+}
+
+#[test]
+fn the_live_data_lane_subscribes_to_server_acks() {
+    assert!(
+        super::DATA_EVENT_KINDS
+            .contains(&whatsapp_rust::wacore::types::events::EventKind::ServerAck)
+    );
+}
+
+#[test]
+fn transport_disconnections_reach_the_control_feed() {
+    use whatsapp_rust::wacore::types::events::{Disconnected, EventHandler};
+    let (handler, receiver, _) = super::interested_channel(super::CONTROL_EVENT_KINDS, 8);
+    handler.handle_event(Arc::new(Event::Disconnected(
+        Disconnected::builder()
+            .reason(wacore::net::DisconnectReason::ReadError(
+                "synthetic network failure".into(),
+            ))
+            .build(),
+    )));
+    assert!(matches!(
+        &*receiver.try_recv().unwrap(),
+        Event::Disconnected(_)
+    ));
+}
+
+#[test]
+fn the_identity_lane_subscribes_to_contact_updates() {
+    assert!(
+        super::IDENTITY_EVENT_KINDS
+            .contains(&whatsapp_rust::wacore::types::events::EventKind::ContactUpdate)
+    );
+    assert!(
+        !super::CONTROL_EVENT_KINDS
+            .contains(&whatsapp_rust::wacore::types::events::EventKind::ContactUpdate),
+        "a contact full sync must not block latency-sensitive control events"
+    );
+}
+
+#[test]
+fn a_contact_sync_burst_is_not_dropped_at_identity_ingress() {
+    use whatsapp_rust::wacore::types::events::{ContactUpdate, EventHandler};
+
+    let (handler, receiver, stats) = super::interested_unbounded_channel(&[
+        whatsapp_rust::wacore::types::events::EventKind::ContactUpdate,
+    ]);
+    let update = Arc::new(Event::ContactUpdate(
+        ContactUpdate::builder()
+            .jid(TEST_PEER.parse().expect("test PN"))
+            .timestamp(
+                whatsapp_rust::wacore::time::from_secs(1_700_000_100).expect("test timestamp"),
+            )
+            .action(Box::new({
+                let mut constructed: wa::sync_action_value::ContactAction = Default::default();
+                constructed.lid_jid = Some(TEST_AUTHOR.to_string());
+                constructed
+            }))
+            .from_full_sync(true)
+            .build(),
+    ));
+
+    for _ in 0..256 {
+        handler.handle_event(update.clone());
+    }
+
+    assert_eq!(stats.stats().dropped_full, 0);
+    assert_eq!(receiver.len(), 256);
+}
+
+#[test]
+fn a_server_ack_uses_its_chats_recoverable_lane() {
+    let ack = Event::ServerAck(
+        ServerAck::builder()
+            .id("ACKED-LANE".to_string())
+            .class("message".to_string())
+            .from(TEST_PEER.parse().expect("test JID"))
+            .build(),
+    );
+
+    assert!(super::lanes::recoverable(&ack));
+    assert_eq!(
+        super::lanes::event_subject(&ack)
+            .map(|subject| subject.as_written())
+            .as_deref(),
+        Some(TEST_PEER)
+    );
+}
+
+/// A positive message ack is the first delivery state after the optimistic
+/// clock. It must travel live rather than wait for the history reloader's
+/// quiet window, which a continuous history sync may never reach.
+#[tokio::test]
+async fn a_server_ack_publishes_a_live_sent_receipt() {
+    let (chat_store, client) = test_session("live-server-ack").await;
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    let ack = Event::ServerAck(
+        ServerAck::builder()
+            .id("ACKED-1".to_string())
+            .class("message".to_string())
+            .from(TEST_PEER.parse().expect("test JID"))
+            .build(),
+    );
+
+    WhatsAppClient::handle_event(
+        Arc::new(ack),
+        client,
+        ui_tx,
+        CallRegistry::default(),
+        Arc::new(book_with(&chat_store)),
+        None,
+        None,
+        None,
+        0,
+    )
+    .await;
+
+    assert_eq!(
+        ui_rx.try_recv(),
+        Ok(velo_core::UiEvent::ReceiptReceived {
+            chat_jid: TEST_PEER.to_string(),
+            message_ids: vec!["ACKED-1".to_string()],
+            receipt_type: velo_core::ReceiptType::Sent,
+        })
+    );
+}
+
+/// A stanza ack is not necessarily a successful outgoing message. Publishing
+/// either of these as `Sent` would replace an honest clock/failure with a lie.
+#[tokio::test]
+async fn a_nack_or_non_message_ack_does_not_publish_sent() {
+    for (class, error) in [("message", Some("500")), ("receipt", None)] {
+        let (chat_store, client) = test_session(&format!("ignored-ack-{class}-{error:?}")).await;
+        let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(super::ui_queue::HistoryBudget::new()),
+        );
+        let ack = Event::ServerAck(
+            ServerAck::builder()
+                .id("NOT-SENT".to_string())
+                .class(class.to_string())
+                .from(TEST_PEER.parse().expect("test JID"))
+                .maybe_error(error.map(str::to_string))
+                .build(),
+        );
+
+        WhatsAppClient::handle_event(
+            Arc::new(ack),
+            client,
+            ui_tx,
+            CallRegistry::default(),
+            Arc::new(book_with(&chat_store)),
+            None,
+            None,
+            None,
+            0,
+        )
+        .await;
+
+        assert!(
+            ui_rx.try_recv().is_err(),
+            "{class} {error:?} published Sent"
+        );
+    }
+}
+
+/// The store can resolve a chatless ack by looking for a unique outgoing row;
+/// the live path cannot guess that ownership and leaves this rare shape to the
+/// durable recovery path.
+#[tokio::test]
+async fn a_chatless_ack_does_not_guess_a_live_destination() {
+    let (chat_store, client) = test_session("chatless-ack").await;
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    let ack = Event::ServerAck(
+        ServerAck::builder()
+            .id("CHATLESS-1".to_string())
+            .class("message".to_string())
+            .build(),
+    );
+
+    WhatsAppClient::handle_event(
+        Arc::new(ack),
+        client,
+        ui_tx,
+        CallRegistry::default(),
+        Arc::new(book_with(&chat_store)),
+        None,
+        None,
+        None,
+        0,
+    )
+    .await;
+
+    assert!(ui_rx.try_recv().is_err());
+}
+
+/// A store-hydrated chat list must label a photo the way the live path
+/// does. The store's preview column holds the newest message's TEXT, and a
+/// photo with no caption has none — the bubble does, and a row rendered
+/// from the empty column reads as "No messages" over a chat that plainly
+/// has one.
+#[tokio::test]
+async fn hydrated_preview_labels_a_captionless_photo() {
+    let (chat_store, client) = test_session("preview-photo").await;
+    let photo = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.image_message = MessageField::some({
+            let mut constructed: wa::message::ImageMessage = Default::default();
+            constructed.mimetype = Some("image/jpeg".into());
+            constructed.jpeg_thumbnail = Some(vec![1, 2, 3]);
+            constructed
+        });
+        constructed
+    };
+    feed(&chat_store, incoming(photo, "MSG-IMG", 1_700_000_000)).await;
+
+    let LoadedHistory {
+        chats, complete, ..
+    } = WhatsAppClient::load_history(&chat_store, &client, &book())
+        .await
+        .expect("history loads");
+    assert!(complete);
+    assert_eq!(chats[0].last_message.as_deref(), Some("📷 Photo"));
+}
+
+/// Same gap at the other end: a revoked newest message clears the store's
+/// preview, and the thread shows a tombstone bubble. The list has to agree
+/// with it rather than claim the chat is empty.
+#[tokio::test]
+async fn hydrated_preview_labels_a_revoked_newest_message() {
+    let (chat_store, client) = test_session("preview-revoked").await;
+    feed(
+        &chat_store,
+        incoming(wa::Message::text("oops"), "MSG-R", 1_700_000_000),
+    )
+    .await;
+    let revoke = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.protocol_message = MessageField::some({
+            let mut constructed: wa::message::ProtocolMessage = Default::default();
+            constructed.key = MessageField::some({
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("MSG-R".into());
+                constructed
+            });
+            constructed.r#type = Some(wa::message::protocol_message::Type::REVOKE);
+            constructed
+        });
+        constructed
+    };
+    feed(&chat_store, incoming(revoke, "MSG-R2", 1_700_000_010)).await;
+
+    let LoadedHistory { chats, .. } = WhatsAppClient::load_history(&chat_store, &client, &book())
+        .await
+        .expect("history loads");
+    assert_eq!(chats[0].last_message.as_deref(), Some("[Message deleted]"));
+}
+
+/// The store's own text still wins where it has one.
+#[tokio::test]
+async fn hydrated_preview_prefers_the_stored_text() {
+    let (chat_store, client) = test_session("preview-text").await;
+    feed(
+        &chat_store,
+        incoming(wa::Message::text("bom dia"), "MSG-T", 1_700_000_000),
+    )
+    .await;
+
+    let LoadedHistory { chats, .. } = WhatsAppClient::load_history(&chat_store, &client, &book())
+        .await
+        .expect("history loads");
+    assert_eq!(chats[0].last_message.as_deref(), Some("bom dia"));
+}
+
+/// A page opened on a chat nobody has read comes back saying every row in
+/// it has been read, so the read the front end then asks for names
+/// messages the daemon was told were already seen and no receipt goes out.
+#[tokio::test]
+async fn a_page_of_an_unread_chat_comes_back_unread() {
+    let (chat_store, client) = test_session("page-unread").await;
+    for (n, id) in ["MSG-P1", "MSG-P2", "MSG-P3"].iter().enumerate() {
+        feed(
+            &chat_store,
+            incoming(wa::Message::text("oi"), id, 1_700_000_000 + n as i64),
+        )
+        .await;
+    }
+
+    let page = WhatsAppClient::message_page(
+        &chat_store,
+        &client,
+        &book(),
+        TEST_PEER.to_string(),
+        None,
+        50,
+    )
+    .await
+    .expect("page loads");
+
+    assert_eq!(page.items.len(), 3);
+    assert!(
+        page.items.iter().all(|m| !m.is_read),
+        "nothing in the chat has been read, so nothing in its page may say it was"
+    );
+}
+
+/// A mention arrives as `@` plus the user part, and a reloaded bubble used
+/// to draw exactly that: `@559900000002` where a phone says `@Bia`. The
+/// hydrated row is rewritten from the proto's mention list through the same
+/// book that names its sender.
+#[tokio::test]
+async fn a_hydrated_mention_names_the_contact_not_the_digits() {
+    use whatsapp_rust::waproto::buffa;
+    use whatsapp_rust::waproto::whatsapp::message;
+
+    const MENTIONED: &str = "559900000002@s.whatsapp.net";
+    let (chat_store, client) = test_session("mention-name").await;
+    // The mentioned contact says who they are somewhere else entirely.
+    feed(
+        &chat_store,
+        from(
+            MENTIONED,
+            MENTIONED,
+            Some("Bia"),
+            wa::Message::text("estou por aqui"),
+            "MSG-BIA",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    let mention = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = buffa::MessageField::some({
+            let mut constructed: message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("oi @559900000002, vem".to_string());
+            constructed.context_info = buffa::MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.mentioned_jid = vec![MENTIONED.to_string()];
+                constructed
+            });
+            constructed
+        });
+        constructed
+    };
+    feed(
+        &chat_store,
+        from(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Ana"),
+            mention,
+            "MSG-MENTION",
+            1_700_000_100,
+        ),
+    )
+    .await;
+
+    let page = WhatsAppClient::message_page(
+        &chat_store,
+        &client,
+        &book_with(&chat_store),
+        TEST_GROUP.to_string(),
+        None,
+        50,
+    )
+    .await
+    .expect("page loads");
+    assert_eq!(page.items[0].content, "oi @Bia, vem");
+}
+
+/// The digits of a LID are an internal address, not a name and not a number
+/// anybody can dial. A mention of a stranger nobody has named must not print
+/// them; it reads the way an unnamed bubble does.
+#[tokio::test]
+async fn a_mention_of_a_stranger_hides_the_internal_digits() {
+    use whatsapp_rust::waproto::buffa;
+    use whatsapp_rust::waproto::whatsapp::message;
+
+    const STRANGER: &str = "111222333444556@lid";
+    let (chat_store, client) = test_session("mention-stranger").await;
+    let mention = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = buffa::MessageField::some({
+            let mut constructed: message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("oi @111222333444556".to_string());
+            constructed.context_info = buffa::MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.mentioned_jid = vec![STRANGER.to_string()];
+                constructed
+            });
+            constructed
+        });
+        constructed
+    };
+    feed(
+        &chat_store,
+        from(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Ana"),
+            mention,
+            "MSG-MENTION",
+            1_700_000_100,
+        ),
+    )
+    .await;
+
+    let page = WhatsAppClient::message_page(
+        &chat_store,
+        &client,
+        &book_with(&chat_store),
+        TEST_GROUP.to_string(),
+        None,
+        50,
+    )
+    .await
+    .expect("page loads");
+    assert_eq!(page.items[0].content, "oi @Unknown contact");
+    assert!(
+        !page.items[0].content.contains("111222333444556"),
+        "no internal address reaches the bubble"
+    );
+}
+
+/// A reply quoting a message that itself mentions someone: the quote bar
+/// draws the nested original verbatim, so its own mention list gets the same
+/// rewrite the body just got — on the hydrated page.
+#[tokio::test]
+async fn a_hydrated_quote_names_the_mentioned_contact() {
+    use whatsapp_rust::waproto::buffa;
+    use whatsapp_rust::waproto::whatsapp::message;
+
+    const MENTIONED: &str = "559900000002@s.whatsapp.net";
+    let (chat_store, client) = test_session("mention-quote").await;
+    // The mentioned contact says who they are somewhere else entirely.
+    feed(
+        &chat_store,
+        from(
+            MENTIONED,
+            MENTIONED,
+            Some("Bia"),
+            wa::Message::text("estou por aqui"),
+            "MSG-BIA",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    let reply = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = buffa::MessageField::some({
+            let mut constructed: message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("olha isso".to_string());
+            constructed.context_info = buffa::MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.stanza_id = Some("MSG-ORIG".to_string());
+                constructed.participant = Some(MENTIONED.to_string());
+                constructed.quoted_message = buffa::MessageField::some({
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.extended_text_message = buffa::MessageField::some({
+                        let mut constructed: message::ExtendedTextMessage = Default::default();
+                        constructed.text = Some("oi @559900000002, vem".to_string());
+                        constructed.context_info = buffa::MessageField::some({
+                            let mut constructed: wa::ContextInfo = Default::default();
+                            constructed.mentioned_jid = vec![MENTIONED.to_string()];
+                            constructed
+                        });
+                        constructed
+                    });
+                    constructed
+                });
+                constructed
+            });
+            constructed
+        });
+        constructed
+    };
+    feed(
+        &chat_store,
+        from(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Ana"),
+            reply,
+            "MSG-REPLY",
+            1_700_000_100,
+        ),
+    )
+    .await;
+
+    let page = WhatsAppClient::message_page(
+        &chat_store,
+        &client,
+        &book_with(&chat_store),
+        TEST_GROUP.to_string(),
+        None,
+        50,
+    )
+    .await
+    .expect("page loads");
+    assert_eq!(page.items[0].content, "olha isso");
+    assert_eq!(
+        page.items[0]
+            .quoted
+            .as_ref()
+            .expect("a reply carries its quote")
+            .preview,
+        "oi @Bia, vem"
+    );
+}
+
+/// The same quote on the live path: the inbound bubble's preview is rewritten
+/// before publishing, not only when reloaded.
+#[tokio::test]
+async fn a_live_quote_names_the_mentioned_contact() {
+    use whatsapp_rust::waproto::buffa;
+    use whatsapp_rust::waproto::whatsapp::message;
+
+    const MENTIONED: &str = "559900000002@s.whatsapp.net";
+    let (chat_store, client) = test_session("mention-quote-live").await;
+    feed(
+        &chat_store,
+        from(
+            MENTIONED,
+            MENTIONED,
+            Some("Bia"),
+            wa::Message::text("estou por aqui"),
+            "MSG-BIA",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    let reply = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = buffa::MessageField::some({
+            let mut constructed: message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("olha isso".to_string());
+            constructed.context_info = buffa::MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.stanza_id = Some("MSG-ORIG".to_string());
+                constructed.participant = Some(MENTIONED.to_string());
+                constructed.quoted_message = buffa::MessageField::some({
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.extended_text_message = buffa::MessageField::some({
+                        let mut constructed: message::ExtendedTextMessage = Default::default();
+                        constructed.text = Some("oi @559900000002, vem".to_string());
+                        constructed.context_info = buffa::MessageField::some({
+                            let mut constructed: wa::ContextInfo = Default::default();
+                            constructed.mentioned_jid = vec![MENTIONED.to_string()];
+                            constructed
+                        });
+                        constructed
+                    });
+                    constructed
+                });
+                constructed
+            });
+            constructed
+        });
+        constructed
+    };
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    let info = live_info(
+        TEST_GROUP,
+        TEST_PEER,
+        Some("Ana"),
+        "MSG-REPLY",
+        1_700_000_100,
+    );
+    WhatsAppClient::handle_inbound_message(
+        &reply,
+        &info,
+        &client,
+        &ui_tx,
+        &book_with(&chat_store),
+        false,
+    )
+    .await;
+    match ui_rx.try_recv() {
+        Ok(velo_core::UiEvent::MessageReceived { message, .. }) => {
+            assert_eq!(message.content, "olha isso");
+            assert_eq!(
+                message
+                    .quoted
+                    .as_ref()
+                    .expect("a reply carries its quote")
+                    .preview,
+                "oi @Bia, vem"
+            );
+        }
+        other => panic!("the reply never reached the window: {other:?}"),
+    }
+}
+
+/// An unknown group sender mentioning themselves: their push name is already
+/// on the envelope and labels their bubble, so the `@` inside it reads the
+/// same rather than falling back to digits the label just hid.
+#[tokio::test]
+async fn a_live_self_mention_uses_the_sender_push_name() {
+    use whatsapp_rust::waproto::buffa;
+    use whatsapp_rust::waproto::whatsapp::message;
+
+    const SELF: &str = "559900000003@s.whatsapp.net";
+    let (chat_store, client) = test_session("mention-self").await;
+    let mention_self = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = buffa::MessageField::some({
+            let mut constructed: message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("oi @559900000003, sou eu".to_string());
+            constructed.context_info = buffa::MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.mentioned_jid = vec![SELF.to_string()];
+                constructed
+            });
+            constructed
+        });
+        constructed
+    };
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    let info = live_info(TEST_GROUP, SELF, Some("Cida"), "MSG-SELF", 1_700_000_100);
+    WhatsAppClient::handle_inbound_message(
+        &mention_self,
+        &info,
+        &client,
+        &ui_tx,
+        &book_with(&chat_store),
+        false,
+    )
+    .await;
+    match ui_rx.try_recv() {
+        Ok(velo_core::UiEvent::MessageReceived {
+            message,
+            sender_name,
+            ..
+        }) => {
+            assert_eq!(
+                sender_name.as_deref(),
+                Some("Cida"),
+                "the premise: the bubble is already named"
+            );
+            assert_eq!(message.content, "oi @Cida, sou eu");
+        }
+        other => panic!("the mention never reached the window: {other:?}"),
+    }
+}
+
+/// The live wire event carries the durable alert decision, not the GUI's
+/// possibly-unhydrated chat row. The first committed message is eligible.
+#[tokio::test]
+async fn live_message_carries_store_notification_decision() {
+    let (chat_store, client) = test_session("notification-policy").await;
+    let info = live_info(
+        TEST_GROUP,
+        TEST_PEER,
+        Some("Example"),
+        "MSG-N1",
+        1_700_000_100,
+    );
+    feed(
+        &chat_store,
+        incoming_in(
+            TEST_GROUP,
+            wa::Message::text("first"),
+            "MSG-N1",
+            1_700_000_100,
+        ),
+    )
+    .await;
+    chat_store
+        .set_chat_name(&TEST_GROUP.parse().expect("test JID"), "Example group")
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    WhatsAppClient::handle_inbound_message(
+        &wa::Message::text("first"),
+        &info,
+        &client,
+        &ui_tx,
+        &book_with(&chat_store),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        ui_rx.try_recv(),
+        Ok(velo_core::UiEvent::MessageReceived {
+            notification_allowed: true,
+            notification_title: Some(title),
+            ..
+        }) if title == "Example group"
+    ));
+
+    feed(
+        &chat_store,
+        Event::MuteUpdate(
+            whatsapp_rust::wacore::types::events::MuteUpdate::builder()
+                .jid(TEST_GROUP.parse().expect("test JID"))
+                .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_200).unwrap())
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::MuteAction = Default::default();
+                    constructed.muted = Some(true);
+                    constructed.mute_end_timestamp = Some(-1);
+                    constructed
+                }))
+                .from_full_sync(false)
+                .build(),
+        ),
+    )
+    .await;
+    WhatsAppClient::handle_inbound_message(
+        &wa::Message::text("second"),
+        &live_info(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Example"),
+            "MSG-N2",
+            1_700_000_201,
+        ),
+        &client,
+        &ui_tx,
+        &book_with(&chat_store),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        ui_rx.try_recv(),
+        Ok(velo_core::UiEvent::MessageReceived {
+            notification_allowed: false,
+            ..
+        })
+    ));
+
+    // A reconnect's offline drain updates the conversation but is not a
+    // newly arrived alert, even after the phone unmutes the group.
+    feed(
+        &chat_store,
+        Event::MuteUpdate(
+            whatsapp_rust::wacore::types::events::MuteUpdate::builder()
+                .jid(TEST_GROUP.parse().expect("test JID"))
+                .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_300).unwrap())
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::MuteAction = Default::default();
+                    constructed.muted = Some(false);
+                    constructed
+                }))
+                .from_full_sync(false)
+                .build(),
+        ),
+    )
+    .await;
+    WhatsAppClient::handle_inbound_message(
+        &wa::Message::text("older"),
+        &live_info(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Example"),
+            "MSG-N3",
+            1_700_000_050,
+        ),
+        &client,
+        &ui_tx,
+        &book_with(&chat_store),
+        false,
+    )
+    .await;
+    assert!(matches!(
+        ui_rx.try_recv(),
+        Ok(velo_core::UiEvent::MessageReceived {
+            notification_allowed: false,
+            ..
+        })
+    ));
+}
+
+/// A personal @mention respects mute/archive policy. Offline drains never
+/// produce a new alert, including when they contain a mention.
+#[tokio::test]
+async fn direct_group_mention_respects_mute_and_archive() {
+    use whatsapp_rust::waproto::buffa;
+    use whatsapp_rust::waproto::whatsapp::message;
+
+    const OWN: &str = "559900000001@s.whatsapp.net";
+    let (chat_store, client) = test_session("mention-notification-policy").await;
+    client
+        .persistence_manager()
+        .modify_device(|device| device.pn = Some(OWN.parse().expect("test JID")))
+        .await;
+    feed(
+        &chat_store,
+        incoming_in(
+            TEST_GROUP,
+            wa::Message::text("first"),
+            "MSG-M1",
+            1_700_000_100,
+        ),
+    )
+    .await;
+    chat_store
+        .set_chat_name(&TEST_GROUP.parse().expect("test JID"), "Example group")
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    feed(
+        &chat_store,
+        Event::MuteUpdate(
+            whatsapp_rust::wacore::types::events::MuteUpdate::builder()
+                .jid(TEST_GROUP.parse().expect("test JID"))
+                .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_200).unwrap())
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::MuteAction = Default::default();
+                    constructed.muted = Some(true);
+                    constructed.mute_end_timestamp = Some(-1);
+                    constructed
+                }))
+                .from_full_sync(false)
+                .build(),
+        ),
+    )
+    .await;
+    feed(
+        &chat_store,
+        Event::ArchiveUpdate(
+            whatsapp_rust::wacore::types::events::ArchiveUpdate::builder()
+                .jid(TEST_GROUP.parse().expect("test JID"))
+                .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_200).unwrap())
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::ArchiveChatAction =
+                        Default::default();
+                    constructed.archived = Some(true);
+                    constructed
+                }))
+                .from_full_sync(false)
+                .build(),
+        ),
+    )
+    .await;
+
+    let mention = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = buffa::MessageField::some({
+            let mut constructed: message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("oi @559900000001".to_string());
+            constructed.context_info = buffa::MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.mentioned_jid = vec![OWN.to_string()];
+                constructed
+            });
+            constructed
+        });
+        constructed
+    };
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    WhatsAppClient::handle_inbound_message(
+        &mention,
+        &live_info(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Example"),
+            "MSG-M2",
+            1_700_000_201,
+        ),
+        &client,
+        &ui_tx,
+        &book_with(&chat_store),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        ui_rx.try_recv(),
+        Ok(velo_core::UiEvent::MessageReceived {
+            notification_allowed: false,
+            notification_title: None,
+            notification_archived: Some(true),
+            ..
+        })
+    ));
+
+    for (message, eager) in [
+        (wa::Message::text("oi @559900000001"), true),
+        (mention.clone(), false),
+    ] {
+        WhatsAppClient::handle_inbound_message(
+            &message,
+            &live_info(
+                TEST_GROUP,
+                TEST_PEER,
+                Some("Example"),
+                "MSG-M3",
+                1_700_000_202,
+            ),
+            &client,
+            &ui_tx,
+            &book_with(&chat_store),
+            eager,
+        )
+        .await;
+        assert!(matches!(
+        ui_rx.try_recv(),
+            Ok(velo_core::UiEvent::MessageReceived {
+                notification_allowed: false,
+                chat_name: Some(name),
+                notification_archived: Some(true),
+                ..
+            }) if name == "Example group"
+        ));
+    }
+}
+
+/// One inbound message's envelope, spelled out: the same fields [`from`]
+/// builds, without the event around them, for driving the live path directly.
+fn live_info(
+    chat: &str,
+    sender: &str,
+    push_name: Option<&str>,
+    id: &str,
+    ts_secs: i64,
+) -> whatsapp_rust::wacore::types::message::MessageInfo {
+    use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+
+    MessageInfo {
+        source: MessageSource {
+            chat: chat.parse().expect("test JID"),
+            sender: sender.parse().expect("test JID"),
+            ..Default::default()
+        },
+        id: id.to_string().into(),
+        timestamp: whatsapp_rust::wacore::time::from_secs(ts_secs).expect("test timestamp"),
+        push_name: push_name.unwrap_or_default().to_string().into(),
+        ..Default::default()
+    }
+}
+
+/// The stream reaches this side ordered and used to be handled on a task
+/// per event, so a call's later stanza could run before the offer that
+/// made it: the removal finds nothing, the offer's task files the call
+/// after it, and a card rings on for a call that is over.
+#[test]
+fn a_calls_later_stanza_is_handled_behind_its_offer() {
+    use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall, MissedCall};
+    use whatsapp_rust::wacore::types::events::Event;
+
+    let call_id = "CALL-ORDER-1";
+    let peer: Jid = TEST_PEER.parse().expect("test JID");
+    let at = whatsapp_rust::wacore::time::from_secs(1_700_000_000).expect("test timestamp");
+    let offer = Event::IncomingCall(Box::new(
+        IncomingCall::builder()
+            .from(peer.clone())
+            .stanza_id("STANZA-1".to_string())
+            .timestamp(at)
+            .offline(false)
+            .action(CallAction::Offer {
+                call_id: call_id.to_string(),
+                call_creator: peer.clone(),
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: true,
+                is_video: false,
+                audio: Vec::new(),
+                group_jid: None,
+            })
+            .build(),
+    ));
+    let missed = Event::MissedCall(MissedCall::new(
+        peer,
+        call_id.to_string(),
+        at,
+        whatsapp_rust::wacore::types::call::MissedReason::Offline,
+    ));
+
+    assert_eq!(
+        super::lanes::lane_of(
+            super::lanes::event_subject(&offer)
+                .map(|s| s.as_written())
+                .as_deref()
+        ),
+        super::lanes::lane_of(
+            super::lanes::event_subject(&missed)
+                .map(|s| s.as_written())
+                .as_deref()
+        ),
+    );
+}
+
+/// A batch can span chats — the store's own fixtures build one over a
+/// hundred of them — and a lane keeps one chat's order. Sent whole on the
+/// first message's lane, a receipt for a later chat in the batch runs on
+/// that chat's own lane and can overtake the message it answers.
+#[test]
+fn a_batch_spanning_chats_reaches_every_lane_it_is_about() {
+    use whatsapp_rust::wacore::types::events::{BatchOrigin, Event, InboundMessage, MessageBatch};
+    use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+
+    let chats = ["1@s.whatsapp.net", "2@s.whatsapp.net", "3@s.whatsapp.net"];
+    let messages: Arc<[InboundMessage]> = chats
+        .iter()
+        .enumerate()
+        .map(|(n, chat)| {
+            let info = MessageInfo {
+                source: MessageSource {
+                    chat: chat.parse().expect("test JID"),
+                    sender: chat.parse().expect("test JID"),
+                    ..Default::default()
+                },
+                id: format!("MSG-BATCH-{n}").into(),
+                timestamp: whatsapp_rust::wacore::time::from_secs(1_700_000_000)
+                    .expect("test timestamp"),
+                ..Default::default()
+            };
+            InboundMessage::builder()
+                .message(Arc::new(wa::Message::text("oi")))
+                .info(Arc::new(info))
+                .build()
+        })
+        .collect();
+    let batch = Arc::new(Event::Messages(
+        MessageBatch::builder()
+            .messages(messages)
+            .origin(BatchOrigin::OfflineDrain)
+            .build(),
+    ));
+
+    let parts = super::lanes::split_by_subject(&batch);
+    assert_eq!(parts.len(), 3, "one per chat it is about");
+    let mut subjects: Vec<String> = parts
+        .iter()
+        .filter_map(|part| super::lanes::event_subject(part).map(|s| s.as_written()))
+        .collect();
+    subjects.sort();
+    assert_eq!(subjects, chats);
+    // How the batch was delivered is as true of one chat's share of it as
+    // of the whole, and it is what decides whether media is fetched.
+    for part in &parts {
+        let Event::Messages(batch) = &**part else {
+            panic!("a batch splits into batches");
+        };
+        assert!(matches!(batch.origin, BatchOrigin::OfflineDrain));
+        assert_eq!(batch.iter().count(), 1);
+    }
+
+    // And a batch about one chat is not rebuilt at all.
+    let single = incoming(wa::Message::text("oi"), "MSG-ONE", 1_700_000_000);
+    assert_eq!(super::lanes::split_by_subject(&Arc::new(single)).len(), 1);
+}
+
+/// Two chats are not each other's business, so they do not queue behind
+/// one another; an event about the account is about neither.
+#[test]
+fn events_are_keyed_by_what_they_are_about() {
+    assert_eq!(
+        super::lanes::event_subject(&incoming(
+            wa::Message::text("oi"),
+            "MSG-LANE",
+            1_700_000_000
+        ))
+        .map(|s| s.as_written())
+        .as_deref(),
+        Some(TEST_PEER)
+    );
+    assert_eq!(
+        super::lanes::event_subject(&incoming_in(
+            "120363000000000001@g.us",
+            wa::Message::text("oi"),
+            "MSG-LANE-2",
+            1_700_000_000,
+        ))
+        .map(|s| s.as_written())
+        .as_deref(),
+        Some("120363000000000001@g.us")
+    );
+
+    // Presence is about a person and a group update about a group, and
+    // both handlers go to the store. On the session-wide lane a burst of
+    // either queued in front of `Connected`, `PairingQrCode` and
+    // `LoggedOut` -- the events a window waits on to draw anything.
+    let presence = whatsapp_rust::wacore::types::events::Event::Presence(
+        whatsapp_rust::wacore::types::events::PresenceUpdate::builder()
+            .from(TEST_PEER.parse().unwrap())
+            .status(whatsapp_rust::wacore::types::presence::PresenceStatus::Available)
+            .build(),
+    );
+    assert_eq!(
+        super::lanes::event_subject(&presence)
+            .map(|s| s.as_written())
+            .as_deref(),
+        Some(TEST_PEER)
+    );
+    assert_ne!(
+        super::lanes::lane_of(
+            super::lanes::event_subject(&presence)
+                .map(|s| s.as_written())
+                .as_deref()
+        ),
+        super::lanes::lane_of(None),
+        "and so is not on the account's own lane"
+    );
+}
+
+/// The quote bar above a reply named an unknown contact while the bubbles
+/// from the same person, an inch above it, carried their name: the
+/// participant went onto the row exactly as the envelope spelled it,
+/// device suffix and all, and `Chat::quoted_author` looks a participant
+/// up by exact string.
+#[tokio::test]
+async fn a_quoted_author_is_filed_where_their_bubbles_are() {
+    use whatsapp_rust::waproto::buffa;
+    use whatsapp_rust::waproto::whatsapp::message;
+
+    let (chat_store, client) = test_session("quoted-author").await;
+    let reply = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = buffa::MessageField::some({
+            let mut constructed: message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("e o áudio?".to_string());
+            constructed.context_info = buffa::MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.stanza_id = Some("ORIGINAL".to_string());
+                // As a sending device spells itself.
+                constructed.participant = Some(TEST_PEER.replace('@', ":12@"));
+                constructed.quoted_message = buffa::MessageField::some({
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.conversation = Some("ping".to_string());
+                    constructed
+                });
+                constructed
+            });
+            constructed
+        });
+        constructed
+    };
+    feed(&chat_store, incoming(reply, "MSG-QUOTE", 1_700_000_000)).await;
+
+    let page = WhatsAppClient::message_page(
+        &chat_store,
+        &client,
+        &book(),
+        TEST_PEER.to_string(),
+        None,
+        50,
+    )
+    .await
+    .expect("page loads");
+    let quoted = page.items[0].quoted.as_ref().expect("this is a reply");
+    assert_eq!(quoted.sender, TEST_PEER);
+}
+
+/// Canonical is not enough on its own. The participant map only holds
+/// whoever has a row on the loaded page, so a reply to a message that was
+/// never loaded had nobody to be named by and the bar read "Unknown
+/// contact" — over a group whose bubbles from that same person, named from
+/// the address book, read fine.
+#[tokio::test]
+async fn a_quoted_author_is_named_from_the_book_their_bubbles_are() {
+    use whatsapp_rust::waproto::buffa;
+    use whatsapp_rust::waproto::whatsapp::message;
+
+    let (chat_store, client) = test_session("quoted-author-name").await;
+    // The author says who they are somewhere else entirely — that is all it
+    // takes for the address book to know them.
+    feed(
+        &chat_store,
+        from(
+            TEST_AUTHOR,
+            TEST_AUTHOR,
+            Some("Allyson"),
+            {
+                let mut constructed: wa::Message = Default::default();
+                constructed.conversation = Some("ping".to_string());
+                constructed
+            },
+            "MSG-ORIGINAL",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    // Somebody else answers them in a group, and the answer is the only row
+    // that group has.
+    let reply = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = buffa::MessageField::some({
+            let mut constructed: message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("e o áudio?".to_string());
+            constructed.context_info = buffa::MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.stanza_id = Some("MSG-ORIGINAL".to_string());
+                // As a sending device spells itself.
+                constructed.participant = Some(TEST_AUTHOR.replace('@', ":12@"));
+                constructed.quoted_message = buffa::MessageField::some({
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.conversation = Some("ping".to_string());
+                    constructed
+                });
+                constructed
+            });
+            constructed
+        });
+        constructed
+    };
+    feed(
+        &chat_store,
+        from(
+            TEST_GROUP,
+            TEST_PEER,
+            None,
+            reply,
+            "MSG-REPLY",
+            1_700_000_100,
+        ),
+    )
+    .await;
+
+    let page = WhatsAppClient::message_page(
+        &chat_store,
+        &client,
+        &book_with(&chat_store),
+        TEST_GROUP.to_string(),
+        None,
+        50,
+    )
+    .await
+    .expect("page loads");
+    let quoted = page.items[0].quoted.as_ref().expect("this is a reply");
+    assert_eq!(quoted.sender, TEST_AUTHOR);
+    assert_eq!(quoted.sender_name, "Allyson");
+}
+
+/// Your own message is quoted as "You", and a name off the book would
+/// displace it — this account is in the address book like anybody else,
+/// under whatever its owner saved their own number as. The hydration leaves
+/// it unnamed on purpose and lets `Chat::quoted_author` answer.
+#[tokio::test]
+async fn a_quote_of_your_own_message_is_left_for_the_chat_to_name() {
+    let (chat_store, client) = test_session("quoted-author-self").await;
+    let own: Jid = TEST_PEER.parse().expect("test JID");
+    client
+        .persistence_manager()
+        .modify_device(|device| device.pn = Some(own.clone()))
+        .await;
+    // The book would answer for this JID: it has a row, like any contact.
+    feed(
+        &chat_store,
+        from(
+            TEST_PEER,
+            TEST_PEER,
+            Some("Eu mesmo"),
+            {
+                let mut constructed: wa::Message = Default::default();
+                constructed.conversation = Some("ping".to_string());
+                constructed
+            },
+            "MSG-ORIGINAL",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    assert_eq!(
+        book_with(&chat_store)
+            .known(&client, &own, None)
+            .await
+            .as_deref(),
+        Some("Eu mesmo"),
+        "the premise: the book has a name for this account"
+    );
+
+    let mut message = ChatMessage::new_outgoing("MSG-REPLY".into(), "e o áudio?".into());
+    message.quoted = Some(velo_core::QuotedMessage {
+        message_id: "MSG-ORIGINAL".to_string(),
+        sender_name: String::new(),
+        sender: TEST_PEER.to_string(),
+        preview: "ping".to_string(),
+        kind: None,
+    });
+    WhatsAppClient::hydrate_quoted_authors(
+        &client,
+        &book_with(&chat_store),
+        std::slice::from_mut(&mut message),
+    )
+    .await;
+    assert_eq!(message.quoted.expect("a reply").sender_name, "");
+}
+
+const TEST_PEER: &str = "559900000001@s.whatsapp.net";
+const TEST_AUTHOR: &str = "111222333444555@lid";
+const TEST_GROUP: &str = "120363000000000001@g.us";
+
+/// A chat store and a client over one in-memory database, with no network:
+/// `Bot::build` only opens the store, and `load_history` needs the client
+/// solely for the PN/LID mapping lookups that resolve chat identity.
+/// A durable descriptor is what a restart draws from before the network is up.
+/// Attaching it is a local read: no lookup happens here, which is the whole
+/// point of keeping the two apart.
+#[tokio::test]
+async fn a_stored_avatar_descriptor_reaches_the_chat_without_a_lookup() {
+    let (chat_store, client) = test_session("avatar-descriptor").await;
+    let jid: Jid = "1@s.whatsapp.net".parse().unwrap();
+    chat_store
+        .record_avatar(&jid, "picture-9", "a-9", 1)
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let mut chats = vec![Chat::from_store("1@s.whatsapp.net".into(), "Ana".into(), 0)];
+    WhatsAppClient::attach_avatar_descriptors(&chat_store, &mut chats).await;
+
+    // No network was touched; the client is here only because the hydrate
+    // path that calls this takes one.
+    let _ = &client;
+    assert_eq!(chats[0].avatar_picture_id.as_deref(), Some("picture-9"));
+    assert_eq!(chats[0].avatar_cache_key.as_deref(), Some("a-9"));
+    assert!(
+        chats[0].avatar_loaded,
+        "a known picture is loaded; whether its bytes are still cached is a reader's question"
+    );
+}
+
+#[tokio::test]
+async fn a_lid_avatar_survives_optimistic_send_and_store_hydration() {
+    let (chat_store, client) = test_session("avatar-alias-send").await;
+    let pn = "559900000008@s.whatsapp.net";
+    let lid = "111000011118888@lid";
+    chat_store
+        .record_avatar(
+            &pn.parse().unwrap(),
+            "picture-before-mapping",
+            "a1-a-pn-cached-bytes",
+            1,
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    client
+        .add_lid_pn_mapping(
+            "111000011118888",
+            "559900000008",
+            whatsapp_rust::lid_pn_cache::LearningSource::Usync,
+        )
+        .await
+        .expect("synthetic local mapping");
+    let mut hydrated = vec![Chat::from_store(lid.into(), "Synthetic contact".into(), 0)];
+    WhatsAppClient::attach_avatar_descriptors(&chat_store, &mut hydrated).await;
+    let mut live = hydrated.remove(0);
+    assert_eq!(
+        live.avatar_cache_key.as_deref(),
+        Some("a1-a-pn-cached-bytes")
+    );
+    live.add_message(ChatMessage::new_outgoing(
+        "synthetic-send".into(),
+        "hello".into(),
+    ));
+    let mut delayed = vec![Chat::from_store(lid.into(), "Synthetic contact".into(), 0)];
+    WhatsAppClient::attach_avatar_descriptors(&chat_store, &mut delayed).await;
+    live.merge_history(delayed.remove(0));
+    assert_eq!(
+        live.avatar_cache_key.as_deref(),
+        Some("a1-a-pn-cached-bytes")
+    );
+    assert!(
+        live.messages
+            .iter()
+            .any(|message| message.id == "synthetic-send")
+    );
+}
+
+#[derive(diesel::QueryableByName)]
+struct StoredProtoRow {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
+    proto: Option<Vec<u8>>,
+}
+
+/// Read a message's durable protobuf without applying quote hydration.
+async fn persisted_proto(store: &SqliteStore, id: &str) -> wa::Message {
+    use diesel::RunQueryDsl as _;
+
+    let device = store.device_id();
+    let id = id.to_owned();
+    let row: StoredProtoRow = store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query("SELECT proto FROM messages WHERE device_id = ? AND msg_id = ?")
+                .bind::<diesel::sql_types::Integer, _>(device)
+                .bind::<diesel::sql_types::Text, _>(id)
+                .get_result(conn)
+                .map_err(velo_chat_store::db_err)
+        })
+        .await
+        .expect("read stored proto");
+    whatsapp_rust::waproto::codec::message_decode(&row.proto.expect("stored payload"))
+        .expect("decode proto")
+}
+
+/// Whether a stored reply still embeds its original quoted-message payload.
+fn has_quoted_snapshot(message: &wa::Message) -> bool {
+    let context = message
+        .extended_text_message
+        .as_option()
+        .and_then(|body| body.context_info.as_option())
+        .or_else(|| {
+            message
+                .image_message
+                .as_option()
+                .and_then(|body| body.context_info.as_option())
+        });
+    context.is_some_and(|context| context.quoted_message.as_option().is_some())
+}
+
+/// Starred and media-candidate reads retain quote content after reopening.
+#[tokio::test]
+async fn starred_and_pending_media_reads_project_rehydrated_quotes() {
+    let store =
+        SqliteStore::open("file:velo-session-quote-secondary-reads?mode=memory&cache=shared")
+            .await
+            .expect("in-memory store");
+    store
+        .database()
+        .provision_device(store.device_id())
+        .await
+        .expect("seed device parent");
+    let chat_store = ChatStore::new(&store).await.expect("chat store");
+    let parent = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.image_message = MessageField::some({
+            let mut constructed: wa::message::ImageMessage = Default::default();
+            constructed.mimetype = Some("image/jpeg".into());
+            constructed.caption = Some("original photo".into());
+            constructed.jpeg_thumbnail = Some(vec![1, 2, 3]);
+            constructed
+        });
+        constructed
+    };
+    chat_store
+        .handler()
+        .handle_event(Arc::new(incoming(parent.clone(), "P", 1_700_000_000)));
+    chat_store.flush().await.expect("store parent");
+
+    let quoted_photo = || {
+        let mut constructed: wa::ContextInfo = Default::default();
+        constructed.stanza_id = Some("P".into());
+        constructed.participant = Some(TEST_PEER.into());
+        constructed.quoted_message = MessageField::some(parent.clone());
+        constructed
+    };
+    let text_reply = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = MessageField::some({
+            let mut constructed: wa::message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("reply".into());
+            constructed.context_info = MessageField::some(quoted_photo());
+            constructed
+        });
+        constructed
+    };
+    chat_store
+        .handler()
+        .handle_event(Arc::new(incoming(text_reply, "R", 1_700_000_060)));
+    chat_store.flush().await.expect("store text reply");
+    chat_store
+        .handler()
+        .handle_event(Arc::new(Event::StarUpdate(
+            whatsapp_rust::wacore::types::events::StarUpdate::builder()
+                .chat_jid(TEST_PEER.parse().expect("test JID"))
+                .message_id("R".to_string())
+                .from_me(false)
+                .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_120).unwrap())
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::StarAction = Default::default();
+                    constructed.starred = Some(true);
+                    constructed
+                }))
+                .from_full_sync(false)
+                .build(),
+        )));
+    chat_store.flush().await.expect("star text reply");
+    let media_reply = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.image_message = MessageField::some({
+            let mut constructed: wa::message::ImageMessage = Default::default();
+            constructed.mimetype = Some("image/jpeg".into());
+            constructed.context_info = MessageField::some(quoted_photo());
+            constructed
+        });
+        constructed
+    };
+    chat_store
+        .handler()
+        .handle_event(Arc::new(incoming(media_reply, "M", 1_700_000_180)));
+    chat_store.flush().await.expect("store media reply");
+    assert!(
+        !has_quoted_snapshot(&persisted_proto(&store, "R").await),
+        "text reply must be compacted before reading"
+    );
+    assert!(
+        !has_quoted_snapshot(&persisted_proto(&store, "M").await),
+        "media reply must be compacted before reading"
+    );
+
+    // Reopen the chat-store handle over the same SQLite database before the
+    // secondary reads, as the session does after a process restart.
+    drop(chat_store);
+    let chat_store = ChatStore::new(&store).await.expect("reopened chat store");
+    let starred = chat_store.starred_messages(10).await.expect("starred read");
+    let projected = super::convert::stored_to_chat_message(
+        starred
+            .into_iter()
+            .find(|row| row.id == "R")
+            .expect("reply"),
+    );
+    let quote = projected.quoted.expect("projected quote");
+    assert_eq!(quote.preview, "original photo");
+    assert_eq!(quote.kind, Some(velo_core::QuotedKind::Image));
+
+    let pending = chat_store
+        .pending_media_messages(Some(&TEST_PEER.parse().expect("test JID")), 10)
+        .await
+        .expect("pending media read");
+    let projected = super::convert::stored_to_chat_message(
+        pending
+            .into_iter()
+            .find(|row| row.id == "M")
+            .expect("media reply"),
+    );
+    let quote = projected.quoted.expect("projected media quote");
+    assert_eq!(quote.preview, "original photo");
+    assert_eq!(quote.kind, Some(velo_core::QuotedKind::Image));
+}
+
+async fn test_session(name: &str) -> (Arc<ChatStore>, Arc<Client>) {
+    let (chat_store, bot) = test_bot(name).await;
+    (chat_store, bot.client())
+}
+
+/// Construct a bot and its synthetic store for reloader integration tests.
+async fn test_bot(name: &str) -> (Arc<ChatStore>, whatsapp_rust::bot::Bot) {
+    let store = SqliteStore::open(&format!(
+        "file:velo-session-{name}?mode=memory&cache=shared"
+    ))
+    .await
+    .expect("in-memory store");
+    let chat_store = ChatStore::new(&store).await.expect("chat store");
+    let bot = super::persistent_companion(whatsapp_rust::bot::Bot::builder())
+        .with_backend(store)
+        .with_inbound_durability_hook(super::ChatStoreDurabilityHook::new(chat_store.clone()))
+        .build()
+        .await
+        .expect("offline bot");
+    (chat_store, bot)
+}
+
+fn incoming(
+    message: wa::Message,
+    id: &str,
+    ts_secs: i64,
+) -> whatsapp_rust::wacore::types::events::Event {
+    incoming_in(TEST_PEER, message, id, ts_secs)
+}
+
+/// One inbound message, spelled out: who it is addressed to, who wrote it,
+/// and what they call themselves — which is what puts them in the address
+/// book.
+fn from(
+    chat: &str,
+    sender: &str,
+    push_name: Option<&str>,
+    message: wa::Message,
+    id: &str,
+    ts_secs: i64,
+) -> whatsapp_rust::wacore::types::events::Event {
+    use whatsapp_rust::wacore::types::events::{BatchOrigin, Event, InboundMessage, MessageBatch};
+    use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+
+    let info = MessageInfo {
+        source: MessageSource {
+            chat: chat.parse().expect("test JID"),
+            sender: sender.parse().expect("test JID"),
+            ..Default::default()
+        },
+        id: id.to_string().into(),
+        timestamp: whatsapp_rust::wacore::time::from_secs(ts_secs).expect("test timestamp"),
+        push_name: push_name.unwrap_or_default().to_string().into(),
+        ..Default::default()
+    };
+    Event::Messages(
+        MessageBatch::builder()
+            .messages(Arc::from([InboundMessage::builder()
+                .message(Arc::new(message))
+                .info(Arc::new(info))
+                .build()]))
+            .origin(BatchOrigin::Live)
+            .build(),
+    )
+}
+
+fn incoming_in(
+    chat: &str,
+    message: wa::Message,
+    id: &str,
+    ts_secs: i64,
+) -> whatsapp_rust::wacore::types::events::Event {
+    use whatsapp_rust::wacore::types::events::{BatchOrigin, Event, InboundMessage, MessageBatch};
+    use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+
+    let info = MessageInfo {
+        source: MessageSource {
+            chat: chat.parse().expect("test JID"),
+            sender: chat.parse().expect("test JID"),
+            ..Default::default()
+        },
+        id: id.to_string().into(),
+        timestamp: whatsapp_rust::wacore::time::from_secs(ts_secs).expect("test timestamp"),
+        ..Default::default()
+    };
+    Event::Messages(
+        MessageBatch::builder()
+            .messages(Arc::from([InboundMessage::builder()
+                .message(Arc::new(message))
+                .info(Arc::new(info))
+                .build()]))
+            .origin(BatchOrigin::Live)
+            .build(),
+    )
+}
+
+async fn feed(chat_store: &Arc<ChatStore>, event: whatsapp_rust::wacore::types::events::Event) {
+    chat_store.handler().handle_event(Arc::new(event));
+    chat_store.flush().await.expect("flush");
+}
+
+fn messages_change(chat: &str) -> StoreChange {
+    StoreChange::Messages {
+        chat: chat.parse().expect("test JID"),
+    }
+}
+
+/// Acks and receipts are message-level, and a peer answers a single send
+/// with several of them; rebuilding the whole chat list for each is the
+/// work this narrowing exists to skip.
+#[test]
+fn message_only_invalidations_narrow_the_reload() {
+    let mut scope = ReloadScope::empty();
+    scope.widen(Some(&messages_change("12025550143@s.whatsapp.net")));
+    // The same chat named twice in one window is one chat to rebuild.
+    scope.widen(Some(&messages_change("12025550143:12@s.whatsapp.net")));
+    scope.widen(Some(&messages_change("120363000000000001@g.us")));
+
+    let chats = scope.chats().expect("narrowed reload");
+    assert_eq!(chats.len(), 2);
+    assert!(chats.contains("12025550143@s.whatsapp.net"));
+    assert!(chats.contains("120363000000000001@g.us"));
+}
+
+/// Ordering, membership and naming are resolved across the whole list, and
+/// only a whole-list load may prune it.
+#[test]
+fn list_level_invalidations_widen_the_reload() {
+    for change in [StoreChange::Chats, StoreChange::Contacts] {
+        let mut scope = ReloadScope::empty();
+        scope.widen(Some(&messages_change("12025550143@s.whatsapp.net")));
+        scope.widen(Some(&change));
+        scope.widen(Some(&messages_change("120363000000000001@g.us")));
+        assert_eq!(scope.chats(), None, "{change:?} must force a full reload");
+    }
+}
+
+/// A lagged receiver dropped changes it cannot name, so the reload has to
+/// assume the worst of them.
+#[test]
+fn a_gap_in_the_window_widens_the_reload() {
+    let mut scope = ReloadScope::empty();
+    scope.widen(Some(&messages_change("12025550143@s.whatsapp.net")));
+    scope.widen(None);
+    assert_eq!(scope.chats(), None);
+}
+
+/// A pin names its chat while a list-level change in the same window widens
+/// the reload to the whole list, which reads only the first page. The named
+/// chats stay alongside the flag, or a quiet chat that unpinning dropped
+/// past that boundary is never hydrated and stays pinned everywhere.
+#[test]
+fn a_widened_window_keeps_the_chats_it_named() {
+    let mut scope = ReloadScope::empty();
+    scope.widen(Some(&messages_change("12025550143@s.whatsapp.net")));
+    scope.widen(Some(&StoreChange::Chats));
+    scope.widen(Some(&messages_change("120363000000000001@g.us")));
+    scope.widen(None);
+    assert!(
+        scope.everything(),
+        "a list-level change still widens the reload"
+    );
+    assert_eq!(scope.chats(), None);
+    assert!(
+        scope.named().contains("12025550143@s.whatsapp.net"),
+        "named before the widening survives it"
+    );
+    assert!(
+        scope.named().contains("120363000000000001@g.us"),
+        "named after the widening survives it too"
+    );
+}
+
+#[test]
+fn history_fallbacks_do_not_expose_internal_lids() {
+    let lid: Jid = "111222333444555@lid".parse().expect("test LID");
+    let pn: Jid = "12025550143@s.whatsapp.net".parse().expect("test PN");
+    let group: Jid = "120363000000000001@g.us".parse().expect("test group");
+
+    assert_eq!(fallback_chat_name(&lid), "Unknown contact");
+    assert_eq!(fallback_chat_name(&pn), "+12025550143");
+    assert_eq!(fallback_chat_name(&group), "Group name unavailable");
+}
+
+#[test]
+fn alias_history_unread_deduplicates_only_matching_messages() {
+    let message = |id: &str| ChatMessage {
+        id: id.to_string(),
+        sender: "12025550143@s.whatsapp.net".to_string(),
+        sender_name: None,
+        content: id.to_string(),
+        timestamp: whatsapp_rust::wacore::time::now_utc(),
+        is_from_me: false,
+        is_read: false,
+        media: None,
+        reactions: HashMap::new(),
+        status: MessageStatus::default(),
+        quoted: None,
+        revoked: false,
+        edited: false,
+        is_text: true,
+        system: None,
+        poll: None,
+        business: None,
+    };
+    let mut chat = Chat::new("111222333444555@lid".to_string());
+    chat.messages = vec![message("MSG-A"), message("MSG-B")];
+    chat.unread_count = 2;
+
+    merge_alias_history_messages(
+        &mut chat,
+        vec![message("MSG-B"), message("MSG-C"), message("MSG-D")],
+        3,
+    );
+    assert_eq!(chat.unread_count, 4);
+    assert_eq!(chat.messages.len(), 4);
+
+    merge_alias_history_messages(
+        &mut chat,
+        vec![message("MSG-B"), message("MSG-C"), message("MSG-D")],
+        3,
+    );
+    assert_eq!(chat.unread_count, 4);
+}
+
+/// A status row hydrates read or unread from the broadcast's unread
+/// cursor, which counts everybody's updates at once and cannot say which
+/// of them was looked at. Without the views put back, every restart
+/// offered watched updates as new.
+#[test]
+fn watched_updates_come_back_watched() {
+    let update = |id: &str, from_me: bool| ChatMessage {
+        id: id.to_string(),
+        sender: "12025550143@s.whatsapp.net".to_string(),
+        sender_name: None,
+        content: id.to_string(),
+        timestamp: whatsapp_rust::wacore::time::now_utc(),
+        is_from_me: from_me,
+        is_read: false,
+        media: None,
+        reactions: HashMap::new(),
+        status: MessageStatus::default(),
+        quoted: None,
+        revoked: false,
+        edited: false,
+        is_text: true,
+        system: None,
+        poll: None,
+        business: None,
+    };
+    let mut broadcast = Chat::new(velo_core::STATUS_BROADCAST_JID.to_string());
+    broadcast.messages = vec![
+        update("SEEN", false),
+        update("NEW", false),
+        update("MINE", true),
+    ];
+    let mut conversation = Chat::new("12025550143@s.whatsapp.net".to_string());
+    conversation.messages = vec![update("SEEN", false)];
+
+    let watched = ["SEEN".to_string(), "MINE".to_string()]
+        .into_iter()
+        .collect();
+    let mut chats = vec![broadcast, conversation];
+    apply_status_views(&mut chats, &watched);
+
+    assert!(
+        chats[0].messages[0].is_read,
+        "watched update comes back watched"
+    );
+    assert!(!chats[0].messages[1].is_read, "one nobody opened stays new");
+    assert!(
+        !chats[0].messages[2].is_read,
+        "our own row carries the peer's read ticks; a local view must not set them"
+    );
+    assert!(
+        !chats[1].messages[0].is_read,
+        "a conversation is not the broadcast, whatever ids collide"
+    );
+}
+
+#[test]
+fn participant_keyed_read_ranges_include_incoming_participants() {
+    let group: Jid = "120363000000000001@g.us".parse().expect("test group");
+    let boundary: ReadBoundary = (
+        1_700_000_000,
+        vec![
+            (
+                "incoming".to_string(),
+                false,
+                Some("12025550143@s.whatsapp.net".to_string()),
+            ),
+            ("outgoing".to_string(), true, None),
+        ],
+    );
+
+    let range = read_message_range(&group, boundary);
+    let incoming = range.messages[0].key.as_option().expect("incoming key");
+    let outgoing = range.messages[1].key.as_option().expect("outgoing key");
+
+    assert_eq!(
+        incoming.participant.as_deref(),
+        Some("12025550143@s.whatsapp.net")
+    );
+    assert_eq!(outgoing.participant, None);
+
+    let status: Jid = "status@broadcast".parse().expect("test status");
+    let boundary = (
+        1_700_000_000,
+        vec![(
+            "status".to_string(),
+            false,
+            Some("12025550144@s.whatsapp.net".to_string()),
+        )],
+    );
+    let range = read_message_range(&status, boundary);
+    assert_eq!(
+        range.messages[0]
+            .key
+            .as_option()
+            .expect("status key")
+            .participant
+            .as_deref(),
+        Some("12025550144@s.whatsapp.net")
+    );
+}
+
+/// A narrowed load is about the chats somebody named, and the page it
+/// starts from is the hundred most recently active ones. A chat past that
+/// window was filtered down to nothing — and a load with nothing in it
+/// publishes nothing, so the invalidation that asked for it was spent in
+/// silence and every front end stayed on rows that had changed.
+#[tokio::test]
+async fn a_scoped_load_finds_a_chat_the_page_left_out() {
+    use whatsapp_rust::wacore::types::events::{BatchOrigin, Event, InboundMessage, MessageBatch};
+    use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+
+    let (chat_store, client) = test_session("scoped-load-beyond-the-page").await;
+    // The target is the oldest, so the hundred newer ones fill the page
+    // ahead of it. One batch, because a hundred flushes is a hundred
+    // transactions for a fact this test states once.
+    let target = "559900000000@s.whatsapp.net";
+    let mut batch = Vec::new();
+    for (index, jid) in std::iter::once(target.to_string())
+        .chain((1..=100).map(|n| format!("55990000{n:04}@s.whatsapp.net")))
+        .enumerate()
+    {
+        let sender: Jid = jid.parse().expect("test JID");
+        batch.push(
+            InboundMessage::builder()
+                .message(Arc::new(wa::Message::text("oi")))
+                .info(Arc::new(MessageInfo {
+                    source: MessageSource {
+                        chat: sender.clone(),
+                        sender,
+                        ..Default::default()
+                    },
+                    id: format!("MSG-{index}").into(),
+                    // Ascending, so the target's is the oldest.
+                    timestamp: whatsapp_rust::wacore::time::from_secs(1_700_000_000 + index as i64)
+                        .expect("test timestamp"),
+                    ..Default::default()
+                }))
+                .build(),
+        );
+    }
+    feed(
+        &chat_store,
+        Event::Messages(
+            MessageBatch::builder()
+                .messages(Arc::from(batch))
+                .origin(BatchOrigin::Live)
+                .build(),
+        ),
+    )
+    .await;
+
+    let only = std::collections::HashSet::from([target.to_string()]);
+    let LoadedHistory {
+        chats,
+        complete,
+        next,
+    } = WhatsAppClient::load_history_scoped(&chat_store, &client, Some(&only), &book())
+        .await
+        .expect("history loads");
+    assert!(
+        next.is_none(),
+        "a narrowed load is not a position in the list"
+    );
+
+    assert!(!complete, "a narrowed load is never the whole list");
+    assert_eq!(
+        chats
+            .iter()
+            .map(|chat| chat.jid.as_str())
+            .collect::<Vec<_>>(),
+        vec![target],
+        "the chat it was asked about, page or no page"
+    );
+    assert_eq!(chats[0].messages.len(), 1);
+}
+
+/// The window above, coalesced: the pin's named invalidation lands in the
+/// same batch as a list-level change, so the reload widens to the whole
+/// list — which reads only the first page. The named chat rides along
+/// anyway, looked up by JID past the boundary.
+#[tokio::test]
+async fn a_coalesced_reload_still_hydrates_the_named_chat() {
+    use whatsapp_rust::wacore::types::events::{BatchOrigin, Event, InboundMessage, MessageBatch};
+    use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+
+    let (chat_store, client) = test_session("coalesced-load-keeps-named").await;
+    let target = "559900000000@s.whatsapp.net";
+    let mut batch = Vec::new();
+    for (index, jid) in std::iter::once(target.to_string())
+        .chain((1..=100).map(|n| format!("55990000{n:04}@s.whatsapp.net")))
+        .enumerate()
+    {
+        let sender: Jid = jid.parse().expect("test JID");
+        batch.push(
+            InboundMessage::builder()
+                .message(Arc::new(wa::Message::text("oi")))
+                .info(Arc::new(MessageInfo {
+                    source: MessageSource {
+                        chat: sender.clone(),
+                        sender,
+                        ..Default::default()
+                    },
+                    id: format!("MSG-{index}").into(),
+                    timestamp: whatsapp_rust::wacore::time::from_secs(1_700_000_000 + index as i64)
+                        .expect("test timestamp"),
+                    ..Default::default()
+                }))
+                .build(),
+        );
+    }
+    feed(
+        &chat_store,
+        Event::Messages(
+            MessageBatch::builder()
+                .messages(Arc::from(batch))
+                .origin(BatchOrigin::Live)
+                .build(),
+        ),
+    )
+    .await;
+
+    // The page alone never reaches the oldest chat: without the named
+    // lookup this test has nothing to prove.
+    let page = WhatsAppClient::load_history(&chat_store, &client, &book())
+        .await
+        .expect("history loads");
+    assert!(
+        page.chats.iter().all(|chat| chat.jid != target),
+        "the first page leaves the quiet chat out"
+    );
+
+    let mut scope = ReloadScope::empty();
+    scope.widen(Some(&messages_change(target)));
+    scope.widen(Some(&StoreChange::Chats));
+    assert!(scope.everything(), "the window widened");
+
+    let loaded = WhatsAppClient::load_history_for_scope(
+        &chat_store,
+        &client,
+        &scope,
+        &book(),
+        WhatsAppClient::HISTORY_CHAT_LIMIT as usize,
+        50,
+    )
+    .await
+    .expect("history loads");
+    assert!(
+        loaded.chats.iter().any(|chat| chat.jid == target),
+        "the named chat rides along with the whole list"
+    );
+}
+
+/// A pin on an archived chat must not resurrect it in the main list. The
+/// scoped page excludes archived rows, but the point-lookup fallback fetched
+/// them anyway — publishing a row `Chat` has no archived flag to reject, so
+/// the daemon and the GUI upserted it beside the chats it belongs with.
+#[tokio::test]
+async fn a_scoped_load_skips_an_archived_chat() {
+    use whatsapp_rust::wacore::types::events::Event;
+
+    let (chat_store, client) = test_session("scoped-load-archived").await;
+    let peer = "559900000007@s.whatsapp.net";
+    feed(
+        &chat_store,
+        incoming_in(peer, wa::Message::text("oi"), "MSG-ARC", 1_700_000_000),
+    )
+    .await;
+    feed(
+        &chat_store,
+        Event::ArchiveUpdate(
+            whatsapp_rust::wacore::types::events::ArchiveUpdate::builder()
+                .jid(peer.parse().expect("test JID"))
+                .timestamp(
+                    whatsapp_rust::wacore::time::from_secs(1_700_000_050).expect("test timestamp"),
+                )
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::ArchiveChatAction =
+                        Default::default();
+                    constructed.archived = Some(true);
+                    constructed
+                }))
+                .from_full_sync(false)
+                .build(),
+        ),
+    )
+    .await;
+
+    let main = WhatsAppClient::load_history(&chat_store, &client, &book())
+        .await
+        .expect("history loads");
+    assert!(
+        main.chats.iter().all(|chat| chat.jid != peer),
+        "archived rows are not in the main list"
+    );
+
+    let only = std::collections::HashSet::from([peer.to_string()]);
+    let loaded = WhatsAppClient::load_history_scoped(&chat_store, &client, Some(&only), &book())
+        .await
+        .expect("history loads");
+    assert!(
+        loaded.chats.iter().all(|chat| chat.jid != peer),
+        "a scoped pin answer leaves an archived chat out"
+    );
+
+    let archived_entries = chat_store
+        .chats(true, 10)
+        .await
+        .expect("include-archived page loads");
+    let archived =
+        WhatsAppClient::hydrate_entries(&chat_store, &client, &book(), archived_entries, |_| 8)
+            .await
+            .expect("archived rows hydrate");
+    let restored = archived
+        .iter()
+        .find(|chat| chat.jid == peer)
+        .expect("archived chat is discoverable in its explicit list");
+    assert!(restored.archived, "archive state survives hydration");
+}
+
+#[tokio::test]
+async fn history_hydration_carries_persisted_group_hierarchy_to_core_chat() {
+    let (chat_store, client) = test_session("group-hierarchy-hydration").await;
+    let hierarchy = velo_core::GroupHierarchy::Subgroup {
+        parent_jid: "120363000000000009@g.us".into(),
+        kind: velo_core::SubgroupKind::General,
+    };
+    let entry = ChatEntry {
+        jid: "120363000000000001@g.us".parse().expect("group JID"),
+        name: Some("General".into()),
+        last_message_at: None,
+        last_message_preview: None,
+        last_message_kind: None,
+        unread_count: 0,
+        pinned_at: None,
+        muted_until: None,
+        archived: false,
+        ephemeral_expiration: None,
+        group_hierarchy: Some(hierarchy.clone()),
+        group_hierarchy_json: None,
+    };
+
+    let chats = WhatsAppClient::hydrate_entries(&chat_store, &client, &book(), vec![entry], |_| 0)
+        .await
+        .expect("history hydrates");
+    assert_eq!(chats.len(), 1);
+    assert_eq!(chats[0].group_hierarchy, Some(hierarchy));
+}
+
+#[tokio::test]
+async fn alias_hydration_is_archived_only_when_both_rows_are_archived() {
+    let (chat_store, client) = test_session("archive-aliases").await;
+    let pn = "559900000008@s.whatsapp.net";
+    let lid = "111000011118888@lid";
+    client
+        .add_lid_pn_mapping(
+            "111000011118888",
+            "559900000008",
+            whatsapp_rust::lid_pn_cache::LearningSource::Usync,
+        )
+        .await
+        .expect("synthetic alias mapping");
+
+    let entry = |jid: &str, archived: bool| ChatEntry {
+        jid: jid.parse().expect("test JID"),
+        name: None,
+        last_message_at: None,
+        last_message_preview: None,
+        last_message_kind: None,
+        unread_count: 0,
+        pinned_at: None,
+        muted_until: None,
+        archived,
+        ephemeral_expiration: None,
+        group_hierarchy: None,
+        group_hierarchy_json: None,
+    };
+    for (first, second, expected) in [
+        (true, false, false),
+        (false, true, false),
+        (true, true, true),
+    ] {
+        let chats = WhatsAppClient::hydrate_entries(
+            &chat_store,
+            &client,
+            &book(),
+            vec![entry(pn, first), entry(lid, second)],
+            |_| 0,
+        )
+        .await
+        .expect("alias rows hydrate");
+        assert_eq!(chats.len(), 1, "PN/LID must merge");
+        assert_eq!(chats[0].jid, lid);
+        assert_eq!(
+            chats[0].archived, expected,
+            "first={first}, second={second}"
+        );
+    }
+}
+
+/// App-state contact rows carry the missing bridge between a PN-keyed address
+/// book entry and a LID-keyed conversation. The protocol library deliberately
+/// leaves those pairs to the embedder; ignoring them makes a saved contact
+/// remain "Unknown contact" even after the update has supplied both aliases.
+#[tokio::test]
+async fn a_contact_update_repairs_an_already_seen_lid_chat() {
+    use whatsapp_rust::wacore::types::events::ContactUpdate;
+
+    let (chat_store, client) = test_session("contact-update-lid-mapping").await;
+    let lid = "111000011119999@lid";
+    let pn = "559900000099@s.whatsapp.net";
+    let group = "120363000000000099@g.us";
+    feed(
+        &chat_store,
+        incoming_in(lid, wa::Message::text("oi"), "MSG-LID", 1_700_000_000),
+    )
+    .await;
+    feed(
+        &chat_store,
+        from(
+            group,
+            pn,
+            None,
+            wa::Message::text("same group message"),
+            "MSG-GROUP-ALIAS",
+            1_700_000_010,
+        ),
+    )
+    .await;
+    feed(
+        &chat_store,
+        from(
+            group,
+            lid,
+            None,
+            wa::Message::text("same group message"),
+            "MSG-GROUP-ALIAS",
+            1_700_000_020,
+        ),
+    )
+    .await;
+    assert_eq!(
+        chat_store
+            .messages(&group.parse::<Jid>().unwrap(), None, 20)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|message| message.id == "MSG-GROUP-ALIAS")
+            .count(),
+        2
+    );
+
+    let names = Arc::new(book_with(&chat_store));
+    let before = WhatsAppClient::load_history(&chat_store, &client, &names)
+        .await
+        .expect("history loads before the contact pair");
+    assert_eq!(
+        before
+            .chats
+            .iter()
+            .find(|chat| chat.jid == lid)
+            .unwrap()
+            .name,
+        "Unknown contact"
+    );
+
+    let update = Event::ContactUpdate(
+        ContactUpdate::builder()
+            .jid(pn.parse().expect("test PN"))
+            .timestamp(
+                whatsapp_rust::wacore::time::from_secs(1_700_000_100).expect("test timestamp"),
+            )
+            .action(Box::new({
+                let mut constructed: wa::sync_action_value::ContactAction = Default::default();
+                constructed.full_name = Some("Bia".to_string());
+                constructed.lid_jid = Some(lid.to_string());
+                constructed
+            }))
+            .from_full_sync(false)
+            .build(),
+    );
+    feed(&chat_store, update.clone()).await;
+    let (identity_events, identity_incoming, _identity_stats) =
+        super::interested_unbounded_channel(super::IDENTITY_EVENT_KINDS);
+    let (_session_over, stopping) = tokio::sync::watch::channel(());
+    WhatsAppClient::spawn_contact_identity_learner(
+        client.clone(),
+        identity_incoming,
+        chat_store.clone(),
+        names.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        stopping,
+    );
+    use whatsapp_rust::wacore::types::events::EventHandler;
+    identity_events.handle_event(Arc::new(update));
+    let learned = crate::exec::with_timeout(
+        async {
+            loop {
+                if client
+                    .get_lid_pn_entry(&lid.parse().expect("test LID"))
+                    .await
+                    .expect("mapping lookup")
+                    .is_some()
+                {
+                    break;
+                }
+                crate::exec::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        },
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+    assert!(learned.is_some(), "the identity worker drains the update");
+    let (group_messages, group_chat) = crate::exec::with_timeout(
+        async {
+            loop {
+                // The in-memory LID cache becomes visible before its mapping
+                // transaction and queued reconciliation finish. Flush may win
+                // that race, so wait for the durable unread repair as well.
+                chat_store
+                    .flush()
+                    .await
+                    .expect("identity reconciliation flushes");
+                let group_messages = chat_store
+                    .messages(&group.parse::<Jid>().unwrap(), None, 20)
+                    .await
+                    .unwrap();
+                let group_chat = chat_store
+                    .chat(&group.parse::<Jid>().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if group_messages
+                    .iter()
+                    .filter(|message| message.id == "MSG-GROUP-ALIAS")
+                    .count()
+                    == 1
+                    && group_chat.unread_count == 1
+                {
+                    break (group_messages, group_chat);
+                }
+                crate::exec::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        },
+        std::time::Duration::from_secs(2),
+    )
+    .await
+    .expect("mapping reconciliation completes");
+    assert_eq!(
+        group_messages
+            .iter()
+            .filter(|message| message.id == "MSG-GROUP-ALIAS")
+            .count(),
+        1,
+        "learning a contact alias repairs already stored group copies"
+    );
+    assert_eq!(group_chat.unread_count, 1);
+
+    let after = WhatsAppClient::load_history(&chat_store, &client, &names)
+        .await
+        .expect("history loads after the contact pair");
+    assert_eq!(after.chats.len(), 2);
+    let lid_chat = after.chats.iter().find(|chat| chat.jid == lid).unwrap();
+    assert_eq!(lid_chat.name, "Bia");
+}
+
+/// A cursor is this crate's to write and to read, and the only thing that
+/// makes that safe is that the two agree.
+#[test]
+fn a_message_cursor_survives_the_round_trip() {
+    let mut row = velo_chat_store::StoredMessage {
+        group_membership: None,
+        chat_jid: "5599000000001@s.whatsapp.net".parse().unwrap(),
+        id: "3EB0".to_string(),
+        sender_jid: "5599000000001@s.whatsapp.net".parse().unwrap(),
+        from_me: false,
+        timestamp: whatsapp_rust::wacore::time::from_millis(1_700_000_000_123).unwrap(),
+        kind: velo_chat_store::MessageKind::Text,
+        text: Some("olá".to_string()),
+        message: None,
+        status: velo_chat_store::MessageStatus::Delivered,
+        revoked: false,
+        local_revoke_placeholder: false,
+        received_as_shared_history: false,
+        edited_at: None,
+        starred: false,
+        seq: 4242,
+    };
+    let token = message_cursor(&row);
+    assert_eq!(token, "m1:1700000000123:4242");
+    let cursor = parse_message_cursor(&token).expect("reads back");
+    assert_eq!(cursor.timestamp_ms, 1_700_000_000_123);
+    assert_eq!(cursor.seq, 4242);
+
+    // A page boundary inside a same-second run is exactly what the seq is
+    // for: two rows with one timestamp are two positions.
+    row.seq = 4243;
+    assert_ne!(message_cursor(&row), token);
+
+    assert!(
+        parse_message_cursor("c1:-:1:a@s.whatsapp.net").is_none(),
+        "not this list's"
+    );
+    assert!(parse_message_cursor("m1:notanumber:1").is_none());
+    assert!(parse_message_cursor("").is_none());
+}
+
+#[test]
+fn stored_edit_state_reaches_own_and_peer_bubbles_in_direct_and_group_chats() {
+    use super::convert::stored_to_chat_message;
+
+    const PEER: &str = "559900000001@s.whatsapp.net";
+    const GROUP: &str = "120363000000000001@g.us";
+    let timestamp = whatsapp_rust::wacore::time::from_millis(1_700_000_000_000).unwrap();
+    for chat_jid in [PEER, GROUP] {
+        for from_me in [false, true] {
+            let stored = velo_chat_store::StoredMessage {
+                group_membership: None,
+                chat_jid: chat_jid.parse().unwrap(),
+                id: format!("EDITED-{from_me}"),
+                sender_jid: PEER.parse().unwrap(),
+                from_me,
+                timestamp,
+                kind: velo_chat_store::MessageKind::Text,
+                text: Some("corrected".into()),
+                message: None,
+                status: velo_chat_store::MessageStatus::Delivered,
+                starred: false,
+                edited_at: Some(timestamp),
+                revoked: false,
+                local_revoke_placeholder: false,
+                received_as_shared_history: false,
+                seq: 1,
+            };
+            let mut plain = stored.clone();
+            plain.edited_at = None;
+            let edited = stored_to_chat_message(stored);
+            assert!(edited.edited, "{chat_jid} from_me={from_me}");
+            assert_eq!(edited.is_from_me, from_me);
+            assert!(!stored_to_chat_message(plain).edited);
+        }
+    }
+}
+
+/// The address goes last and is not split on: a device JID carries a
+/// colon of its own, and a cursor that lost the tail of one would page
+/// A load that stopped at its limit knows where it stopped, and saying so
+/// is what stops a window's first "load more" from being the page it was
+/// just handed: the attach load left no cursor, so the only way to obtain
+/// one was to ask for those hundred rows all over again.
+#[tokio::test]
+async fn a_truncated_load_says_where_the_list_continues() {
+    let (chat_store, client) = test_session("history-cursor").await;
+    let rows = WhatsAppClient::HISTORY_CHAT_LIMIT + 5;
+    for n in 0..rows {
+        let chat = format!("5599{n:09}@s.whatsapp.net");
+        chat_store.handler().handle_event(Arc::new(incoming_in(
+            &chat,
+            wa::Message::text("olá"),
+            &format!("MSG-{n:04}"),
+            1_700_000_000 + n,
+        )));
+    }
+    chat_store.flush().await.expect("flush");
+
+    let LoadedHistory {
+        chats,
+        complete,
+        next,
+    } = WhatsAppClient::load_history(&chat_store, &client, &book())
+        .await
+        .expect("history loads");
+    assert!(!complete, "more chats than the load carries");
+    let token = next.expect("a load that stopped at its limit stopped somewhere");
+
+    // What continues from there is rows this load did not carry, which is
+    // the whole point: the page after a load is not the load.
+    let after = parse_chat_cursor(&token).expect("this crate reads its own token");
+    let page = chat_store
+        .chats_page(
+            velo_chat_store::ChatArchiveFilter::Unarchived,
+            Some(after),
+            5,
+        )
+        .await
+        .expect("a page after the load");
+    assert!(!page.is_empty(), "there is more behind a truncated load");
+    let carried: std::collections::HashSet<String> =
+        chats.iter().map(|chat| chat.jid.clone()).collect();
+    for entry in &page {
+        assert!(
+            !carried.contains(&entry.jid.to_string()),
+            "{} was in the load and in the page after it",
+            entry.jid
+        );
+    }
+}
+
+/// from a chat that does not exist.
+#[test]
+fn a_chat_cursor_keeps_an_address_with_a_colon_in_it() {
+    let entry = ChatEntry {
+        jid: "5599000000001:57@s.whatsapp.net".parse().unwrap(),
+        name: None,
+        last_message_at: Some(whatsapp_rust::wacore::time::from_millis(1_700_000_000_123).unwrap()),
+        last_message_preview: None,
+        last_message_kind: None,
+        unread_count: 0,
+        pinned_at: Some(whatsapp_rust::wacore::time::from_millis(1_699_999_999_000).unwrap()),
+        muted_until: None,
+        archived: false,
+        ephemeral_expiration: None,
+        group_hierarchy: None,
+        group_hierarchy_json: None,
+    };
+    let token = chat_cursor(&entry);
+    assert_eq!(
+        token,
+        "c1:1699999999000:1700000000123:5599000000001:57@s.whatsapp.net"
+    );
+    let cursor = parse_chat_cursor(&token).expect("reads back");
+    assert_eq!(cursor.pinned_at_ms, Some(1_699_999_999_000));
+    assert_eq!(cursor.last_message_ts, 1_700_000_000_123);
+    assert_eq!(cursor.jid, "5599000000001:57@s.whatsapp.net");
+
+    // The unpinned run, which is where most of the list lives.
+    let plain =
+        parse_chat_cursor("c1:-:1700000000123:5599000000001@s.whatsapp.net").expect("reads back");
+    assert_eq!(plain.pinned_at_ms, None);
+    assert_eq!(plain.jid, "5599000000001@s.whatsapp.net");
+}
+
+#[test]
+fn an_unreadable_pin_does_not_read_back_as_unpinned() {
+    assert!(parse_chat_cursor("c1:xx:1700000000123:5599000000001@s.whatsapp.net").is_none());
+    assert!(parse_chat_cursor("c1::1700000000123:5599000000001@s.whatsapp.net").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// The session's own lifecycle: what a caller can observe while it comes up,
+// and what is left of it once it has gone.
+// ---------------------------------------------------------------------------
+
+/// A send that arrives before the session is up still reaches the front end.
+///
+/// The optimistic bubble is already drawn and carries its local id; nothing
+/// else will ever fail it, so a session that answers such a send with silence
+/// leaves it pending for the life of the window. This is the whole reason the
+/// event channel exists from construction rather than from `start`: the sender
+/// it used to be filled into was `None` until the session task got there.
+#[tokio::test]
+async fn a_send_before_the_session_is_up_still_fails_its_bubble() {
+    let mut client = WhatsAppClient::new().expect("an executor");
+    let mut events = client.take_events().expect("the event stream");
+
+    client
+        .send_message(TEST_PEER, "oi", "local-1".to_string(), None)
+        .await
+        .expect("the send task runs");
+
+    match events.try_recv() {
+        Ok(velo_core::UiEvent::SendFailed { message_id, .. }) => {
+            assert_eq!(message_id, "local-1");
+        }
+        other => panic!("the bubble was left pending: {other:?}"),
+    }
+    // The executor owns a runtime, and tokio refuses to drop one from inside
+    // an async context; letting go is the platform's answer to that.
+    crate::exec::let_go(client).await;
+}
+
+/// The event stream is handed out once. It used to be a `bool` beside four
+/// handles; now the receiver is the token, so "already started" cannot
+/// disagree with whether anybody is listening.
+#[tokio::test]
+async fn the_event_stream_is_handed_out_once() {
+    let mut client = WhatsAppClient::new().expect("an executor");
+    assert!(client.take_events().is_some());
+    assert!(client.take_events().is_none());
+    crate::exec::let_go(client).await;
+}
+
+/// Nothing a caller can observe is ever half a session.
+///
+/// The four handles this replaced were published one at a time, so throughout
+/// a cold start a caller could hold a chat store with no address book to name
+/// people from, or — from the other end, at teardown — a live client with no
+/// store recording what it sent.
+///
+/// Sampled at every await the opening does, rather than from a racing task: a
+/// gap of one yield is exactly what a race misses half the time, and every
+/// caller in this crate reaches the session across such a yield. So the
+/// opening future is driven poll by poll and the slot read between polls —
+/// which observes the whole of it, deterministically.
+#[tokio::test]
+async fn a_session_is_never_observed_half_open() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let (ui_tx, _ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    let session: super::SessionSlot = Arc::new(super::Mutex::new(None));
+
+    let stores = StoreRegistry::new("file:velo-session-half-open?mode=memory&cache=shared");
+    let opening = WhatsAppClient::open_session(
+        &stores,
+        velo_core::AccountId::LEGACY,
+        &ui_tx,
+        &session,
+        super::chat_names::ChatNameResolveSignal::new(),
+    );
+    let mut opening = std::pin::pin!(opening);
+    let mut cx = Context::from_waker(Waker::noop());
+
+    let mut polls = 0_u32;
+    let opened = loop {
+        // Re-polled rather than woken: the waker is a no-op, so nothing here
+        // depends on a notification arriving, and the loop is bounded so a
+        // future that genuinely cannot finish fails the test instead of
+        // hanging it.
+        if let Poll::Ready(opened) = opening.as_mut().poll(&mut cx) {
+            break opened;
+        }
+        let seen = super::parts_visible(&session).await;
+        assert!(
+            seen == [true; 3] || seen == [false; 3],
+            "half a session was visible after {polls} polls: {seen:?}"
+        );
+        polls += 1;
+        assert!(polls < 500_000, "the session never finished opening");
+        tokio::task::yield_now().await;
+    };
+
+    assert!(opened.is_some(), "the session opens offline");
+    assert!(polls > 0, "the opening was observed while it ran");
+    assert_eq!(super::parts_visible(&session).await, [true; 3]);
+}
+
+/// Letting go of the session takes the client with the store.
+///
+/// The teardown used to take only the chat store, leaving the client handle
+/// live: a send racing it went out on a wire nothing was recording any more,
+/// and the `Arc<Client>` — and the pool under it — outlived the wipe that
+/// followed on the "clear data and pair again" path.
+#[tokio::test]
+async fn closing_takes_the_client_away_with_the_store() {
+    let (ui_tx, _ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    let session: super::SessionSlot = Arc::new(super::Mutex::new(None));
+    let stores = StoreRegistry::new("file:velo-session-close?mode=memory&cache=shared");
+    WhatsAppClient::open_session(
+        &stores,
+        velo_core::AccountId::LEGACY,
+        &ui_tx,
+        &session,
+        super::chat_names::ChatNameResolveSignal::new(),
+    )
+    .await
+    .expect("the session opens offline");
+    assert_eq!(super::parts_visible(&session).await, [true; 3]);
+
+    // What `drain_chat_store` does: the whole session, in one take.
+    let taken = session.lock().await.take();
+    assert!(taken.is_some(), "the session was published");
+    assert_eq!(
+        super::parts_visible(&session).await,
+        [false; 3],
+        "nothing is left for a racing send to use"
+    );
+}
+
+/// A per-device `<reject>` must not end our side of the call: `busy` is in
+/// another call and `enc` could not decrypt the offer, and neither speaks
+/// for the callee. Only a decision — any other reason, or none — hangs up.
+#[test]
+fn only_a_decision_reject_ends_our_side_of_the_call() {
+    assert!(!super::WhatsAppClient::reject_ends_call(Some("busy")));
+    assert!(!super::WhatsAppClient::reject_ends_call(Some("enc")));
+    assert!(super::WhatsAppClient::reject_ends_call(None));
+    assert!(super::WhatsAppClient::reject_ends_call(Some("declined")));
+}
+
+/// A plain `request()` must carry the full-pass bit.
+#[tokio::test]
+async fn a_plain_request_carries_a_full_pass() {
+    let signal = super::AvatarResolveSignal::new();
+    signal.request();
+    let taken = signal.next().await;
+    assert!(taken.full, "a bare request is a full pass");
+    assert!(!taken.reset, "nothing asked to forget");
+    assert!(taken.demands.is_empty());
+}
+
+/// The asks coalesce: what is outstanding between two passes is one pass.
+#[tokio::test]
+async fn asks_coalesce_into_one_pass() {
+    let signal = super::AvatarResolveSignal::new();
+    signal.request();
+    signal.request();
+    signal.request_named(["a@s.whatsapp.net".to_string()]);
+    signal.request_named(["b@s.whatsapp.net".to_string()]);
+    signal.reset();
+
+    let taken = signal.next().await;
+    assert!(taken.full);
+    assert!(taken.reset);
+    let mut jids: Vec<String> = taken.demands.into_iter().map(|d| d.jid).collect();
+    jids.sort();
+    assert_eq!(jids, ["a@s.whatsapp.net", "b@s.whatsapp.net"]);
+
+    // Nothing is left over: a second take would block, so take it out of band.
+    let next = tokio::time::timeout(std::time::Duration::from_millis(50), signal.next()).await;
+    assert!(next.is_err(), "a coalesced ask is taken once");
+}
+
+/// A new connection is a new generation, without an eager full pass over all chats.
+#[tokio::test]
+async fn a_new_connection_advances_the_generation_without_eager_full_pass() {
+    let signal = super::AvatarResolveSignal::new();
+    let before = signal.next_generation_for_test();
+    signal.new_connection();
+    assert_eq!(
+        signal.next_generation_for_test(),
+        before + 1,
+        "generation is bumped on new connection"
+    );
+
+    // It does not eagerly queue a pass:
+    let next = tokio::time::timeout(std::time::Duration::from_millis(50), signal.next()).await;
+    assert!(
+        next.is_err(),
+        "new connection does not eagerly queue a pass"
+    );
+
+    // When demand arrives, it executes under the new generation:
+    signal.ensure([velo_core::AvatarDemand {
+        jid: "a@s.whatsapp.net".to_string(),
+        known_picture_id: None,
+        cache_key: None,
+        need_bytes: true,
+        cache_miss: false,
+    }]);
+    let taken = signal.next().await;
+    assert_eq!(taken.generation, before + 1);
+    assert!(!taken.full);
+    assert_eq!(taken.demands.len(), 1);
+}
+
+/// Ensure coalesces demands by JID and upgrades need_bytes from false to true.
+#[tokio::test]
+async fn ensure_coalesces_demands_and_upgrades_need_bytes() {
+    let signal = super::AvatarResolveSignal::new();
+    signal.ensure([
+        velo_core::AvatarDemand {
+            jid: "a@s.whatsapp.net".to_string(),
+            known_picture_id: Some("pic-1".to_string()),
+            cache_key: Some("a-1".to_string()),
+            need_bytes: false,
+            cache_miss: false,
+        },
+        velo_core::AvatarDemand {
+            jid: "b@s.whatsapp.net".to_string(),
+            known_picture_id: None,
+            cache_key: None,
+            need_bytes: false,
+            cache_miss: false,
+        },
+    ]);
+
+    // Second demand upgrades a@s.whatsapp.net to need_bytes = true
+    signal.ensure([velo_core::AvatarDemand {
+        jid: "a@s.whatsapp.net".to_string(),
+        known_picture_id: None,
+        cache_key: None,
+        need_bytes: true,
+        cache_miss: true,
+    }]);
+
+    let taken = signal.next().await;
+    assert_eq!(taken.demands.len(), 2);
+    let mut demands = taken.demands;
+    demands.sort_by(|x, y| x.jid.cmp(&y.jid));
+
+    assert_eq!(demands[0].jid, "a@s.whatsapp.net");
+    assert!(demands[0].need_bytes, "upgraded to need_bytes = true");
+    assert!(demands[0].cache_miss, "preserved the explicit cache miss");
+    assert_eq!(
+        demands[0].known_picture_id, None,
+        "cleared known_picture_id"
+    );
+
+    assert_eq!(demands[1].jid, "b@s.whatsapp.net");
+    assert!(!demands[1].need_bytes);
+}
+
+#[tokio::test]
+async fn phone_read_live_replay_does_not_notify_but_new_message_does() {
+    let (chat_store, client) = test_session("read-replay-notification").await;
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    feed(
+        &chat_store,
+        incoming_in(
+            TEST_GROUP,
+            wa::Message::text("old"),
+            "PHONE-READ",
+            1_700_000_100,
+        ),
+    )
+    .await;
+    feed(
+        &chat_store,
+        Event::MarkChatAsReadUpdate(
+            wacore::types::events::MarkChatAsReadUpdate::builder()
+                .jid(TEST_GROUP.parse().unwrap())
+                .timestamp(wacore::time::from_secs(1_700_000_110).unwrap())
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
+                        Default::default();
+                    constructed.read = Some(true);
+                    constructed
+                }))
+                .from_full_sync(false)
+                .build(),
+        ),
+    )
+    .await;
+    for (id, timestamp, expected_read) in [
+        ("PHONE-READ", 1_700_000_100, true),
+        ("NEW-UNREAD", 1_700_000_200, false),
+    ] {
+        let message = wa::Message::text("text");
+        feed(
+            &chat_store,
+            incoming_in(TEST_GROUP, message.clone(), id, timestamp),
+        )
+        .await;
+        WhatsAppClient::handle_inbound_message(
+            &message,
+            &live_info(TEST_GROUP, TEST_PEER, Some("Example"), id, timestamp),
+            &client,
+            &ui_tx,
+            &book_with(&chat_store),
+            true,
+        )
+        .await;
+        let Ok(velo_core::UiEvent::MessageReceived {
+            message,
+            notification_allowed,
+            ..
+        }) = ui_rx.try_recv()
+        else {
+            panic!("missing message event")
+        };
+        assert_eq!(message.is_read, expected_read);
+        assert_eq!(notification_allowed, !expected_read);
+    }
+}
+
+#[tokio::test]
+async fn offline_replays_keep_phone_read_flags_without_alerting() {
+    use whatsapp_rust::wacore::types::events::{BatchOrigin, InboundMessage, MessageBatch};
+    let (chat_store, client) = test_session("offline-read-replay").await;
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    feed(
+        &chat_store,
+        incoming_in(
+            TEST_GROUP,
+            wa::Message::text("old"),
+            "PHONE-READ",
+            1_700_000_100,
+        ),
+    )
+    .await;
+    feed(
+        &chat_store,
+        Event::MarkChatAsReadUpdate(
+            wacore::types::events::MarkChatAsReadUpdate::builder()
+                .jid(TEST_GROUP.parse().unwrap())
+                .timestamp(wacore::time::from_secs(1_700_000_110).unwrap())
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
+                        Default::default();
+                    constructed.read = Some(true);
+                    constructed
+                }))
+                .from_full_sync(false)
+                .build(),
+        ),
+    )
+    .await;
+    let messages =
+        [("PHONE-READ", 1_700_000_100), ("NEW-UNREAD", 1_700_000_200)].map(|(id, ts)| {
+            InboundMessage::builder()
+                .message(Arc::new(wa::Message::text("text")))
+                .info(Arc::new(live_info(
+                    TEST_GROUP,
+                    TEST_PEER,
+                    Some("Example"),
+                    id,
+                    ts,
+                )))
+                .build()
+        });
+    WhatsAppClient::handle_event(
+        Arc::new(Event::Messages(
+            MessageBatch::builder()
+                .messages(Arc::from(messages))
+                .origin(BatchOrigin::OfflineDrain)
+                .build(),
+        )),
+        client,
+        ui_tx,
+        CallRegistry::default(),
+        Arc::new(book_with(&chat_store)),
+        None,
+        None,
+        None,
+        0,
+    )
+    .await;
+    for expected_read in [true, false] {
+        let Ok(velo_core::UiEvent::MessageReceived {
+            message,
+            notification_allowed,
+            ..
+        }) = ui_rx.try_recv()
+        else {
+            panic!("missing offline message event");
+        };
+        assert_eq!(message.is_read, expected_read);
+        assert!(!notification_allowed);
+    }
+}
+
+#[tokio::test]
+async fn live_and_reloaded_shared_contacts_show_the_same_details() {
+    use whatsapp_rust::waproto::buffa::MessageField;
+    let (store, client) = test_session("shared-contact-details").await;
+    let proto = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.contact_message = MessageField::some({
+            let mut constructed: wa::message::ContactMessage = Default::default();
+            constructed.display_name = Some("Example Alpha".into());
+            constructed.vcard = Some("FN:Example Alpha\nTEL:+55 99 0000-0001".into());
+            constructed
+        });
+        constructed
+    };
+    feed(
+        &store,
+        from(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Example"),
+            proto.clone(),
+            "SHARED-CARD",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    let info = live_info(
+        TEST_GROUP,
+        TEST_PEER,
+        Some("Example"),
+        "SHARED-CARD",
+        1_700_000_000,
+    );
+    WhatsAppClient::handle_inbound_message(
+        &proto,
+        &info,
+        &client,
+        &ui_tx,
+        &book_with(&store),
+        false,
+    )
+    .await;
+    let velo_core::UiEvent::MessageReceived { message, .. } = ui_rx.recv().await.unwrap() else {
+        panic!("contact message event");
+    };
+    assert_eq!(message.content, "Example Alpha\n+55 99 0000-0001");
+    let stored = store
+        .message(&TEST_GROUP.parse().unwrap(), "SHARED-CARD")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        super::convert::stored_to_chat_message(stored).content,
+        message.content
+    );
+}
+
+#[test]
+fn read_ranges_skip_invalid_references_and_preserve_boundary() {
+    let group: Jid = "read-range@g.us".parse().unwrap();
+    let sender = Some("reader@s.whatsapp.net".to_string());
+    let range = read_message_range(
+        &group,
+        (
+            123,
+            vec![
+                (String::new(), false, sender.clone()),
+                ("missing-author".into(), false, None),
+                ("incoming".into(), false, sender),
+                ("outgoing".into(), true, None),
+            ],
+        ),
+    );
+    assert_eq!(range.last_message_timestamp, Some(123));
+    assert_eq!(range.messages.len(), 2);
+    let incoming = range.messages[0].key.as_option().unwrap();
+    assert_eq!(incoming.id.as_deref(), Some("incoming"));
+    assert_eq!(incoming.from_me, Some(false));
+    assert_eq!(
+        incoming.participant.as_deref(),
+        Some("reader@s.whatsapp.net")
+    );
+    let outgoing = range.messages[1].key.as_option().unwrap();
+    assert_eq!(outgoing.id.as_deref(), Some("outgoing"));
+    assert_eq!(outgoing.from_me, Some(true));
+    assert_eq!(outgoing.participant, None);
+}
+
+/// Business mention contexts may be on the template or its interactive body.
+/// Both live projection and a durable reload must resolve the same visible text.
+#[tokio::test]
+async fn business_mentions_resolve_live_and_historical_cards() {
+    const MENTIONED: &str = "559900000002@s.whatsapp.net";
+    for interactive in [false, true] {
+        let (chat_store, client) = test_session(if interactive {
+            "business-mention-interactive"
+        } else {
+            "business-mention-hydrated"
+        })
+        .await;
+        feed(
+            &chat_store,
+            from(
+                MENTIONED,
+                MENTIONED,
+                Some("Bia"),
+                wa::Message::text("hello"),
+                "CONTACT",
+                1_700_000_000,
+            ),
+        )
+        .await;
+        let mut context = wa::ContextInfo::default();
+        context.mentioned_jid = vec![MENTIONED.into()];
+        let mut template = wa::message::TemplateMessage::default();
+        if interactive {
+            let mut body = wa::message::interactive_message::Body::default();
+            body.text = Some("Hi @559900000002".into());
+            let mut header = wa::message::interactive_message::Header::default();
+            header.title = Some("For @559900000002".into());
+            let mut footer = wa::message::interactive_message::Footer::default();
+            footer.text = Some("From @559900000002".into());
+            let mut button =
+                wa::message::interactive_message::native_flow_message::NativeFlowButton::default();
+            button.name = Some("quick_reply".into());
+            button.button_params_json = Some(r#"{"display_text":"Ask @559900000002"}"#.into());
+            let mut flow = wa::message::interactive_message::NativeFlowMessage::default();
+            flow.buttons.push(button);
+            let mut body_message = wa::message::InteractiveMessage::default();
+            body_message.body = MessageField::some(body);
+            body_message.header = MessageField::some(header);
+            body_message.footer = MessageField::some(footer);
+            body_message.context_info = MessageField::some(context);
+            body_message.interactive_message = Some(
+                wa::message::interactive_message::InteractiveMessage::NativeFlowMessage(
+                    flow.into(),
+                ),
+            );
+            template.format = Some(
+                wa::message::template_message::Format::InteractiveMessageTemplate(
+                    body_message.into(),
+                ),
+            );
+        } else {
+            let mut hydrated = wa::message::template_message::HydratedFourRowTemplate::default();
+            hydrated.hydrated_content_text = Some("Hi @559900000002".into());
+            hydrated.hydrated_footer_text = Some("From @559900000002".into());
+            hydrated.title = Some(
+                wa::message::template_message::hydrated_four_row_template::Title::HydratedTitleText(
+                    "For @559900000002".into(),
+                ),
+            );
+            let mut reply = wa::hydrated_template_button::HydratedQuickReplyButton::default();
+            reply.display_text = Some("Ask @559900000002".into());
+            let mut button = wa::HydratedTemplateButton::default();
+            button.hydrated_button =
+                Some(wa::hydrated_template_button::HydratedButton::QuickReplyButton(reply.into()));
+            hydrated.hydrated_buttons.push(button);
+            template.hydrated_template = MessageField::some(hydrated);
+            template.context_info = MessageField::some(context);
+        }
+        let mut proto = wa::Message::default();
+        proto.template_message = MessageField::some(template);
+        for _ in 0..2 {
+            let mut wrapper = wa::message::FutureProofMessage::default();
+            wrapper.message = MessageField::some(proto);
+            proto = wa::Message::default();
+            proto.ephemeral_message = MessageField::some(wrapper);
+        }
+        feed(
+            &chat_store,
+            from(
+                TEST_GROUP,
+                TEST_PEER,
+                Some("Ana"),
+                proto.clone(),
+                "BUSINESS-MENTION",
+                1_700_000_100,
+            ),
+        )
+        .await;
+        let names = book_with(&chat_store);
+        let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(super::ui_queue::HistoryBudget::new()),
+        );
+        let info = live_info(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Ana"),
+            "BUSINESS-MENTION",
+            1_700_000_100,
+        );
+        WhatsAppClient::handle_inbound_message(&proto, &info, &client, &ui_tx, &names, false).await;
+        let velo_core::UiEvent::MessageReceived { message: live, .. } = ui_rx.try_recv().unwrap()
+        else {
+            panic!("business message must be published")
+        };
+        let live_card = live.business.as_ref().unwrap();
+        assert_eq!(live.content, "Hi @Bia");
+        assert_eq!(live_card.header, "For @Bia");
+        assert_eq!(live_card.footer, "From @Bia");
+        assert_eq!(live_card.buttons[0].label, "Ask @Bia");
+        let page =
+            WhatsAppClient::message_page(&chat_store, &client, &names, TEST_GROUP.into(), None, 50)
+                .await
+                .unwrap();
+        let historical = page
+            .items
+            .iter()
+            .find(|message| message.id == "BUSINESS-MENTION")
+            .unwrap();
+        assert_eq!(historical.content, live.content);
+        assert_eq!(historical.business, live.business);
+    }
+}
+
+#[tokio::test]
+async fn membership_labels_refresh_from_contacts_after_persistence_and_history_reload() {
+    use velo_core::SystemNotice;
+    use whatsapp_rust::wacore::stanza::groups::{GroupNotificationAction, GroupParticipantInfo};
+    use whatsapp_rust::wacore::types::events::{ContactUpdate, GroupUpdate};
+    let (store, client) = test_session("membership-labels").await;
+    let pn = "12025550123@s.whatsapp.net";
+    let lid = "111000011112222@lid";
+    let group = "120363000000000099@g.us";
+    let update = GroupUpdate::builder()
+        .group_jid(group.parse().unwrap())
+        .notification_id("MEMBERSHIP".to_owned())
+        .participant("559900000002@s.whatsapp.net".parse().unwrap())
+        .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_000).unwrap())
+        .is_lid_addressing_mode(true)
+        .action(Box::new(
+            GroupNotificationAction::add()
+                .participants(vec![
+                    GroupParticipantInfo::builder()
+                        .jid(lid.parse().unwrap())
+                        .maybe_phone_number(Some(pn.parse().unwrap()))
+                        .maybe_display_name(Some("Event name".to_owned()))
+                        .build(),
+                ])
+                .build(),
+        ))
+        .build();
+    feed(&store, Event::GroupUpdate(update.clone())).await;
+    let names = book(); // History receives its store explicitly, even without a live book.
+    let before = WhatsAppClient::load_history(&store, &client, &names)
+        .await
+        .unwrap();
+    let row = &before
+        .chats
+        .iter()
+        .find(|c| c.jid == group)
+        .unwrap()
+        .messages[0];
+    assert!(
+        row.content.ends_with(" added Event name"),
+        "{}",
+        row.content
+    );
+    assert!(row.is_read);
+    let Some(SystemNotice::GroupMembership(original)) = &row.system else {
+        panic!("membership notice")
+    };
+    assert_eq!(original.participants[0].jid, lid);
+    for name in ["Saved member", "Renamed member"] {
+        feed(
+            &store,
+            Event::ContactUpdate(
+                ContactUpdate::builder()
+                    .jid(pn.parse().unwrap())
+                    .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_100).unwrap())
+                    .action(Box::new({
+                        let mut action: wa::sync_action_value::ContactAction = Default::default();
+                        action.full_name = Some(name.to_owned());
+                        action
+                    }))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+        )
+        .await;
+        let loaded = WhatsAppClient::load_history(&store, &client, &names)
+            .await
+            .unwrap();
+        let row = &loaded
+            .chats
+            .iter()
+            .find(|c| c.jid == group)
+            .unwrap()
+            .messages[0];
+        assert!(
+            row.content.ends_with(&format!(" added {name}")),
+            "{}",
+            row.content
+        );
+        assert_eq!(row.sender, group);
+        let Some(SystemNotice::GroupMembership(event)) = &row.system else {
+            panic!("membership notice")
+        };
+        assert_eq!(event.participants[0].jid, lid);
+        assert_eq!(event.participants[0].phone_jid.as_deref(), Some(pn));
+        // Durable facts still contain the original hint, never a cached label.
+        let raw = store
+            .messages(&group.parse().unwrap(), None, 10)
+            .await
+            .unwrap();
+        assert!(
+            raw[0].group_membership.as_ref().unwrap().participants[0]
+                .label
+                .is_none()
+        );
+    }
+    let (other_store, other_client) = test_session("membership-other-account").await;
+    feed(&other_store, Event::GroupUpdate(update)).await;
+    let other = WhatsAppClient::load_history(&other_store, &other_client, &book())
+        .await
+        .unwrap();
+    assert!(
+        other
+            .chats
+            .iter()
+            .find(|c| c.jid == group)
+            .unwrap()
+            .messages[0]
+            .content
+            .ends_with(" added Event name")
+    );
+}
+
+#[tokio::test]
+async fn membership_uses_a_late_local_mapping_without_replacing_wire_identity() {
+    use velo_core::{GroupMembership, MembershipAction, NoticeParticipant};
+    let (store, client) = test_session("membership-late-mapping").await;
+    let names = book();
+    let lid = "111000011112333@lid";
+    let mut event = GroupMembership {
+        action: MembershipAction::Add,
+        actor: None,
+        participants: vec![NoticeParticipant {
+            jid: "111000011112333:7@lid".to_owned(),
+            phone_jid: None,
+            lid: None,
+            offered_name: None,
+            label: None,
+            is_self: false,
+            canonical_jid: None,
+        }],
+    };
+    super::membership::resolve(&client, &names, &store, &mut event).await;
+    assert_eq!(event.summary(), "Someone added Unknown contact");
+    client
+        .add_lid_pn_mapping(
+            "111000011112333",
+            "12025550123",
+            whatsapp_rust::lid_pn_cache::LearningSource::Usync,
+        )
+        .await
+        .unwrap();
+    names.forget();
+    super::membership::resolve(&client, &names, &store, &mut event).await;
+    assert_eq!(event.summary(), "Someone added +1 202-555-0123");
+    assert_eq!(event.participants[0].jid, "111000011112333:7@lid");
+    assert!(
+        event.participants[0].phone_jid.is_none(),
+        "projection must not replace the wire aliases"
+    );
+    assert_eq!(event.participants[0].canonical_jid.as_deref(), Some(lid));
+}
+
+#[tokio::test]
+async fn membership_wire_phone_outranks_a_masked_lid_contact_label() {
+    use velo_core::{GroupMembership, MembershipAction, NoticeParticipant};
+    let (store, client) = test_session("membership-masked-lid-contact").await;
+    let lid = "111000011112555@lid";
+    feed(
+        &store,
+        from(
+            "120363000000000099@g.us",
+            lid,
+            Some("+1 ·· ····"),
+            wa::Message::text("synthetic"),
+            "MASKED-CONTACT",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    let names = book();
+    for (offered, expected) in [
+        (None, "Someone added +1 202-555-0123"),
+        (Some("Event name"), "Someone added Event name"),
+    ] {
+        let mut event = GroupMembership {
+            action: MembershipAction::Add,
+            actor: None,
+            participants: vec![NoticeParticipant {
+                jid: lid.to_owned(),
+                phone_jid: Some("12025550123@s.whatsapp.net".to_owned()),
+                lid: None,
+                offered_name: offered.map(str::to_owned),
+                label: None,
+                is_self: false,
+                canonical_jid: None,
+            }],
+        };
+        super::membership::resolve(&client, &names, &store, &mut event).await;
+        assert_eq!(event.summary(), expected);
+    }
+}
+
+#[tokio::test]
+async fn offline_phone_delivery_hydrates_two_ticks_in_a_scoped_reload() {
+    use whatsapp_rust::wacore::types::events::{
+        BatchOrigin, InboundMessage, MessageBatch, Receipt,
+    };
+    use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+    use whatsapp_rust::wacore::types::presence::ReceiptType;
+
+    let (store, client) = test_session("offline-phone-delivery-ticks").await;
+    let chat: Jid = TEST_PEER.parse().unwrap();
+    let timestamp = whatsapp_rust::wacore::time::from_secs(1_700_000_000).unwrap();
+    let source = MessageSource {
+        chat: chat.clone(),
+        sender: chat.clone(),
+        ..Default::default()
+    };
+    let handler = store.handler();
+    handler.handle_event(Arc::new(Event::Receipt(
+        Receipt::builder()
+            .source(source.clone())
+            .message_ids(vec!["PHONE-OFFLINE-TICKS".into()])
+            .timestamp(timestamp)
+            .r#type(ReceiptType::Delivered)
+            .offline(true)
+            .build(),
+    )));
+    store.flush().await.unwrap();
+    handler.handle_event(Arc::new(Event::Messages(
+        MessageBatch::builder()
+            .messages(Arc::from([InboundMessage::builder()
+                .message(Arc::new(wa::Message::text("synthetic phone send")))
+                .info(Arc::new(MessageInfo {
+                    source: MessageSource {
+                        is_from_me: true,
+                        ..source
+                    },
+                    id: "PHONE-OFFLINE-TICKS".into(),
+                    timestamp,
+                    is_offline: true,
+                    ..Default::default()
+                }))
+                .build()]))
+            .origin(BatchOrigin::Live)
+            .build(),
+    )));
+    store.flush().await.unwrap();
+    let mut scope = ReloadScope::empty();
+    scope.widen(Some(&StoreChange::Messages { chat }));
+    let loaded = WhatsAppClient::load_history_for_scope(
+        &store,
+        &client,
+        &scope,
+        &NameBook::new(Some(store.clone())),
+        100,
+        50,
+    )
+    .await
+    .unwrap();
+    assert!(!loaded.complete);
+    assert_eq!(loaded.chats.len(), 1);
+    let message = loaded.chats[0]
+        .messages
+        .iter()
+        .find(|m| m.id == "PHONE-OFFLINE-TICKS")
+        .unwrap();
+    assert_eq!(message.status, MessageStatus::Delivered);
+    assert!(!message.is_read, "delivery evidence must not invent a read");
+}
+
+#[tokio::test]
+/// A blocked handler cannot prevent control-lane overflow recovery.
+async fn a_saturated_control_lane_triggers_recovery_without_waiting_for_its_handler() {
+    let (store, client) = test_session("saturated-control-lane").await;
+    let (tx, mut rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    let (_stop, stopping) = tokio::sync::watch::channel(());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let mut lanes = super::lanes::EventLanes::new(
+        {
+            let gate = gate.clone();
+            let entered = entered.clone();
+            move |_, _| {
+                let gate = gate.clone();
+                let entered = entered.clone();
+                async move {
+                    entered.notify_one();
+                    gate.notified().await;
+                }
+            }
+        },
+        stopping,
+        CallRegistry::default(),
+        tx,
+    );
+    let names = book_with(&store);
+    let event = Arc::new(Event::Connected(
+        whatsapp_rust::wacore::types::events::Connected::builder().build(),
+    ));
+    lanes.dispatch(&client, &names, event.clone()).await;
+    entered.notified().await;
+    for _ in 0..64 {
+        lanes.dispatch(&client, &names, event.clone()).await;
+    }
+    assert!(
+        crate::exec::with_timeout(
+            lanes.dispatch(&client, &names, event),
+            std::time::Duration::from_secs(1)
+        )
+        .await
+        .is_some()
+    );
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(velo_core::UiEvent::SessionResyncRequired(_))
+    ));
+}
+
+/// A full control queue must not make its recovery notification spin the
+/// reloader, and freeing capacity must allow the pending reload to complete.
+#[tokio::test]
+async fn history_reloader_backs_off_when_control_queue_is_full() {
+    let (store, bot) = test_bot("reloader-control-capacity").await;
+    let reload = Arc::new(tokio::sync::Notify::new());
+    let budget = Arc::new(super::ui_queue::HistoryBudget::new());
+    let (tx, mut rx) = super::ui_queue::channel(reload.clone(), budget.clone());
+    for _ in 0..256 {
+        tx.send(velo_core::UiEvent::Error("synthetic control".into()))
+            .unwrap();
+    }
+    let (stop, stopping) = tokio::sync::watch::channel(());
+    WhatsAppClient::spawn_history_reloader(
+        store.subscribe(),
+        store.clone(),
+        &bot,
+        &tx,
+        reload.clone(),
+        budget,
+        Arc::new(book_with(&store)),
+        stopping,
+    );
+    reload.notify_one();
+    assert!(
+        crate::exec::with_timeout(
+            async {
+                while tx.stats().dropped_recoverable == 0 {
+                    crate::exec::breathe().await;
+                }
+            },
+            std::time::Duration::from_secs(3)
+        )
+        .await
+        .is_some()
+    );
+    crate::exec::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        tx.stats().dropped_recoverable,
+        1,
+        "rejection must wait before reloading again"
+    );
+    for _ in 0..256 {
+        assert!(matches!(rx.try_recv(), Ok(velo_core::UiEvent::Error(_))));
+    }
+    assert!(matches!(
+        crate::exec::with_timeout(rx.recv(), std::time::Duration::from_secs(3)).await,
+        Some(Some(velo_core::UiEvent::HistoryLoaded { .. }))
+    ));
+    let _ = stop.send(());
+}
+
+#[tokio::test]
+/// Rejected oversized snapshots retry smaller pages and later store changes.
+async fn history_reloader_survives_oversized_pages_and_later_store_changes() {
+    let (store, bot) = test_bot("reloader-admission-retry").await;
+    let reload = Arc::new(tokio::sync::Notify::new());
+    let budget = Arc::new(super::ui_queue::HistoryBudget::new());
+    let (tx, mut rx) = super::ui_queue::channel(reload.clone(), budget.clone());
+    let (_stop, stopping) = tokio::sync::watch::channel(());
+    WhatsAppClient::spawn_history_reloader(
+        store.subscribe(),
+        store.clone(),
+        &bot,
+        &tx,
+        reload.clone(),
+        budget.clone(),
+        Arc::new(book_with(&store)),
+        stopping,
+    );
+    feed(
+        &store,
+        incoming(
+            wa::Message::text("x".repeat(5 * 1024 * 1024)),
+            "OVERSIZED",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    reload.notify_one();
+    assert!(
+        crate::exec::with_timeout(
+            async {
+                while !budget.exhausted() {
+                    crate::exec::breathe().await;
+                }
+            },
+            std::time::Duration::from_secs(5)
+        )
+        .await
+        .is_some(),
+        "reloader must retry every smaller budget instead of treating rejection as closure"
+    );
+    feed(
+        &store,
+        incoming(
+            wa::Message::text("small latest message"),
+            "FITS",
+            1_700_000_001,
+        ),
+    )
+    .await;
+    reload.notify_one();
+    let event = crate::exec::with_timeout(rx.recv(), std::time::Duration::from_secs(5)).await;
+    let Some(Some(velo_core::UiEvent::HistoryLoaded { chats, .. })) = event else {
+        panic!("history reloader stopped after admission rejection");
+    };
+    assert!(
+        chats
+            .iter()
+            .flat_map(|chat| &chat.messages)
+            .any(|message| message.id == "FITS")
+    );
+}
+
+#[tokio::test]
+async fn history_backfill_wait_uses_coverage_even_when_notice_predates_anchor() {
+    use super::ops::history_sync_progressed;
+    use whatsapp_rust::wacore::stanza::groups::{GroupNotificationAction, GroupParticipantInfo};
+    use whatsapp_rust::wacore::types::events::GroupUpdate;
+    let (store, _client) = test_session("history-membership-baseline").await;
+    let group: Jid = "120363000000000099@g.us".parse().unwrap();
+    let update = GroupUpdate::builder()
+        .group_jid(group.clone())
+        .notification_id("BASELINE-NOTICE".to_owned())
+        .participant(TEST_PEER.parse().unwrap())
+        .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_000).unwrap())
+        .is_lid_addressing_mode(false)
+        .action(Box::new(
+            GroupNotificationAction::add()
+                .participants(vec![
+                    GroupParticipantInfo::builder()
+                        .jid(TEST_PEER.parse().unwrap())
+                        .build(),
+                ])
+                .build(),
+        ))
+        .build();
+    feed(&store, Event::GroupUpdate(update)).await;
+    feed(
+        &store,
+        from(
+            &group.to_string(),
+            TEST_PEER,
+            None,
+            wa::Message::text("anchor"),
+            "ANCHOR",
+            1_700_000_010,
+        ),
+    )
+    .await;
+    let anchor = store.oldest_message(&group).await.unwrap().unwrap();
+    let before = store.message_coverage(Some(&group)).await.unwrap();
+    assert_eq!(anchor.id, "ANCHOR");
+    assert!(before.oldest_ms.unwrap() < anchor.timestamp.timestamp_millis());
+    let unchanged = store.message_coverage(Some(&group)).await.unwrap();
+    assert!(
+        !history_sync_progressed(before, unchanged),
+        "the existing notice is not a phone reply"
+    );
+    // A reply may fill the gap after the notice without moving oldest_ms.
+    feed(
+        &store,
+        from(
+            &group.to_string(),
+            TEST_PEER,
+            None,
+            wa::Message::text("backfilled"),
+            "BACKFILLED",
+            1_700_000_005,
+        ),
+    )
+    .await;
+    let after = store.message_coverage(Some(&group)).await.unwrap();
+    assert_eq!(after.oldest_ms, before.oldest_ms);
+    assert!(history_sync_progressed(before, after));
+}
+
+#[test]
+fn history_backfill_wait_detects_older_rows_without_count_growth() {
+    use super::ops::history_sync_progressed;
+    use velo_chat_store::MessageCoverage;
+    let before = MessageCoverage {
+        stored_count: 2,
+        oldest_ms: Some(20),
+        newest_ms: Some(30),
+    };
+    assert!(!history_sync_progressed(before, before));
+    assert!(history_sync_progressed(
+        before,
+        MessageCoverage {
+            oldest_ms: Some(10),
+            ..before
+        }
+    ));
+    assert!(!history_sync_progressed(
+        before,
+        MessageCoverage {
+            stored_count: 1,
+            oldest_ms: Some(30),
+            ..before
+        }
+    ));
+}
