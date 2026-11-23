@@ -10,11 +10,28 @@
 //!
 //! Not drawn on the web, where the browser owns the frame.
 
-use gpui::{App, IntoElement, ParentElement, Styled, div};
-use gpui_component::{ActiveTheme as _, Icon, TitleBar, h_flex};
+use gpui::{App, Image, ImageFormat, ImageSource, IntoElement, ParentElement, Styled, div, img};
+use gpui_component::{ActiveTheme as _, TitleBar, h_flex};
 
-use crate::components::{ProductIcon, parts};
+use crate::components::parts;
 use crate::theme::ActiveProductTheme as _;
+
+/// The app picture, kept as pixels rather than an SVG mask.
+///
+/// `Icon` treats an SVG as a single-colour mask. `wasp-mark.svg` embeds the
+/// PNG, so the whole opaque tile was tinted the
+/// accent and rendered as one green square. `img` keeps the
+/// picture's lime tile and folded panels.
+fn icon() -> std::sync::Arc<Image> {
+    static ICON: std::sync::OnceLock<std::sync::Arc<Image>> = std::sync::OnceLock::new();
+    ICON.get_or_init(|| {
+        std::sync::Arc::new(Image::from_bytes(
+            ImageFormat::Png,
+            include_bytes!("../../../../packaging/windows/wasp.png").to_vec(),
+        ))
+    })
+    .clone()
+}
 
 pub fn render_window_bar(cx: &App) -> impl IntoElement + use<> {
     let metrics = cx.product().metrics;
@@ -27,13 +44,7 @@ pub fn render_window_bar(cx: &App) -> impl IntoElement + use<> {
             h_flex()
                 .gap(metrics.space_sm())
                 .items_center()
-                .child(
-                    // Tinted with the accent, so the mark follows the colour
-                    // chosen in Appearance.
-                    Icon::from(ProductIcon::WaspMark)
-                        .size(metrics.icon_small())
-                        .text_color(cx.theme().primary),
-                )
+                .child(img(ImageSource::Image(icon())).size(metrics.icon_small()))
                 .child(
                     div()
                         .text_size(metrics.text_small())
@@ -41,4 +52,13 @@ pub fn render_window_bar(cx: &App) -> impl IntoElement + use<> {
                         .child("Wasp"),
                 ),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_titlebar_icon_keeps_its_colours() {
+        let icon = super::icon();
+        assert!(icon.bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
 }
