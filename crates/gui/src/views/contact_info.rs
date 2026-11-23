@@ -79,7 +79,7 @@ fn counts(chat: &Chat) -> Counts {
 fn mute_line(chat: &Chat) -> String {
     match chat.muted_until {
         Some(until) if until == chrono::DateTime::<chrono::Utc>::MAX_UTC => "Muted".into(),
-        Some(until) if until > wacore::time::now_utc() => format!(
+        Some(until) if until > velo_core::now() => format!(
             "Muted until {}",
             until.with_timezone(&chrono::Local).format("%b %-d, %H:%M")
         ),

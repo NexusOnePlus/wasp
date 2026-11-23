@@ -498,12 +498,7 @@ mod announcement_tests {
             if mode == "full" {
                 for index in 0..1024 {
                     store
-                        .record_outgoing(
-                            &chat,
-                            format!("FILL-{index}"),
-                            &message,
-                            whatsapp_rust::wacore::time::now_utc(),
-                        )
+                        .record_outgoing(&chat, format!("FILL-{index}"), &message, velo_core::now())
                         .unwrap();
                 }
             } else if mode == "stopped" {

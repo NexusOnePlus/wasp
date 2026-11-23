@@ -238,7 +238,7 @@ mod tests {
             caller_jid: "559900000001@s.whatsapp.net".to_string(),
             is_video: false,
             is_offline: false,
-            received_at: wacore::time::now_utc(),
+            received_at: velo_core::now(),
         })
     }
 

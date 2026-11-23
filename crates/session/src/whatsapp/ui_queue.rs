@@ -870,7 +870,7 @@ mod tests {
             UiEvent::SystemNotice {
                 chat_jid: "test@g.us".into(),
                 notice_id: "id".into(),
-                at: wacore::time::from_secs(0).unwrap(),
+                at: velo_core::from_wacore(wacore::time::from_secs(0).unwrap()),
                 notice: velo_core::SystemNotice::GroupChanged("x".repeat(4096)),
             },
         ];

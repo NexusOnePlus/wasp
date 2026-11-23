@@ -114,7 +114,7 @@ impl Notices {
         self.push(
             text.into(),
             tone,
-            wacore::time::now_utc()
+            velo_core::now()
                 + chrono::Duration::from_std(LIFETIME).unwrap_or(chrono::Duration::seconds(6)),
         );
         self.sweep(cx);
@@ -176,7 +176,7 @@ impl Notices {
             loop {
                 crate::platform::sleep(SWEEP).await;
                 let more = entity.update(cx, |notices, cx| {
-                    if notices.expire(wacore::time::now_utc()) {
+                    if notices.expire(velo_core::now()) {
                         cx.notify();
                     }
                     !notices.shown.is_empty()

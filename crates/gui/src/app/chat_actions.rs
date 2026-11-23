@@ -210,7 +210,7 @@ impl WhatsAppApp {
 
     /// Bring the window's copy in line with a change WhatsApp accepted.
     fn apply_chat_action(&mut self, jid: &str, action: &ChatAction, cx: &mut Context<Self>) {
-        let now = wacore::time::now_utc();
+        let now = velo_core::now();
         match action {
             ChatAction::Delete => {
                 if self.selected_chat.as_deref() == Some(jid) {

@@ -402,7 +402,7 @@ mod tests {
             id: "3EB0C".to_string(),
             sender_jid: "559900000001@s.whatsapp.net".parse().unwrap(),
             from_me: false,
-            timestamp: wacore::time::now_utc(),
+            timestamp: velo_core::now(),
             kind: velo_chat_store::MessageKind::Poll,
             text: None,
             message: Some(Box::new(proto)),

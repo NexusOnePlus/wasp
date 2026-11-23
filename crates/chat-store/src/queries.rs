@@ -821,7 +821,7 @@ impl ChatStore {
         let device_id = self.device_id();
         let is_group = jid.is_group();
         let jid = jid.to_string();
-        let now_ms = wacore::time::now_utc().timestamp_millis();
+        let now_ms = velo_core::now().timestamp_millis();
         let rows: Vec<(Option<i64>, bool, Option<String>)> = self
             .db()
             .read(move |conn| {
@@ -2409,7 +2409,7 @@ impl ChatStore {
     ) -> Result<()> {
         use schema::media_refs::dsl;
         let device_id = self.device_id();
-        let now_ms = wacore::time::now_utc().timestamp_millis();
+        let now_ms = velo_core::now().timestamp_millis();
         self.db()
             .run(move |conn| {
                 diesel::insert_into(dsl::media_refs)
@@ -2901,10 +2901,14 @@ mod tests {
         println!("sqlite_version={}", version.version);
     }
 
-    /// `EXPLAIN QUERY PLAN` for the query as diesel actually renders it. Binds
-    /// stay unbound: the planner does not need their values, and asking it
-    /// about hand-written SQL would pin a string this crate never runs.
+    /// `EXPLAIN QUERY PLAN` for the query as diesel actually renders it.
+    ///
+    /// The binds are replaced with `NULL` before planning. SQLite binds an
+    /// unset parameter as `NULL`, so this is the plan the old unbound call
+    /// produced; diesel 2.4 refuses to prepare a statement whose parameters
+    /// were not supplied, and the planner never needed their values anyway.
     fn plan(sql: &str) -> String {
+        let sql = sql.replace('?', "NULL");
         let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
         // Production opens this parent through whatsapp-rust before the chat
         // store runs. This planner test uses Diesel directly, so provide the

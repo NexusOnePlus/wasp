@@ -259,7 +259,7 @@ impl WhatsAppApp {
         let chat = self.chats.iter().find(|chat| chat.is_status);
         let count = chat.map_or(0, |chat| chat.messages.len());
 
-        let now = wacore::time::now_utc();
+        let now = velo_core::now();
         let mut cache = self.status_feed_cache.borrow_mut();
         // Count alone cannot see an update lapsing: nothing was added or
         // removed, the clock simply passed it.
@@ -301,7 +301,7 @@ impl WhatsAppApp {
         // Saturating, and never zero: a lapse already past still needs one
         // turn of the loop to be noticed, and a negative duration would make
         // the timer fire in a tight loop.
-        let wait = (when - wacore::time::now_utc())
+        let wait = (when - velo_core::now())
             .to_std()
             .unwrap_or(std::time::Duration::ZERO)
             .max(std::time::Duration::from_secs(1));

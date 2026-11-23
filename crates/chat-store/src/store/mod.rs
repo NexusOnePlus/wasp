@@ -988,7 +988,10 @@ impl ChatStore {
             .maybe_participant_jid(participant)
             .message_id(target_id.to_owned())
             .from_me(from_me)
-            .timestamp(timestamp)
+            .timestamp(
+                wacore::Timestamp::from_millis(timestamp.timestamp_millis())
+                    .expect("a domain timestamp is within the engine's range"),
+            )
             .action(Box::new({
                 let mut constructed: wa::sync_action_value::DeleteMessageForMeAction =
                     Default::default();

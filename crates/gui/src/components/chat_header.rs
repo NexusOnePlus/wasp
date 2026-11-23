@@ -395,7 +395,7 @@ fn render_actions(
                 pinned: chat.pinned_at.is_some(),
                 muted: chat
                     .muted_until
-                    .is_some_and(|until| until > wacore::time::now_utc()),
+                    .is_some_and(|until| until > velo_core::now()),
                 archived: chat.archived,
             },
             layout,

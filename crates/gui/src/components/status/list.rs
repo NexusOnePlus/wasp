@@ -1023,7 +1023,7 @@ mod visible_cost {
             crate::theme::init(cx);
         });
         let mut chat = velo_core::Chat::new("status@broadcast".into());
-        let now = wacore::time::now_utc();
+        let now = velo_core::now();
         for n in 0..50 {
             let mut message = velo_core::ChatMessage::new_incoming(
                 format!("S-{n}"),

@@ -995,7 +995,7 @@ fn first_live_message_carries_mute_to_tray_before_chat_hydration() {
     bridge.observe(event);
     let summary = bridge.hub.chat(jid).unwrap();
     assert_eq!(summary.unread, 1);
-    assert!(summary.is_muted(wacore::time::now_utc().timestamp_millis()));
+    assert!(summary.is_muted(velo_core::now().timestamp_millis()));
     assert_eq!(bridge.hub.watch_tray().borrow().unread, 0);
 }
 

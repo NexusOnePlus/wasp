@@ -399,12 +399,7 @@ mod tests {
                 .unwrap();
             let peer: wacore_binary::Jid = "900001@s.whatsapp.net".parse().unwrap();
             history
-                .record_outgoing(
-                    &peer,
-                    "RETAINED",
-                    &Default::default(),
-                    wacore::time::now_utc(),
-                )
+                .record_outgoing(&peer, "RETAINED", &Default::default(), velo_core::now())
                 .unwrap();
             history.flush().await.unwrap();
             history

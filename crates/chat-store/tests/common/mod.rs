@@ -83,6 +83,16 @@ pub fn ts(secs: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(secs, 0).expect("a representable test instant")
 }
 
+/// A whole wire second as the engine's timestamp type.
+pub fn ts_wire(secs: i64) -> wacore::Timestamp {
+    wacore::time::from_secs(secs).expect("a representable test instant")
+}
+
+/// A domain instant as the engine's timestamp type.
+pub fn wire_ts(at: DateTime<Utc>) -> wacore::Timestamp {
+    wacore::time::from_millis(at.timestamp_millis()).expect("a representable test instant")
+}
+
 pub fn incoming_info(chat: &str, sender: &str, id: &str, ts_secs: i64) -> MessageInfo {
     MessageInfo {
         source: MessageSource {
@@ -93,7 +103,7 @@ pub fn incoming_info(chat: &str, sender: &str, id: &str, ts_secs: i64) -> Messag
             ..Default::default()
         },
         id: id.to_string().into(),
-        timestamp: ts(ts_secs),
+        timestamp: ts_wire(ts_secs),
         ..Default::default()
     }
 }
@@ -180,7 +190,7 @@ fn built_receipt(
                 ..Default::default()
             })
             .message_ids(ids.iter().map(|id| (*id).into()).collect())
-            .timestamp(at)
+            .timestamp(wire_ts(at))
             .r#type(ty)
             .offline(offline)
             .build(),
@@ -236,7 +246,7 @@ fn built_ack(id: &str, chat: Option<Jid>, at: Option<DateTime<Utc>>, code: Optio
             .id(id.to_string())
             .class("message".to_string())
             .maybe_from(chat)
-            .maybe_timestamp(at)
+            .maybe_timestamp(at.map(wire_ts))
             .maybe_error(code.map(str::to_string))
             .build(),
     )
@@ -276,7 +286,7 @@ pub fn delete_for_me(chat: Jid, id: &str, from_me: bool, at: DateTime<Utc>) -> E
             .chat_jid(chat)
             .message_id(id.to_string())
             .from_me(from_me)
-            .timestamp(at)
+            .timestamp(wire_ts(at))
             .action(Box::new(
                 wa::sync_action_value::DeleteMessageForMeAction::default(),
             ))
@@ -300,7 +310,7 @@ pub fn mark_read_event(chat: &str, read: bool, ts_secs: i64) -> Event {
     Event::MarkChatAsReadUpdate(
         wacore::types::events::MarkChatAsReadUpdate::builder()
             .jid(jid(chat))
-            .timestamp(ts(ts_secs))
+            .timestamp(ts_wire(ts_secs))
             .action(Box::new({
                 let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
                     Default::default();

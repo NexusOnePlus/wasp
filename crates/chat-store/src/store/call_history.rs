@@ -17,7 +17,7 @@ pub(super) fn apply(conn: &mut SqliteConnection, device: i32, event: &Event) -> 
             Some(call.call_id.as_str()),
             Some(&call.call_creator_jid),
             Some(call.from_me),
-            call.timestamp.timestamp_millis(),
+            call.timestamp.as_millis(),
         ),
         Event::CallLogHistory(call) => (
             &*call.record,

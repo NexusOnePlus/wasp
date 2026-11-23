@@ -135,7 +135,7 @@ mod call_alert_tests {
             caller_jid: "999000@s.whatsapp.net".into(),
             is_video: true,
             is_offline: false,
-            received_at: wacore::time::now_utc(),
+            received_at: velo_core::now(),
         }
     }
 

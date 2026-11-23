@@ -185,7 +185,7 @@ fn day_label(day: chrono::NaiveDate, today: chrono::NaiveDate) -> String {
 impl Render for CallHistory {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let metrics = cx.product().metrics;
-        let today = wacore::time::now_utc().with_timezone(&Local).date_naive();
+        let today = velo_core::now().with_timezone(&Local).date_naive();
         let rows: Vec<&Row> = self
             .calls
             .iter()

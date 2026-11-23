@@ -40,9 +40,11 @@ mod quoted;
 mod rich_text;
 mod status;
 mod system_notice;
+mod time;
 pub use group_membership::{
     GroupMembership, MembershipAction, NoticeParticipant, format_phone_jid,
 };
+pub use time::{from_wacore, now};
 mod video;
 
 pub use account::{AccountId, InvalidAccountId};

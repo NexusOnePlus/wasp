@@ -51,7 +51,7 @@ pub fn render_chat_item(
     let menu_unread = has_unread;
     let menu_muted = row
         .muted_until
-        .is_some_and(|until| until > wacore::time::now_utc());
+        .is_some_and(|until| until > velo_core::now());
 
     // The row's own ground, which the avatar's badge rings itself in.
     let ground = if is_selected {
@@ -257,7 +257,7 @@ fn render_name_row(
         )
         .children(
             row.muted_until
-                .filter(|until| *until > wacore::time::now_utc())
+                .filter(|until| *until > velo_core::now())
                 .map(|_| {
                     Icon::new(crate::components::ProductIcon::BellOff)
                         .flex_shrink_0()

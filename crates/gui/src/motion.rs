@@ -33,7 +33,7 @@ pub const BREATH: Duration = Duration::from_millis(1400);
 pub const FRESH_WINDOW: chrono::TimeDelta = chrono::TimeDelta::seconds(4);
 
 pub fn is_fresh(at: chrono::DateTime<chrono::Utc>) -> bool {
-    let age = wacore::time::now_utc() - at;
+    let age = velo_core::now() - at;
     age >= chrono::TimeDelta::zero() && age < FRESH_WINDOW
 }
 
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn only_just_arrived_messages_are_fresh() {
-        let now = wacore::time::now_utc();
+        let now = velo_core::now();
         assert!(is_fresh(now));
         assert!(!is_fresh(now - chrono::TimeDelta::seconds(30)));
         // A clock skewed into the future does not animate forever.
