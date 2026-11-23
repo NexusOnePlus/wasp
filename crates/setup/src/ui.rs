@@ -33,9 +33,17 @@ pub fn run() {
     let args: Vec<String> = std::env::args().collect();
     let uninstall = args.iter().any(|a| a == "--uninstall") || system::is_installed_copy();
     let quiet = args.iter().any(|a| a == "--quiet");
+    // The updater starts this installer from the window it is replacing and
+    // cannot show it a window, so the relaunch has to be asked for here. Set
+    // by the interactive window too, where "open when done" is already the
+    // default and the flag changes nothing.
+    let restart = args.iter().any(|a| a == "--restart");
     if quiet {
-        // Unattended: what a package manager or "Installed apps" asks for.
-        let _ = if uninstall {
+        // Unattended: what a package manager, "Installed apps", or the
+        // in-app updater asks for. `--restart` starts the new window after
+        // an install; the updater has already closed the old one and
+        // would otherwise leave nothing running at all.
+        let result = if uninstall {
             system::uninstall(false, &|_| {})
         } else {
             system::install(
@@ -46,6 +54,9 @@ pub fn run() {
                 &|_| {},
             )
         };
+        if result.is_ok() && restart && !uninstall {
+            system::launch();
+        }
         return;
     }
 

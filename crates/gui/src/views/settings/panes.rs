@@ -33,7 +33,7 @@ pub fn render(
         SettingsSection::AudioVideo => super::devices::render(app, entity.clone(), metrics, cx),
         SettingsSection::Privacy => privacy(entity.clone(), metrics, cx),
         SettingsSection::Storage => storage(app, entity, metrics, cx),
-        SettingsSection::Advanced => advanced(entity, metrics, cx),
+        SettingsSection::Advanced => advanced(app, entity, metrics, cx),
         SettingsSection::Plugins => plugins(app, entity, metrics, cx),
         // Rendered by its own module.
         SettingsSection::Appearance => div().into_any_element(),
@@ -416,6 +416,9 @@ fn account(
             .map(|a| a.status.clone())
             .unwrap_or_else(|| crate::tr!(NotLinked).to_string()),
     ));
+    if let Some(synced) = account.as_ref().and_then(|a| a.last_synced.clone()) {
+        lines.push((crate::tr!(LastSynced).to_string(), synced));
+    }
 
     group(
         label(crate::tr!(LinkedDevice), metrics, cx),
@@ -877,7 +880,12 @@ fn files(count: u64) -> String {
 /// a person can only set by restarting the client from a terminal they may
 /// not have, and one a page has never had at all. What is drawn now takes
 /// effect in this window and in the daemon at once, and is remembered.
-fn advanced(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElement {
+fn advanced(
+    app: &WhatsAppApp,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> AnyElement {
     let active = velo_logging::current();
     // A level given for this run from outside — `RUST_LOG` on a desktop,
     // `?log=` in a page — is what the process *started* at. Said rather than
@@ -960,12 +968,70 @@ fn advanced(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyEleme
         .flex_col()
         .gap(metrics.space_xxl())
         .child(diagnostics)
+        .when(crate::platform::updater::supported(), |el| {
+            el.child(updates(app, entity.clone(), metrics, cx))
+        })
         .child(group(
             label("Keyboard shortcuts", metrics, cx),
             card(shortcuts(), metrics, cx),
             metrics,
         ))
         .into_any_element()
+}
+
+/// The nightly-about card: which channel this is, where it stands, and the one
+/// button that checks or installs.
+fn updates(
+    app: &WhatsAppApp,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> AnyElement {
+    let revision = crate::platform::updater::current_revision().unwrap_or("—");
+    let status = app.update_status();
+    let busy = app.update_busy();
+    let ready = app.update_ready();
+    let action = app.update_action_label();
+
+    group(
+        label(crate::tr!(UpdatesSection), metrics, cx),
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.space_lg())
+            .child(card(
+                vec![
+                    (
+                        crate::tr!(Channel).to_string(),
+                        crate::tr!(NightlyChannel).to_string(),
+                    ),
+                    (
+                        "Version".to_string(),
+                        format!("{} ({revision})", env!("CARGO_PKG_VERSION")),
+                    ),
+                    (crate::tr!(Status).to_string(), status),
+                ],
+                metrics,
+                cx,
+            ))
+            .child(
+                Button::new("update-action")
+                    .label(action)
+                    .primary()
+                    .disabled(busy)
+                    .on_click(move |_, _window, cx| {
+                        entity.update(cx, |app, cx| {
+                            if ready {
+                                app.install_update(cx);
+                            } else {
+                                app.check_for_updates(cx);
+                            }
+                        });
+                    }),
+            ),
+        metrics,
+    )
+    .into_any_element()
 }
 
 /// The window's shortcuts, as a table. Written here by hand rather than read
