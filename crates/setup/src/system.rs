@@ -56,7 +56,7 @@ pub enum Step {
 }
 
 pub fn install_dir() -> PathBuf {
-    local_app_data().join("Programs").join("Velo")
+    local_app_data().join("Programs").join("Wasp")
 }
 
 fn local_app_data() -> PathBuf {

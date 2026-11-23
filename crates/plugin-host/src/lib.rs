@@ -69,7 +69,10 @@ pub(crate) use loader::{only_this_user_can_write, write_private};
 // `loader` with the code that answers them — and the tests only build where
 // there is a filesystem to answer one.
 #[cfg(test)]
-use loader::{create_private_dir, discover, modules_in, plugin_id, usable_state_dir};
+use loader::{discover, modules_in, plugin_id, usable_state_dir};
+// Only the Unix test below needs this, and only a Unix build can run it.
+#[cfg(all(test, unix))]
+use loader::create_private_dir;
 #[cfg(test)]
 use std::path::{Path, PathBuf};
 

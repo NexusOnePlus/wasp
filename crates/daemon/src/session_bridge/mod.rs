@@ -486,7 +486,7 @@ pub async fn run(
             log::error!(
                 "local state was NOT reset: the session is still closing, and resetting the \
                  account from under it could let it repopulate what the reset just cleared. \
-                 Start Velo again and repeat \"clear data and pair again\"."
+                 Start Wasp again and repeat \"clear data and pair again\"."
             );
             disposition.incomplete()
         } else {
@@ -496,7 +496,7 @@ pub async fn run(
     } else {
         if !closed || !plugins_closed {
             log::error!(
-                "account {} did not close; restart Velo before retrying",
+                "account {} did not close; restart Wasp before retrying",
                 account_id.get()
             );
         }
@@ -564,7 +564,7 @@ pub async fn finish_forget(
         log::error!(
             "local state was NOT reset: the plugins' recorded permissions could not be \
              cleared, and resetting now would let them outlive the account that granted them. \
-             Start Velo again and repeat \"clear data and pair again\"."
+             Start Wasp again and repeat \"clear data and pair again\"."
         );
         return disposition.incomplete();
     }

@@ -1,0 +1,196 @@
+# Manual backup for the platforms Wasp does not ship to.
+#
+# Windows is the support target and `ci.yml` is what gates a push. This file
+# keeps the Linux, macOS and browser checks reachable without making every
+# change on `main` pay for three more runners. It never runs on its own.
+name: CI (other platforms)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-other-platforms-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The target dir is restored from cache each run, so incremental state is
+  # always cold: it cannot speed anything up and only inflates what gets
+  # cached. (rust-cache sets this too; stating it here keeps the reason
+  # visible next to the setting that depends on it.)
+  CARGO_INCREMENTAL: "0"
+  # Full DWARF is a quarter of the cached target dir and buys nothing here:
+  # a panic's file and line come from `panic::Location`, which is compiled in
+  # regardless, and line tables keep backtraces readable when RUST_BACKTRACE
+  # is on. Measured on this workspace: 2.4 GB -> 1.8 GB, same build time.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  linux:
+    name: Check (linux-x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.100.0"
+      # Installed rather than cached. The caching action decides for itself
+      # whether a package is already present, and when it decides wrong it
+      # says "No packages to install" and succeeds — so the job fails much
+      # later, at the linker, with `unable to find library -lasound`.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libwayland-dev libxcb1-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libfontconfig1-dev libfreetype6-dev
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: protoc,cargo-nextest@0.9.150
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          key: other-linux-${{ hashFiles('Cargo.toml') }}
+          cache-on-failure: "true"
+      - run: cargo check --workspace --all-targets --all-features
+      - run: cargo nextest run --workspace --all-features
+
+  macos:
+    name: Check (macos-aarch64)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.100.0"
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          key: other-macos-${{ hashFiles('Cargo.toml') }}
+          cache-on-failure: "true"
+      - run: cargo check --workspace --all-targets --all-features
+      # The same tests the old cross-platform job ran: the transport, the
+      # session and the platform-sensitive GUI logic.
+      - name: Test the platform-sensitive crates
+        run: cargo test -p velo-ipc -p velo-daemon -p velo-core -p velo-video -p velo-session --all-features
+      - name: Test avatar cache recovery without a display
+        run: cargo test -p velo-gui --all-features session::avatar::tests
+
+  # The web half, run in a browser rather than checked.
+  #
+  # This job exists because of what its absence let through. The whole of
+  # `daemon::plugins::web` — the OPFS folder a page installs into, lists and
+  # loads from — is `#[cfg(target_family = "wasm")]`, so `cargo test
+  # --workspace` does not compile a line of it, let alone run one. Checking
+  # would not have caught it either — it compiled. Only running it in a
+  # browser does, which is what `wasm-bindgen-test-runner` and a headless
+  # Chrome are here for.
+  web:
+    name: Test (web)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.100.0"
+          targets: wasm32-unknown-unknown
+          # For the shared-view ban below. This action installs only what it
+          # is told to, so an unnamed component is an absent one.
+          components: clippy
+      # `waproto` generates code with protoc, which is a host build even
+      # though the artifact is wasm.
+      #
+      # The runner has to match the `wasm-bindgen` crate this workspace
+      # resolves, exactly — the generated glue and the runner are two halves
+      # of one version — so it is pinned here and moves when Cargo.lock does.
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: protoc,wasm-bindgen-cli@0.2.129
+      # rust-cache hashes installed compilers; include the shared-test pin.
+      - name: Install nightly for shared WASM tests
+        run: rustup toolchain install nightly-2026-10-29 --profile minimal --component rust-src --target wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          key: other-web-${{ hashFiles('Cargo.toml') }}
+          cache-on-failure: "true"
+      # The shared-view ban, and the only place it can be checked: these
+      # crates' browser bindings are compiled for no other target, so the
+      # workspace job never sees a line of them. A `--shared-memory` build
+      # makes every Rust slice a `SharedArrayBuffer` view, and the
+      # specifications refuse those — which has cost three outages here, each
+      # one compiling perfectly and throwing at run time. `clippy.toml` names
+      # the banned spellings; this is what runs them.
+      #
+      # Only that rule, deliberately: these crates have never been clippy'd
+      # for wasm and carry lints of their own (an `Arc` that is `!Send` is
+      # what the single-threaded web design *is*). Adopting the whole surface
+      # is a cleanup with its own PR; making this class impossible is not.
+      - name: Refuse a shared view into a browser API
+        env:
+          RUSTFLAGS: --cfg web_sys_unstable_apis
+        run: |
+          cargo clippy -p velo-audio -p velo-session \
+            --target wasm32-unknown-unknown -- \
+            -A clippy::all -A warnings \
+            -D clippy::disallowed_methods -D clippy::disallowed_types
+      # Chrome and its driver are on the image already. `CHROMEWEBDRIVER` is
+      # the directory holding the driver and the runner wants the binary, so
+      # it is joined in the shell rather than in an `env:` expression — the
+      # `env` context there holds only what this file defines, and an image
+      # variable read through it comes out empty.
+      - name: Test the web half in a browser
+        env:
+          # Web Locks — `navigator.locks`, which the install path takes so two
+          # tabs cannot grow the same folder past its budget — are behind
+          # web-sys's unstable gate. Setting `RUSTFLAGS` also replaces the
+          # root config's flags for this target, which is right: those are the
+          # web *front end's* atomics and shared memory, and a test module
+          # built with them needs isolation headers this runner does not
+          # serve.
+          RUSTFLAGS: --cfg web_sys_unstable_apis
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: |
+          export CHROMEDRIVER="${CHROMEWEBDRIVER:-}/chromedriver"
+          test -x "$CHROMEDRIVER" || CHROMEDRIVER=$(command -v chromedriver)
+          cargo test -p velo-daemon -p velo-session --lib --target wasm32-unknown-unknown
+          CARGO_TARGET_DIR=target/webcodecs-tests cargo test \
+            --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
+            --locked --target wasm32-unknown-unknown --test readback --test recovery --test transform
+          # Audio needs autoplay; shared-view rejection needs SharedArrayBuffer.
+          export WASM_BINDGEN_TEST_WEBDRIVER_JSON="$RUNNER_TEMP/call-playout-webdriver.json"
+          printf '%s\n' '{"goog:chromeOptions":{"args":["--enable-features=SharedArrayBuffer","--autoplay-policy=no-user-gesture-required"]}}' > "$WASM_BINDGEN_TEST_WEBDRIVER_JSON"
+          cargo test -p velo-audio --target wasm32-unknown-unknown --test call_audio_lifecycle
+          CARGO_TARGET_DIR=target/call-playout-browser cargo test \
+            --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
+            --locked --target wasm32-unknown-unknown --test browser
+      - name: Test production audio and WebCodecs with shared WASM memory
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: |
+          unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+          export CHROMEDRIVER="${CHROMEWEBDRIVER:-}/chromedriver"
+          test -x "$CHROMEDRIVER" || CHROMEDRIVER=$(command -v chromedriver)
+          export WASM_BINDGEN_TEST_WEBDRIVER_JSON="$RUNNER_TEMP/call-playout-webdriver.json"
+          # Inherit the web bundle's root flags and rebuild std, as Pages does.
+          CARGO_TARGET_DIR=target/webcodecs-shared cargo +nightly-2026-10-29 test \
+            --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
+            --locked --target wasm32-unknown-unknown -Z build-std=std,panic_abort \
+            --test readback --test recovery --test transform
+          CARGO_TARGET_DIR=target/call-playout-shared cargo +nightly-2026-10-29 test \
+            --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
+            --locked --target wasm32-unknown-unknown -Z build-std=std,panic_abort --test browser
+          CARGO_TARGET_DIR=target/call-audio-shared cargo +nightly-2026-10-29 test \
+            -p velo-audio --target wasm32-unknown-unknown \
+            -Z build-std=std,panic_abort --test call_audio_lifecycle

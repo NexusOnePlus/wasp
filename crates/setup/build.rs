@@ -5,7 +5,7 @@
 //! executable with "setup" in its name is an installer that needs an
 //! administrator, and raises a UAC prompt for it — unless the manifest says
 //! `asInvoker`. gpui's own manifest, linked into every app it builds, says
-//! exactly that; Velo installs per user and asks for nothing more.
+//! exactly that; Wasp installs per user and asks for nothing more.
 //!
 //! The payload is read from `WASP_PAYLOAD_DIR` when it is set (the release
 //! task sets it after building the program) and compressed into

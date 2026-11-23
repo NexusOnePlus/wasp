@@ -65,7 +65,7 @@ pub fn fetch(cx: &App, url: String) -> Task<Result<LinkPreview, String>> {
         // the title in a few hundred bytes, and the thumbnail addresses are
         // derivable from the video id, so the page is not needed at all.
         if let Some(id) = youtube_id(&url) {
-            return Ok(youtube_preview(&client, &url, &id).await);
+            return Ok(youtube_preview(&client, &url, id).await);
         }
         let html = match get(&client, &url, MAX_HTML_BYTES).await {
             Ok(html) => html,
@@ -174,11 +174,11 @@ async fn youtube_preview(client: &Arc<dyn HttpClient>, url: &str, id: &str) -> L
     }
     let mut thumbnail = Vec::new();
     for candidate in candidates {
-        if let Some(bytes) = fetch_image(client, &candidate).await {
-            if let Some(jpeg) = jpeg_thumbnail(&bytes) {
-                thumbnail = jpeg;
-                break;
-            }
+        if let Some(bytes) = fetch_image(client, &candidate).await
+            && let Some(jpeg) = jpeg_thumbnail(&bytes)
+        {
+            thumbnail = jpeg;
+            break;
         }
     }
     LinkPreview {

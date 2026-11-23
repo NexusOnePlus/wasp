@@ -10,9 +10,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/NexusOnePlus/wasp/releases/latest/download/Wasp-Setup-1.2.0-x64.exe"><b>⬇ Download Wasp 1.2 for Windows</b></a>
+  <a href="https://github.com/NexusOnePlus/wasp/releases"><b>⬇ Download Wasp for Windows</b></a>
   &nbsp;·&nbsp; Windows 10 &amp; 11, 64-bit &nbsp;·&nbsp; free
-  <br><sub><a href="https://github.com/NexusOnePlus/wasp/releases/latest">All downloads, portable zip and checksums</a></sub>
+  <br><sub>Nightly builds, portable zip and SHA-256 checksums are on the <a href="https://github.com/NexusOnePlus/wasp/releases">releases page</a></sub>
 </p>
 
 ---
@@ -90,7 +90,7 @@ It also keeps running in the tray when you close the window, so messages and cal
 
 ## Install
 
-1. Download the **`Wasp-Setup-…-x64.exe`** installer from the [latest release](https://github.com/NexusOnePlus/wasp/releases/latest).
+1. Download the **`Wasp-Setup-…-x64.exe`** installer from the [releases page](https://github.com/NexusOnePlus/wasp/releases).
 2. Run it and press **Install**. It installs just for you, with no administrator prompt.
 3. Open Wasp, then on your phone go to **WhatsApp → Settings → Linked devices → Link a device** and scan the QR code.
 

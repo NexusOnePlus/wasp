@@ -2479,7 +2479,7 @@ impl WhatsAppApp {
                 labels
                     .entry(message.id.clone())
                     .or_default()
-                    .push(self.receipt_name(&chat, reader));
+                    .push(self.receipt_name(chat, reader));
             }
         }
         for names in labels.values_mut() {
@@ -5975,7 +5975,7 @@ mod tests {
             jid: "author@example.invalid".into(),
             name: "Author".into(),
             updates: vec![0],
-            latest: chrono::Utc::now(),
+            latest: wacore::time::now_utc(),
             unseen: 0,
         };
         let source = app.read_with(cx, |app, _| {

@@ -9,7 +9,11 @@
 use tokio::io::AsyncBufReadExt as _;
 use velo_ipc::{ClientScope, PROTOCOL_VERSION};
 
-use super::accept::{acquire_startup_lock, prepare_state_dir, reject};
+use super::accept::{acquire_startup_lock, reject};
+// Only the Unix tests below need this; on Windows the state directory is
+// already under the user's profile.
+#[cfg(unix)]
+use super::accept::prepare_state_dir;
 use super::handshake::{Attached, check_hello, handshake, read_frame};
 use super::requests::handle_request;
 use super::*;

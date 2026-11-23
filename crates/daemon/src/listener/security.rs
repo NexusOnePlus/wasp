@@ -46,7 +46,7 @@ impl UserOnly {
         // SAFETY: the buffer came from that call and outlives every use below.
         let sid = unsafe { velo_ipc::windows_user::sid_of(&token) };
 
-        let mut access = EXPLICIT_ACCESS_W {
+        let access = EXPLICIT_ACCESS_W {
             grfAccessPermissions: FILE_ALL_ACCESS,
             grfAccessMode: SET_ACCESS,
             grfInheritance: NO_INHERITANCE,
@@ -63,7 +63,7 @@ impl UserOnly {
         let mut acl: *mut ACL = std::ptr::null_mut();
         // SAFETY: one initialized entry, no ACL to merge with, and `acl` is a
         // valid out-pointer.
-        let status = unsafe { SetEntriesInAclW(1, &mut access, std::ptr::null(), &mut acl) };
+        let status = unsafe { SetEntriesInAclW(1, &access, std::ptr::null(), &mut acl) };
         if status != 0 {
             return Err(io::Error::from_raw_os_error(status as i32));
         }

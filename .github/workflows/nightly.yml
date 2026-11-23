@@ -23,17 +23,11 @@ jobs:
     with:
       version: nightly
 
-  # The same client as a page, packaged so it can be hosted without being
-  # built. It is a separate workflow rather than a fourth matrix entry because
-  # nothing about it matches: a shared-memory target, a rebuilt standard library,
-  # trunk, and one artifact rather than one per platform.
-  web:
-    uses: ./.github/workflows/web-bundle.yml
-    with:
-      version: nightly
-
+  # The same client as a page used to be published from here too. The app
+  # ships to Windows only; the web bundle is still buildable by hand through
+  # `web-bundle.yml`, and the Pages workflow is unchanged.
   publish:
-    needs: [build, web]
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -49,12 +43,12 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          (cd artifacts && sha256sum wasp-* > checksums.sha256)
+          (cd artifacts && sha256sum wasp-* Wasp-* > checksums.sha256)
           cat > notes.md <<'NOTES'
           Unsigned development build of `main`. Expect breakage.
 
-          Download the archive for your platform and unpack it. It holds three
-          binaries that belong together, and they must stay in the same
+          Download `wasp-nightly-windows-x86_64.zip` and unpack it. It holds
+          three binaries that belong together, and they must stay in the same
           directory:
 
           - `wasp` is the window.
@@ -63,21 +57,10 @@ jobs:
           - `wasp-cli` is the scriptable front end onto that same daemon,
             for use from a terminal or a script.
 
-          The tarballs carry the execute bit. On macOS, clear the quarantine
-          flag before the first run:
+          `Wasp-Setup-nightly-x64.exe` installs the same three binaries for the
+          current user, with no administrator prompt.
 
-              xattr -dr com.apple.quarantine wasp waspd wasp-cli
-
-          On Windows, SmartScreen will object. All of this follows from the
-          binaries being unsigned.
-
-          `wasp-nightly-web.zip` is the same client as a web page: the
-          bundle published to GitHub Pages, built to be served from anywhere
-          rather than from one directory. Unpack it and serve the files with
-          any static web server — over HTTPS or from `localhost`, and with
-          `coi-serviceworker.js` left beside `index.html`, which is what
-          obtains the cross-origin isolation the window needs. `README.md`
-          inside says the rest.
+          SmartScreen will object to both. The binaries are unsigned.
           NOTES
           echo "" >> notes.md
           echo "Built from [\`${GITHUB_SHA:0:7}\`](https://github.com/$GH_REPO/commit/$GITHUB_SHA) on $(date -u +"%Y-%m-%d %H:%M") UTC." >> notes.md

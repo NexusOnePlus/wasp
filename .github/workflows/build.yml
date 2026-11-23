@@ -48,22 +48,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 22.04, not latest: the binary links against the runner's glibc, and
-          # this keeps the floor low enough for stable distributions.
-          - name: linux-x86_64
-            os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - name: linux-aarch64
-            os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-          # Apple Silicon only. The macos-13 (Intel) pool queues for tens of
-          # minutes on free runners, and an Intel build would hold the whole
-          # nightly behind it. Intel Macs can be covered later by building both
-          # targets here and joining them with `lipo`, at the cost of doubling
-          # this job.
-          - name: macos-aarch64
-            os: macos-15
-            target: aarch64-apple-darwin
+          # Windows is the only platform the app ships to. The other targets
+          # are still buildable by hand; this workflow no longer publishes them.
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -79,19 +65,6 @@ jobs:
         with:
           toolchain: "1.100.0"
           targets: ${{ matrix.target }}
-
-      - name: Install Linux system dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          # `--no-install-recommends`: what these headers recommend is
-          # documentation and tooling nothing links against, and it is a
-          # download and an unpack on every run of every job that needs them.
-          sudo apt-get install -y --no-install-recommends \
-            libasound2-dev libxkbcommon-dev \
-            libxkbcommon-x11-dev libwayland-dev libxcb1-dev \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libfontconfig1-dev libfreetype6-dev
 
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
@@ -184,6 +157,47 @@ jobs:
             "target/$env:TARGET/release/wasp-cli.exe"
           )
 
+      # The installer is the file most people download, and it carries the
+      # three binaries plus their licences. Built here rather than only on a
+      # release manager's machine so nightly and tagged releases publish the
+      # same artifact. It is unsigned only when the binaries above were.
+      - name: Build the Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $payload = "target/$env:TARGET/wasp-payload"
+          New-Item -ItemType Directory -Force $payload | Out-Null
+          foreach ($file in 'wasp.exe', 'waspd.exe', 'wasp-cli.exe') {
+            Copy-Item "target/$env:TARGET/release/$file" $payload
+          }
+          Copy-Item packaging/release/LICENSE.txt $payload
+          Copy-Item packaging/release/THIRD-PARTY-NOTICES.txt $payload
+          $env:WASP_PAYLOAD_DIR = (Resolve-Path $payload).Path
+          cargo build --release --target $env:TARGET -p wasp-setup
+          if ($LASTEXITCODE -ne 0) { throw 'building the installer failed' }
+          Copy-Item "target/$env:TARGET/release/wasp-setup.exe" "Wasp-Setup-$env:VERSION-x64.exe"
+
+      - name: Sign the Windows installer
+        if: runner.os == 'Windows' && steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          WINDOWS_SIGNING_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_THUMBPRINT }}
+        run: ./packaging/windows/sign.ps1 -Files "Wasp-Setup-$env:VERSION-x64.exe"
+
+      - name: Upload the Windows installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wasp-setup-${{ matrix.name }}
+          path: Wasp-Setup-${{ inputs.version }}-x64.exe
+          if-no-files-found: error
+
       - name: Package the binaries for their platform
         shell: bash
         # Through the environment, not into the script. `release.yml` takes a
@@ -203,52 +217,33 @@ jobs:
               exit 1
               ;;
           esac
-          # One archive per platform, and the platform is in its *file* name.
-          # A directory would not do: `upload-artifact` stores a directory's
-          # contents at the artifact root, and the publish jobs download every
-          # platform with `merge-multiple`, so three sets of identically named
-          # binaries would land on top of each other and only one platform
-          # would survive into the release.
+          # One archive, and the platform is in its *file* name. A directory
+          # would not do: `upload-artifact` stores a directory's contents at
+          # the artifact root, and the publish job downloads them with
+          # `merge-multiple`, so the files would land loose beside the
+          # installer instead of inside their own archive.
           out="wasp-$VERSION-$PLATFORM"
           mkdir -p "$out"
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            mv "target/$TARGET/release/wasp.exe" "$out/"
-            mv "target/$TARGET/release/waspd.exe" "$out/"
-            mv "target/$TARGET/release/wasp-cli.exe" "$out/"
-            7z a -tzip "$out.zip" "$out" > /dev/null
-            echo "ASSET=$out.zip" >> "$GITHUB_ENV"
-          else
-            mv "target/$TARGET/release/wasp" "$out/"
-            mv "target/$TARGET/release/waspd" "$out/"
-            mv "target/$TARGET/release/wasp-cli" "$out/"
-            # Preserving the execute bit, which the bare binaries never had:
-            # an archive can carry it where a raw asset download cannot.
-            chmod +x "$out/wasp" "$out/waspd" "$out/wasp-cli"
-            if [ "${{ runner.os }}" = "Linux" ]; then
-              cp packaging/linux/install-desktop.sh packaging/linux/io.github.NexusOnePlus.Wasp.png "$out/"
-              chmod +x "$out/install-desktop.sh"
-            fi
-            tar -czf "$out.tar.gz" "$out"
-            echo "ASSET=$out.tar.gz" >> "$GITHUB_ENV"
-          fi
+          mv "target/$TARGET/release/wasp.exe" "$out/"
+          mv "target/$TARGET/release/waspd.exe" "$out/"
+          mv "target/$TARGET/release/wasp-cli.exe" "$out/"
+          7z a -tzip "$out.zip" "$out" > /dev/null
+          echo "ASSET=$out.zip" >> "$GITHUB_ENV"
 
       - name: Verify archive contents and binary architecture
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
           PLATFORM: ${{ matrix.name }}
-        run: python3 .github/scripts/check-release.py "$ASSET" "$VERSION" "$PLATFORM"
+        run: python .github/scripts/check-release.py "$ASSET" "$VERSION" "$PLATFORM"
 
       - name: Run the packaged CLI on its native runner
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
           PLATFORM: ${{ matrix.name }}
-          RUNNER_OS: ${{ runner.os }}
         run: |
-          cli="./wasp-$VERSION-$PLATFORM/wasp-cli"
-          if [ "$RUNNER_OS" = "Windows" ]; then cli="$cli.exe"; fi
-          "$cli" --help
+          "./wasp-$VERSION-$PLATFORM/wasp-cli.exe" --help
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
