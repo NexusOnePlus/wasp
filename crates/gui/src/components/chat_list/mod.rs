@@ -53,6 +53,12 @@ pub struct AccountSummary {
     pub name: String,
     pub status: String,
     pub is_healthy: bool,
+    /// When the link last became ready, formatted for display.
+    ///
+    /// `None` when this window has never seen it connect — a freshly opened
+    /// window onto an existing session, for instance — so Settings omits the
+    /// row rather than inventing a time.
+    pub last_synced: Option<String>,
     /// The account's own profile picture, from its own chat, when loaded.
     pub avatar_key: Option<String>,
 }
@@ -406,15 +412,28 @@ fn render_empty(
             reset_entity.update(cx, |app, cx| app.set_chat_filter(ChatFilter::All, cx));
         })
     } else {
-        EmptyState::new(match props.destination {
-            Destination::Channels => crate::tr!(NoChannelsYet),
-            Destination::Communities => crate::tr!(NoCommunitiesYet),
-            _ => crate::tr!(NoChatsYet),
-        })
-        .icon(IconName::Inbox)
-        .description(crate::tr!(
-            ConversationsAppearHereOnceYourPhoneFinishesSyncing
-        ))
+        // Each destination says what actually has to happen for it to fill.
+        // "Once your phone finishes syncing" is true of a chat list on a fresh
+        // pair and false of a channels list on a device that synced days ago,
+        // and an empty state that describes the wrong cause sends the person
+        // looking in the wrong place.
+        let (title, description) = match props.destination {
+            Destination::Channels => (
+                crate::tr!(NoChannelsYet),
+                crate::tr!(ChannelsYouFollowAppearHereAfterYourPhoneSharesThem),
+            ),
+            Destination::Communities => (
+                crate::tr!(NoCommunitiesYet),
+                crate::tr!(CommunitiesAppearHereOnceYourPhoneSharesTheirGroups),
+            ),
+            _ => (
+                crate::tr!(NoChatsYet),
+                crate::tr!(ConversationsAppearHereOnceYourPhoneFinishesSyncing),
+            ),
+        };
+        EmptyState::new(title)
+            .icon(IconName::Inbox)
+            .description(description)
     };
 
     div()

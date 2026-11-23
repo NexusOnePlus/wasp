@@ -97,7 +97,7 @@ pub fn scale_media_dimensions(width: u32, height: u32, max_size: f32) -> (f32, f
 /// out a full date on every row would make the column unscannable.
 pub fn format_list_time(timestamp: &DateTime<Utc>) -> String {
     let local: DateTime<Local> = timestamp.with_timezone(&Local);
-    let today = wacore::time::now_utc().with_timezone(&Local).date_naive();
+    let today = velo_core::now().with_timezone(&Local).date_naive();
     let date = local.date_naive();
 
     match (today - date).num_days() {
@@ -118,7 +118,7 @@ pub fn format_list_time(timestamp: &DateTime<Utc>) -> String {
 /// is what the hour tells you.
 pub fn format_status_time(timestamp: &DateTime<Utc>) -> String {
     let local: DateTime<Local> = timestamp.with_timezone(&Local);
-    let today = wacore::time::now_utc().with_timezone(&Local).date_naive();
+    let today = velo_core::now().with_timezone(&Local).date_naive();
 
     match (today - local.date_naive()).num_days() {
         0 => local.format(crate::tr!(TodayAtHM)).to_string(),
@@ -127,10 +127,29 @@ pub fn format_status_time(timestamp: &DateTime<Utc>) -> String {
     }
 }
 
+/// When the device last reached WhatsApp, for the Settings account card.
+///
+/// A full date and clock, unlike a chat row: the reader is checking whether a
+/// sync happened today or whether the link has been up since some older
+/// moment, not counting minutes since it. `format_list_time` would answer the
+/// second question and hide the year.
+pub fn format_sync_time(timestamp: &DateTime<Utc>) -> String {
+    timestamp
+        .with_timezone(&Local)
+        .format(
+            if crate::i18n::Language::current() == crate::i18n::Language::Portuguese {
+                "%d/%m/%Y %H:%M"
+            } else {
+                "%d %b %Y %H:%M"
+            },
+        )
+        .to_string()
+}
+
 /// The heading over a group of messages sent on the same day.
 pub fn format_date_divider(timestamp: &DateTime<Utc>) -> String {
     let local: DateTime<Local> = timestamp.with_timezone(&Local);
-    let today = wacore::time::now_utc().with_timezone(&Local).date_naive();
+    let today = velo_core::now().with_timezone(&Local).date_naive();
 
     match (today - local.date_naive()).num_days() {
         0 => crate::tr!(Today).to_string(),

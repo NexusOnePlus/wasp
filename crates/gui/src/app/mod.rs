@@ -37,6 +37,7 @@ mod search;
 pub(crate) mod settings;
 mod status;
 mod timeline_ctl;
+mod updates;
 mod viewer;
 
 pub use calls::CallCard;
@@ -1231,6 +1232,16 @@ pub struct WhatsAppApp {
     /// The same account's LID. A chat with your own number can be keyed by
     /// either alias, and neither string matches the other.
     account_lid: Option<String>,
+    /// When this window last reached WhatsApp with the account ready.
+    ///
+    /// Settings shows it beside the status, because "synced" is a claim
+    /// about a moment: without one it reads the same after a reconnect as
+    /// it did on the first pair, and the person cannot tell a
+    /// healthy link from one that has not moved since yesterday.
+    synced_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The nightly check and the answer it last produced. See
+    /// [`updates`].
+    updates: updates::Updates,
     /// Every plugin the daemon loaded, what each wants drawn, and the boxes
     /// this window holds for their text fields. See [`plugins_ctl`].
     plugins: Entity<plugins_ctl::Plugins>,
@@ -2014,6 +2025,8 @@ impl WhatsAppApp {
             account_name: None,
             account_jid: None,
             account_lid: None,
+            synced_at: None,
+            updates: updates::Updates::new(),
             settings: cx.new(|_| settings::Settings::new()),
             status_tick: None,
             heartbeat: None,
@@ -2343,6 +2356,7 @@ impl WhatsAppApp {
                 _ => crate::tr!(LinkedReconnecting).to_string(),
             },
             is_healthy: connected,
+            last_synced: self.synced_at.map(|at| crate::utils::format_sync_time(&at)),
             // The account's own picture is its "You" chat's picture: the
             // same fetched, cached image, not a second request.
             avatar_key: self
@@ -4347,8 +4361,13 @@ impl WhatsAppApp {
             let send_quoted = quoted;
             let send_mentions = mentions;
             cx.spawn(async move |_, cx| {
+                // Long enough for a page or an oEmbed answer on a normal
+                // connection, short enough that a person who pressed send is
+                // not left watching a bubble that has not left yet. Reddit and
+                // TikTok answer in one small request; a page that does not
+                // must not hold the message.
                 let preview =
-                    crate::platform::with_timeout(task, std::time::Duration::from_secs(8)).await;
+                    crate::platform::with_timeout(task, std::time::Duration::from_secs(3)).await;
                 let preview = match preview {
                     Some(Ok(preview)) => Some(preview),
                     Some(Err(error)) => {
@@ -5975,7 +5994,7 @@ mod tests {
             jid: "author@example.invalid".into(),
             name: "Author".into(),
             updates: vec![0],
-            latest: wacore::time::now_utc(),
+            latest: velo_core::now(),
             unseen: 0,
         };
         let source = app.read_with(cx, |app, _| {

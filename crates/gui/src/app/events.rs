@@ -33,6 +33,10 @@ impl WhatsAppApp {
                 // From here on there is a `theme.json` to watch, whether or
                 // not this session ever reaches the pairing screen.
                 self.ensure_heartbeat(cx);
+                // An installed nightly checks itself once a day; a source
+                // build has no published revision to compare and stays quiet.
+                self.watch_for_updates(cx);
+                self.watch_for_updates(cx);
                 cx.notify();
             }
             UiEvent::HistoryLoaded {
@@ -220,7 +224,7 @@ impl WhatsAppApp {
                         data: code,
                         png_bytes: Arc::new(png_bytes),
                     })
-                    .map(|qr| Issued::new(qr, timeout_secs, wacore::time::now_utc()))
+                    .map(|qr| Issued::new(qr, timeout_secs, velo_core::now()))
                     .or(previous);
                 self.app_state = AppState::WaitingForPairing {
                     qr_code: cached_qr,
@@ -238,7 +242,7 @@ impl WhatsAppApp {
                 };
                 self.app_state = AppState::WaitingForPairing {
                     qr_code,
-                    pair_code: Some(Issued::new(code, timeout_secs, wacore::time::now_utc())),
+                    pair_code: Some(Issued::new(code, timeout_secs, velo_core::now())),
                 };
                 self.ensure_heartbeat(cx);
                 cx.notify();
@@ -250,6 +254,7 @@ impl WhatsAppApp {
             UiEvent::Connected => {
                 self.recovery.update(cx, |recovering, _| recovering.stop());
                 self.app_state = AppState::Connected;
+                self.synced_at = Some(velo_core::now());
                 cx.notify();
             }
             UiEvent::LoggedOut(message) => {

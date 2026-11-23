@@ -51,6 +51,7 @@ pub mod plugins;
 pub mod prefs;
 pub mod startup;
 pub mod taskbar;
+pub mod updater;
 pub mod window_identity;
 
 pub use activity::application_is_active;

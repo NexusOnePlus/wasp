@@ -176,6 +176,8 @@ catalog! {
     NoCommunitiesYet => ("No communities yet", "Ainda não há comunidades");
     NoChatsYet => ("No chats yet", "Ainda não há conversas");
     ConversationsAppearHereOnceYourPhoneFinishesSyncing => ("Conversations appear here once your phone finishes syncing.", "As conversas aparecerão aqui quando o celular terminar de sincronizar.");
+    ChannelsYouFollowAppearHereAfterYourPhoneSharesThem => ("Channels you follow appear here after your phone shares them.", "Os canais que você segue aparecerão aqui depois que o celular compartilhá-los.");
+    CommunitiesAppearHereOnceYourPhoneSharesTheirGroups => ("Communities appear here once your phone shares their groups.", "As comunidades aparecerão aqui quando o celular compartilhar os grupos delas.");
     Status => ("Status", "Status");
     PickSomeoneOnTheLeftToSeeWhatTheyPosted => ("Pick someone on the left to see what they posted.", "Selecione alguém à esquerda para ver suas publicações.");
     PreviousUpdate => ("Previous update", "Atualização anterior");
@@ -371,6 +373,17 @@ catalog! {
     VideosNotSupported => ("Videos cannot be played in this browser.", "Este navegador não permite reproduzir vídeos.");
     ThisDevice => ("This device", "Este dispositivo");
     LinkedSynced => ("Linked device · synced", "Dispositivo conectado · sincronizado");
+    LastSynced => ("Last synced", "Sincronizado pela última vez");
+    UpdatesSection => ("Updates", "Atualizações");
+    NightlyChannel => ("Nightly", "Noturna");
+    CheckForUpdates => ("Check for updates", "Verificar atualizações");
+    InstallAndRestart => ("Install and restart", "Instalar e reiniciar");
+    NotCheckedYet => ("Not checked yet", "Ainda não verificado");
+    CheckingForUpdates => ("Checking for updates…", "Verificando atualizações…");
+    UpToDate => ("Up to date", "Atualizado");
+    NightlyRevisionIsAvailable => ("A new nightly is available", "Uma nova versão noturna está disponível");
+    DownloadingAndVerifying => ("Downloading and verifying…", "Baixando e verificando…");
+    InstallingAndRestarting => ("Installing and restarting…", "Instalando e reiniciando…");
     LocalOffline => ("Local history · offline", "histórico local · sem conexão");
     LinkedReconnecting => ("Linked device · reconnecting", "dispositivo conectado · reconectando");
     DeleteUnavailable => ("Could not delete message: the daemon is unavailable.", "Não foi possível apagar a mensagem: o serviço está indisponível.");
