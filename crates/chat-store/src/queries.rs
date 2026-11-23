@@ -2676,6 +2676,12 @@ impl ChatStore {
                     chats::chats.filter(
                         chats::device_id
                             .eq(device_id)
+                            // A channel is a destination before it has any
+                            // message: its row is created from the subscribed
+                            // list, and pruning it for being empty would make
+                            // the Channels tab lose it again until the next
+                            // message.
+                            .and(chats::jid.not_like("%@newsletter"))
                             .and(diesel::dsl::not(diesel::dsl::exists(
                                 messages::messages.filter(
                                     messages::device_id

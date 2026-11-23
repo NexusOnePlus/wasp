@@ -883,7 +883,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             }
         }
     }
-    if groups.is_empty() && channels.is_empty() {
+    if groups.is_empty() && channels.is_empty() && !request.full {
         return;
     }
     // `stop` races the network below, not just the wait for the next
@@ -900,6 +900,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     let mut settled: Vec<(String, Option<String>)> = Vec::new();
     let mut resolved: Vec<velo_chat_store::ChatNameWrite> = Vec::new();
     let mut resolved_mutes = Vec::new();
+    let mut ensure_channels: Vec<Jid> = Vec::new();
     let mut pre_channel_mutes = Default::default();
     let mut resolved_hierarchies: Vec<velo_chat_store::GroupHierarchyWrite> = Vec::new();
     let mut failed: Vec<(String, std::time::Duration)> = Vec::new();
@@ -1064,7 +1065,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             break;
         }
     }
-    if !channels.is_empty() && global_backoff.is_none() {
+    if (!channels.is_empty() || request.full) && global_backoff.is_none() {
         // One call for every subscribed channel, which is normally all of
         // them — but ONLY when the bulk call succeeds. A failed list must
         // not read as "every channel absent": that turns one transient
@@ -1088,6 +1089,12 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         match listed {
             Ok(subscribed) => {
                 let mut fallback: Vec<Jid> = Vec::new();
+                // Channels that already have a row (a message created it, or
+                // an earlier pass did). Any other subscribed channel is a
+                // destination missing only because history sync did not
+                // carry it, and is handled below.
+                let existing: HashSet<String> =
+                    channels.iter().map(|jid| jid.to_string()).collect();
                 for jid in channels {
                     match subscribed.get(&jid.to_string()) {
                         Some(meta) => {
@@ -1106,6 +1113,30 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                             }
                         }
                         None => fallback.push(jid),
+                    }
+                }
+                // A subscribed channel with no row yet is not "absent": it is a
+                // destination history sync did not create. Give it a row before
+                // its name/mute below, or the Channels destination stays empty
+                // until the first message happens to create one.
+                for (jid_str, meta) in &subscribed {
+                    if existing.contains(jid_str.as_str()) {
+                        continue;
+                    }
+                    let Ok(jid) = jid_str.parse::<Jid>() else {
+                        continue;
+                    };
+                    if !jid.is_newsletter() {
+                        continue;
+                    }
+                    ensure_channels.push(jid.clone());
+                    if let Some(muted) = meta.muted {
+                        resolved_mutes.push((jid_str.clone(), muted));
+                    }
+                    let name = meta.name.trim().to_owned();
+                    settled.push((jid_str.clone(), usable_name(&name).then(|| name.clone())));
+                    if usable_name(&name) {
+                        resolved.push(velo_chat_store::ChatNameWrite::checked(jid, None, name));
                     }
                 }
                 // A channel absent from a GOOD list is either unsubscribed
@@ -1215,7 +1246,13 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             debug!("chat-name resolver: discarding a pass from a superseded connection");
             return;
         }
-        if !resolved.is_empty()
+        if !ensure_channels.is_empty()
+            && let Err(e) = chat_store.ensure_channels(ensure_channels.clone())
+        {
+            queue_error = Some(e);
+        }
+        if queue_error.is_none()
+            && !resolved.is_empty()
             && let Err(e) = chat_store.apply_chat_names(resolved.clone())
         {
             queue_error = Some(e);
@@ -2069,6 +2106,35 @@ mod tests {
             Some("Trip planning")
         );
         assert_eq!(source.group_lookup_calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// A subscribed channel is a destination before its first message. A
+    /// full pass must create its row and name it even when history sync never
+    /// carried the chat at all.
+    #[tokio::test]
+    async fn a_subscribed_channel_with_no_history_gets_a_row_and_name() {
+        let store = test_store("channel-subscribed-only").await;
+        assert!(
+            store
+                .chat(&CHANNEL.parse().expect("channel JID"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let source = FakeMeta::with_channel(CHANNEL, "Announcements", true);
+        let signal = ChatNameResolveSignal::new();
+        signal.request_full();
+        let request = signal.next().await;
+        let mut resolver = NameResolver::new();
+        drive(&source, &store, &signal, &mut resolver, request).await;
+
+        let chat = store
+            .chat(&CHANNEL.parse().expect("channel JID"))
+            .await
+            .expect("read channel")
+            .expect("channel row created from the subscribed list");
+        assert_eq!(chat.name.as_deref(), Some("Announcements"));
     }
 
     /// A live channel message resolves through the subscribed list, with no

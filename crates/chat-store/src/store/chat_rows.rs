@@ -284,13 +284,12 @@ pub(super) fn ensure_chat(
     conn: &mut SqliteConnection,
     device_id: i32,
     chat: &str,
-) -> QueryResult<()> {
+) -> QueryResult<usize> {
     use schema::chats::dsl;
     diesel::insert_into(dsl::chats)
         .values((dsl::device_id.eq(device_id), dsl::jid.eq(chat)))
         .on_conflict_do_nothing()
-        .execute(conn)?;
-    Ok(())
+        .execute(conn)
 }
 
 /// Preferences can arrive before the initial unread/history snapshot.

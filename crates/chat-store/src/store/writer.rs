@@ -664,6 +664,19 @@ fn apply_writer_msg(
         WriterMsg::ChatNames(names) => {
             crate::store::chat_names::apply_chat_names(conn, device_id, names, cs)
         }
+        WriterMsg::EnsureChannels(channels) => {
+            for jid in channels {
+                if !jid.is_newsletter() {
+                    continue;
+                }
+                let created =
+                    crate::store::chat_rows::ensure_chat(conn, device_id, &jid.to_non_ad_string())?;
+                if created > 0 {
+                    cs.chats = true;
+                }
+            }
+            Ok(())
+        }
         WriterMsg::GroupHierarchies(writes) => {
             crate::store::group_hierarchy::apply_group_hierarchies(conn, device_id, writes, cs)
         }

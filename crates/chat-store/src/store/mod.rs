@@ -180,6 +180,10 @@ pub(crate) enum WriterMsg {
     /// name is news — like the group-subject arm — so a pass that learned
     /// nothing broadcasts nothing and the debounced reload stays quiet.
     ChatNames(Vec<ChatNameWrite>),
+    /// Subscribed channels that must exist as rows before their first
+    /// message. A channel is a first-class destination, so its row cannot
+    /// wait for history sync or an inbound message to create it.
+    EnsureChannels(Vec<Jid>),
     ChannelMutes {
         writes: Vec<(String, bool)>,
         expected: Option<crate::types::ChannelMuteSnapshot>,
@@ -1111,6 +1115,21 @@ impl ChatStore {
         }
         self.tx
             .send(WriterMsg::ChatNames(names))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
+    }
+
+    /// Create rows for subscribed channels that history sync has not seen.
+    ///
+    /// A channel can be subscribed before any message arrives, and history
+    /// sync only sometimes carries its chat row. Without this, the channel
+    /// never gets a row and the Channels destination stays empty until a
+    /// message happens to create one.
+    pub fn ensure_channels(&self, channels: Vec<Jid>) -> Result<()> {
+        if channels.is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .send(WriterMsg::EnsureChannels(channels))
             .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
