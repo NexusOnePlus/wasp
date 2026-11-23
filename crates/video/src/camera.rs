@@ -928,7 +928,7 @@ fn enumerate_with(
 /// override takes an index or a backend-specific name, both of which the
 /// capture backends accept.
 pub(crate) fn configured_device() -> CameraIndex {
-    match std::env::var("VELO_CAMERA") {
+    match std::env::var("WASP_CAMERA") {
         Ok(value) if !value.trim().is_empty() => match value.trim().parse::<u32>() {
             Ok(index) => CameraIndex::Index(index),
             Err(_) => CameraIndex::String(value.trim().to_string()),
@@ -940,7 +940,7 @@ pub(crate) fn configured_device() -> CameraIndex {
 /// The devices an open will choose among, as one line.
 ///
 /// Read off enumeration rather than the open because the open names only the
-/// device it took. `VELO_CAMERA` names the same index and name space
+/// device it took. `WASP_CAMERA` names the same index and name space
 /// [`configured_device`] reads, so the line says exactly what there is to
 /// choose from when index 0 is the wrong camera.
 fn inventory() -> String {

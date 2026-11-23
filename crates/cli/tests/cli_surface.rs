@@ -5,12 +5,12 @@
 use std::process::Command;
 
 fn cli() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_velo-cli"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_wasp-cli"));
     command
-        .env_remove("VELO_ACCOUNT")
-        .env_remove("VELO_SOCKET")
-        .env_remove("VELO_READONLY")
-        .env_remove("VELO_LOCAL_ACCOUNT");
+        .env_remove("WASP_ACCOUNT")
+        .env_remove("WASP_SOCKET")
+        .env_remove("WASP_READONLY")
+        .env_remove("WASP_LOCAL_ACCOUNT");
     command
 }
 
@@ -77,13 +77,13 @@ fn new_subcommands_exist() {
 fn accounts_use_needs_no_daemon() {
     let out = cli()
         .args(["accounts", "use", "work"])
-        .env("VELO_SOCKET", "/tmp/velo-cli-test-nonexistent.sock")
+        .env("WASP_SOCKET", "/tmp/wasp-cli-test-nonexistent.sock")
         .output()
         .expect("run the cli");
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "export VELO_ACCOUNT=work"
+        "export WASP_ACCOUNT=work"
     );
 }
 
@@ -115,7 +115,7 @@ fn accounts_use_default_unsets() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "unset VELO_ACCOUNT"
+        "unset WASP_ACCOUNT"
     );
 }
 
@@ -137,22 +137,22 @@ fn an_invalid_account_flag_is_refused() {
 /// the environment's.
 ///
 /// Run from a private directory holding a copy of the binary and nothing
-/// else, with a private runtime directory: no `velod` sits beside it to
+/// else, with a private runtime directory: no `waspd` sits beside it to
 /// start and no daemon can already be listening, so the CLI reports the
 /// endpoint it looked for. A workspace `cargo test` leaves a real
-/// `velod` in `target/debug/`, which is what a test run from there would
+/// `waspd` in `target/debug/`, which is what a test run from there would
 /// otherwise start and connect to.
 #[test]
 fn the_account_flag_beats_the_environment() {
-    let dir = std::env::temp_dir().join(format!("velo-cli-flag-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("wasp-cli-flag-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     let binary = dir.join(if cfg!(windows) {
-        "velo-cli.exe"
+        "wasp-cli.exe"
     } else {
-        "velo-cli"
+        "wasp-cli"
     });
-    std::fs::copy(env!("CARGO_BIN_EXE_velo-cli"), &binary).expect("a copy of the cli");
+    std::fs::copy(env!("CARGO_BIN_EXE_wasp-cli"), &binary).expect("a copy of the cli");
 
     // A profile name no real daemon uses, so a socket that somehow already
     // exists for it cannot be what this test reaches.
@@ -160,7 +160,7 @@ fn the_account_flag_beats_the_environment() {
     let inherited = "envprobe";
     let out = Command::new(&binary)
         .args(["--json", "--account", chosen, "status"])
-        .env("VELO_ACCOUNT", inherited)
+        .env("WASP_ACCOUNT", inherited)
         .env("XDG_RUNTIME_DIR", &dir)
         .env("TMPDIR", &dir)
         .output()
@@ -194,7 +194,7 @@ fn the_account_flag_beats_the_environment() {
 fn an_invalid_environment_account_is_refused() {
     let out = cli()
         .arg("status")
-        .env("VELO_ACCOUNT", "wo/rk")
+        .env("WASP_ACCOUNT", "wo/rk")
         .output()
         .expect("run the cli");
     assert_eq!(out.status.code(), Some(2));
@@ -205,7 +205,7 @@ fn an_invalid_environment_account_is_refused() {
 #[test]
 fn dead_socket_is_a_clean_error() {
     let out = cli()
-        .args(["--socket", "/tmp/velo-cli-test-nonexistent.sock", "status"])
+        .args(["--socket", "/tmp/wasp-cli-test-nonexistent.sock", "status"])
         .output()
         .expect("run the cli");
     assert_eq!(out.status.code(), Some(2));
@@ -219,7 +219,7 @@ fn json_errors_are_structured() {
         .args([
             "--json",
             "--socket",
-            "/tmp/velo-cli-test-nonexistent.sock",
+            "/tmp/wasp-cli-test-nonexistent.sock",
             "status",
         ])
         .output()
@@ -287,7 +287,7 @@ fn raw_text_commands_still_run_by_default() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "export VELO_ACCOUNT=work"
+        "export WASP_ACCOUNT=work"
     );
 }
 
@@ -321,7 +321,7 @@ fn read_only_refuses_local_account_mutations() {
 #[test]
 fn sync_without_follow_reports_a_dead_daemon() {
     let out = cli()
-        .args(["--socket", "/tmp/velo-cli-test-nonexistent.sock", "sync"])
+        .args(["--socket", "/tmp/wasp-cli-test-nonexistent.sock", "sync"])
         .output()
         .expect("run the cli");
     assert_eq!(out.status.code(), Some(2));
@@ -340,7 +340,7 @@ fn sync_without_follow_reports_a_dead_daemon() {
 fn export_continues_from_the_daemon_cursor() {
     use std::io::{BufRead as _, BufReader, Write as _};
 
-    let dir = std::env::temp_dir().join(format!("velo-cli-export-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("wasp-cli-export-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     let socket = dir.join("endpoint.sock");

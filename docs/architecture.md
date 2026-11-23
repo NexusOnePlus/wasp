@@ -56,7 +56,7 @@ The crate map, the theme, and how the interface responds to viewport size.
   startup does not, so a level raised in Settings was let through by the macro
   and dropped by the logger underneath, which is a failure with no symptom
   except silence. And both processes have to read one answer: the window and
-  `velod` log about one account, and a choice only the window remembered
+  `waspd` log about one account, and a choice only the window remembered
   would leave the process holding the session — where nearly everything worth
   reading is written — at `info` for ever. So `env_logger` keeps the
   formatting and the per-module floors and the global level is an atomic this
@@ -64,7 +64,7 @@ The crate map, the theme, and how the interface responds to viewport size.
   page, and the precedence is stated once: an explicit `RUST_LOG` (or `?log=`)
   wins for the run it was given for, then the stored choice, then `info`.
   Choosing a level at runtime always applies, whatever started the process.
-- **velo-daemon**: a library and the binary `velod` around it. The
+- **velo-daemon**: a library and the binary `waspd` around it. The
   library is everything the daemon *does* — the state every front end
   observes, the bridge that turns their requests into session calls, and the
   protocol spoken down a byte stream — and it builds for
@@ -123,7 +123,7 @@ The crate map, the theme, and how the interface responds to viewport size.
   table a test owns, which is the only way to run a handler without the
   daemon; `raw::Ptr` exists for it, because an address is an `i32` on wasm32
   and truncates to nothing anywhere else.
-- **velo-gui**: GPUI front end, binary `velo`. Talks to the daemon and
+- **velo-gui**: GPUI front end, binary `wasp`. Talks to the daemon and
   starts one if none is listening. Owns video decode, which writes straight
   into `gpui::RenderImage` and is not reusable off GPUI.
   The same crate builds for `wasm32-unknown-unknown`, where `main` becomes the

@@ -5,7 +5,7 @@
 
 use super::*;
 use gpui::AppContext as _;
-use velo_core::MediaType;
+use velo_core::{MediaType, STATUS_BROADCAST_JID};
 
 /// A voice note whose expensive preparation is running off the UI executor.
 ///
@@ -218,8 +218,14 @@ impl WhatsAppApp {
     }
 
     /// Update a message's media data (used to cache downloaded media)
-    fn update_message_media_data(&mut self, message_id: &str, data: Arc<Vec<u8>>, cx: &mut App) {
-        self.update_chat_media_data(None, message_id, data, false, cx);
+    fn update_message_media_data(
+        &mut self,
+        message_id: &str,
+        data: Arc<Vec<u8>>,
+        cache_key: Option<&str>,
+        cx: &mut App,
+    ) {
+        self.update_chat_media_data(None, message_id, data, false, cache_key, cx);
     }
 
     fn update_chat_media_data(
@@ -228,6 +234,7 @@ impl WhatsAppApp {
         message_id: &str,
         data: Arc<Vec<u8>>,
         preview: bool,
+        cache_key: Option<&str>,
         cx: &mut App,
     ) {
         // Locate the owning chat through shared references first. Calling
@@ -251,8 +258,13 @@ impl WhatsAppApp {
                 // frame claimed fails every time.
                 if preview {
                     media.adopt_server_preview(data);
+                    media.preview_cache_key = cache_key.map(str::to_string);
                 } else {
                     media.adopt_full_bytes(data);
+                    // The daemon wrote these bytes under this key. Keeping it
+                    // is what makes the row cached again after the in-memory
+                    // copy is released on a chat switch.
+                    media.cache_key = cache_key.map(str::to_string);
                 }
                 info!("Cached media data for message {}", message_id);
                 touched = Some(chat.jid.clone());
@@ -832,14 +844,20 @@ impl WhatsAppApp {
         // Spawn a GPUI task to await the download result with timeout
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             match download_with_timeout(download_rx).await {
-                Ok(data) => {
+                Ok(downloaded) => {
+                    let data = downloaded.bytes;
                     info!("Audio downloaded: {} bytes", data.len());
 
                     // Cache the downloaded audio and play it
                     let _ = entity.update(cx, |app, cx| {
                         app.finish_download(&msg_id);
                         // Cache the audio data in the message so we don't need to download again
-                        app.update_message_media_data(&msg_id, data.clone(), cx);
+                        app.update_message_media_data(
+                            &msg_id,
+                            data.clone(),
+                            Some(&downloaded.key),
+                            cx,
+                        );
                         // Autoplay only if the user hasn't started other media
                         // since this download began.
                         if app.pending_media_request.as_deref() == Some(msg_id.as_str()) {
@@ -877,6 +895,223 @@ impl WhatsAppApp {
     /// Fetch the full image for a bubble whose eager download failed and left
     /// no thumbnail; mirrors the audio lazy-download path (no autoplay, the
     /// cached bytes just render).
+    /// Fetch the recent pictures in the conversation on screen without a tap.
+    ///
+    /// A chat used to open with downloadable rows and wait for the reader to
+    /// press each one. The window already knows which conversation is visible
+    /// and the daemon already has a cache; this is the bounded version of
+    /// doing what every other messenger does. Two at a time, four candidates,
+    /// and a remembered attempt so a failed fetch is a tap away rather than a
+    /// retry loop on every repaint.
+    pub(crate) fn auto_download_recent_images(&mut self, chat_jid: &str, cx: &mut Context<Self>) {
+        if !self.is_connected() {
+            return;
+        }
+        let Some(chat) = self.find_chat(chat_jid) else {
+            return;
+        };
+        let count = chat.messages.len();
+        if self.auto_media_scan.as_ref() == Some(&(chat_jid.to_string(), count)) {
+            // The scan is done, but a slot may have opened since the last
+            // frame (a video or a document finishing does not go through the
+            // image completion path).
+            self.pump_auto_media(cx);
+            return;
+        }
+        // Collected before anything is written: the queue lives on `self`, and
+        // holding the chat borrow across that would be a second mutable access.
+        let candidates: Vec<(String, DownloadableMedia, AutoMediaKind)> = chat
+            .messages
+            .iter()
+            .rev()
+            .filter_map(|message| {
+                let media = message.media.as_ref()?;
+                let kind = match media.media_type {
+                    // Stickers are a few kilobytes and are the one kind that
+                    // looks broken when it is waiting: the placeholder is a
+                    // big empty rectangle with a download arrow. Fetch them
+                    // with the photos rather than asking for a tap.
+                    velo_core::MediaType::Image | velo_core::MediaType::Sticker => {
+                        // Full bytes already here are not a download candidate.
+                        if !media.data.is_empty() && !media.data_is_preview {
+                            return None;
+                        }
+                        AutoMediaKind::Still
+                    }
+                    // A GIF is an MP4 with a poster. It has no still bytes to
+                    // trust, so the player's own state says whether it is
+                    // already here.
+                    velo_core::MediaType::Video if media.is_gif => {
+                        if self.video_players.contains_key(&message.id) {
+                            return None;
+                        }
+                        AutoMediaKind::Gif
+                    }
+                    _ => return None,
+                };
+                let downloadable = media.downloadable.as_ref()?.clone();
+                Some((message.id.clone(), downloadable, kind))
+            })
+            .take(MAX_AUTO_MEDIA_QUEUE)
+            .collect();
+        self.auto_media_scan = Some((chat_jid.to_string(), count));
+        for (message_id, downloadable, kind) in candidates {
+            self.enqueue_auto_media(chat_jid, &message_id, downloadable, kind);
+        }
+        self.pump_auto_media(cx);
+    }
+
+    /// Queue one automatic picture, once.
+    ///
+    /// The attempt is recorded here rather than when a slot finally opens:
+    /// the scan can run again before the queue drains, and one row must not
+    /// be asked for twice because the first scan had to wait.
+    fn enqueue_auto_media(
+        &mut self,
+        chat_jid: &str,
+        message_id: &str,
+        downloadable: DownloadableMedia,
+        kind: AutoMediaKind,
+    ) {
+        if !self.is_connected() {
+            return;
+        }
+        let scope = (chat_jid.to_string(), message_id.to_string());
+        if self.auto_media_attempts.contains(&scope)
+            || self.is_downloading(message_id)
+            || self.auto_media_queue.len() >= MAX_AUTO_MEDIA_QUEUE
+            || self
+                .auto_media_queue
+                .iter()
+                .any(|request| request.chat_jid == chat_jid && request.message_id == message_id)
+        {
+            return;
+        }
+        // Bound the remembered attempts: the queue itself prevents a duplicate
+        // while an entry is waiting, so forgetting older names is safe.
+        if self.auto_media_attempts.len() >= 512 {
+            self.auto_media_attempts.clear();
+        }
+        self.auto_media_attempts.insert(scope);
+        self.auto_media_queue.push_back(AutoMediaRequest {
+            chat_jid: chat_jid.to_string(),
+            message_id: message_id.to_string(),
+            downloadable,
+            kind,
+        });
+    }
+
+    /// Start queued pictures until both download slots are busy.
+    ///
+    /// Called after a scan and after every completion. The queue is what lets
+    /// a conversation with a dozen new photos finish loading itself; the old
+    /// loop stopped at the second and never came back.
+    pub(super) fn pump_auto_media(&mut self, cx: &mut Context<Self>) {
+        if !self.is_connected() {
+            return;
+        }
+        // A GIF hands the animated file to the video path, which owns the one
+        // playback the window can show. Its download does not take one of the
+        // two picture slots, so it is held back rather than counted: starting
+        // it while a voice note or another clip is live would cut that off.
+        let mut deferred = Vec::new();
+        while self.downloads_in_flight.len() < AUTO_MEDIA_CONCURRENCY {
+            let Some(request) = self.auto_media_queue.pop_front() else {
+                break;
+            };
+            if self.find_chat(&request.chat_jid).is_none() {
+                continue;
+            }
+            match request.kind {
+                AutoMediaKind::Still => {
+                    self.download_image(
+                        request.chat_jid,
+                        request.message_id,
+                        request.downloadable,
+                        cx,
+                    );
+                }
+                AutoMediaKind::Gif => {
+                    // A hidden conversation's GIF is not started: the video
+                    // path owns the window's one playback, and a loop behind
+                    // the chat list is exactly the thing it must not do.
+                    if self.selected_chat.as_deref() != Some(request.chat_jid.as_str()) {
+                        self.auto_media_attempts
+                            .remove(&(request.chat_jid.clone(), request.message_id.clone()));
+                        continue;
+                    }
+                    let busy = !matches!(self.active_media, ActiveMedia::None)
+                        || self.video_players.values().any(|player| {
+                            matches!(
+                                player.state(),
+                                VideoPlayerState::Downloading
+                                    | VideoPlayerState::Decoding
+                                    | VideoPlayerState::Playing
+                                    | VideoPlayerState::Paused
+                            )
+                        });
+                    if busy || self.pending_media_request.is_some() {
+                        deferred.push(request);
+                        continue;
+                    }
+                    let message_id = request.message_id;
+                    self.start_video_download(message_id, request.downloadable, true, cx);
+                }
+            }
+        }
+        for request in deferred.into_iter().rev() {
+            self.auto_media_queue.push_front(request);
+        }
+    }
+
+    /// Fetch the newest picture of each person in the status feed.
+    ///
+    /// The generic recent-image scan takes the newest six rows of the whole
+    /// broadcast, which can all belong to one talkative contact. A status
+    /// grid is one card per author, so the candidate is each author's newest
+    /// image — that is the frame their card would draw.
+    pub(crate) fn auto_download_status_previews(&mut self, cx: &mut Context<Self>) {
+        if !self.is_connected() {
+            return;
+        }
+        let Some(chat) = self.find_chat(STATUS_BROADCAST_JID) else {
+            return;
+        };
+        let feed = velo_core::StatusFeed::from_chat(chat);
+        let mut candidates: Vec<(String, DownloadableMedia)> = Vec::new();
+        for author in feed.authors() {
+            let Some((message, downloadable)) = feed
+                .updates_of(author)
+                .filter_map(|message| {
+                    let media = message.media.as_ref()?;
+                    if media.media_type != velo_core::MediaType::Image {
+                        return None;
+                    }
+                    if !media.data.is_empty() && !media.data_is_preview {
+                        return None;
+                    }
+                    Some((message, media.downloadable.clone()?))
+                })
+                .last()
+            else {
+                continue;
+            };
+            candidates.push((message.id.clone(), downloadable));
+            if candidates.len() >= MAX_AUTO_MEDIA_QUEUE {
+                break;
+            }
+        }
+        for (message_id, downloadable) in candidates {
+            self.enqueue_auto_media(
+                STATUS_BROADCAST_JID,
+                &message_id,
+                downloadable,
+                AutoMediaKind::Still,
+            );
+        }
+        self.pump_auto_media(cx);
+    }
+
     pub fn download_image(
         &mut self,
         chat_jid: String,
@@ -942,13 +1177,14 @@ impl WhatsAppApp {
                     *success = result.is_ok();
                 }
                 match result {
-                    Ok(data) => {
-                        info!("Image downloaded: {} bytes", data.len());
+                    Ok(downloaded) => {
+                        info!("Image downloaded: {} bytes", downloaded.bytes.len());
                         app.update_chat_media_data(
                             chat_jid.as_deref(),
                             &message_id,
-                            data,
+                            downloaded.bytes,
                             preview,
+                            Some(&downloaded.key),
                             cx,
                         );
                     }
@@ -957,6 +1193,9 @@ impl WhatsAppApp {
                         failed = Some(what_went_wrong(crate::tr!(CouldNotDownloadThatImage), &e));
                     }
                 }
+                // A slot just opened; whatever the scan had to leave behind
+                // goes now.
+                app.pump_auto_media(cx);
                 cx.notify();
             });
             if user_initiated && let Some(reason) = failed {
@@ -1089,7 +1328,8 @@ impl WhatsAppApp {
 
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             match download_with_timeout(download_rx).await {
-                Ok(data) => {
+                Ok(downloaded) => {
+                    let data = downloaded.bytes;
                     // The download can outlive its account. Check on the app
                     // thread immediately before starting any native or browser
                     // handoff; a stale completion must not write to Downloads.
@@ -1497,6 +1737,7 @@ impl WhatsAppApp {
         &mut self,
         message_id: String,
         downloadable: DownloadableMedia,
+        looping: bool,
         cx: &mut Context<Self>,
     ) {
         // Get player state first to determine action
@@ -1601,7 +1842,7 @@ impl WhatsAppApp {
             }
             Some(VideoPlayerState::Idle) | Some(VideoPlayerState::Error) => {
                 // Start downloading (or retry on error)
-                self.start_video_download(message_id, downloadable, cx);
+                self.start_video_download(message_id, downloadable, looping, cx);
             }
             Some(VideoPlayerState::Downloading) | Some(VideoPlayerState::Decoding) => {
                 // Already on its way — but say again that it is wanted.
@@ -1614,7 +1855,7 @@ impl WhatsAppApp {
             }
             None => {
                 // No player yet, start downloading
-                self.start_video_download(message_id, downloadable, cx);
+                self.start_video_download(message_id, downloadable, looping, cx);
             }
         }
         cx.notify();
@@ -1624,6 +1865,7 @@ impl WhatsAppApp {
         &mut self,
         message_id: String,
         downloadable: DownloadableMedia,
+        looping: bool,
         cx: &mut Context<Self>,
     ) {
         // Asked before the fetch, not after it. The decoder is built from the
@@ -1678,6 +1920,7 @@ impl WhatsAppApp {
 
         // Create or get player and set to downloading
         let player = self.video_players.entry(message_id.clone()).or_default();
+        player.set_looping(looping);
         let preparation = player.set_downloading();
 
         let msg_id = message_id.clone();
@@ -1685,7 +1928,8 @@ impl WhatsAppApp {
         // Spawn a GPUI task to await the download result with timeout
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             match download_with_timeout(download_rx).await {
-                Ok(data) => {
+                Ok(downloaded) => {
+                    let data = downloaded.bytes;
                     info!("Video downloaded: {} bytes", data.len());
 
                     // Set to decoding state (quick UI update)
@@ -2162,6 +2406,7 @@ mod tests {
                 "42",
                 Arc::new(vec![2, 3]),
                 false,
+                None,
                 cx,
             );
             assert_eq!(
@@ -2187,6 +2432,7 @@ mod tests {
                 "42",
                 Arc::new(vec![4, 5]),
                 true,
+                None,
                 cx,
             );
             let preview = app.chats[1].messages[0].media.as_ref().unwrap();

@@ -72,6 +72,7 @@ diesel::table! {
         full_name -> Nullable<Text>,
         first_name -> Nullable<Text>,
         business_name -> Nullable<Text>,
+        username -> Nullable<Text>,
     }
 }
 

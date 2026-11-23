@@ -186,7 +186,7 @@ const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 /// Without `if_available`, deliberately: the second installation should
 /// *wait* rather than be told to try again. Somebody who pressed Add twice
 /// wants both files.
-const INSTALL_LOCK: &str = "velo-plugins-install";
+const INSTALL_LOCK: &str = "wasp-plugins-install";
 
 /// Everything installed, ready to hand to the host.
 ///

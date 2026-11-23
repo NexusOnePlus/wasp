@@ -128,9 +128,9 @@ jobs:
       # heavy dependency the moment it lands.
       - name: Check the CLI binary budget
         run: |
-          cargo build -p velo-cli --release
-          size=$(stat -c%s target/release/velo-cli)
-          echo "velo-cli release size: $size bytes"
+          cargo build -p wasp-cli --release
+          size=$(stat -c%s target/release/wasp-cli)
+          echo "wasp-cli release size: $size bytes"
           test "$size" -lt 2097152
       # The example plugins, which the workspace steps above compile no line
       # of: `examples/` is excluded from the root workspace so that a host

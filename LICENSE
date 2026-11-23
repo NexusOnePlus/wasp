@@ -1,19 +1,23 @@
-Velo
+Wasp
 ====
 
-Velo is built on oxidezap/client (https://github.com/oxidezap/client) and
-whatsapp-rust (https://github.com/oxidezap/whatsapp-rust). Both are
+Wasp is a fork of Velo (https://github.com/Ruchin-Audichya/velo), which is
+built on oxidezap/client (https://github.com/oxidezap/client) and
+whatsapp-rust (https://github.com/oxidezap/whatsapp-rust). All three are
 distributed under the MIT License, reproduced below with the original
-copyright notice, which applies to Velo as a modified work of them.
+copyright notice, which applies to Wasp as a modified work of them.
 
 Changes and additions for Velo: Copyright (c) 2026 Ruchin Audichya,
 released under the same MIT License.
 
-Velo is an independent project. It is not affiliated with, endorsed by or
-sponsored by WhatsApp LLC or Meta Platforms, Inc. "WhatsApp" is a trademark
-of WhatsApp LLC, used here only to describe what Velo connects to.
+Changes and additions for Wasp: Copyright (c) 2026 NexusOnePlus,
+released under the same MIT License.
 
-The libraries Velo is built with are listed, with their licences, in
+Wasp is an independent project. It is not affiliated with, endorsed by or
+sponsored by WhatsApp LLC or Meta Platforms, Inc. "WhatsApp" is a trademark
+of WhatsApp LLC, used here only to describe what Wasp connects to.
+
+The libraries Wasp is built with are listed, with their licences, in
 THIRD-PARTY-NOTICES.txt beside this file.
 
 -------------------------------------------------------------------------------

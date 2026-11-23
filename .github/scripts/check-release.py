@@ -25,7 +25,7 @@ def machine(data, platform):
 
 
 def check(path, version, platform):
-    root = f'velo-{version}-{platform}'
+    root = f'wasp-{version}-{platform}'
     windows = platform.startswith('windows-')
     suffix = '.zip' if windows else '.tar.gz'
     assert path.name == root + suffix, 'wrong archive name'
@@ -50,12 +50,12 @@ def check(path, version, platform):
                 assert entry.name not in files, 'duplicate member'
                 files[entry.name] = (archive.extractfile(entry).read(), entry.mode)
     binaries = [f'{root}/{name}' + ('.exe' if windows else '')
-                for name in ('velo', 'velod', 'velo-cli')]
+                for name in ('wasp', 'waspd', 'wasp-cli')]
     expected = set(binaries)
     if platform.startswith('linux-'):
-        expected.update(f'{root}/{name}' for name in ('install-desktop.sh', 'io.github.RuchinAudichya.Velo.png'))
+        expected.update(f'{root}/{name}' for name in ('install-desktop.sh', 'io.github.NexusOnePlus.Wasp.png'))
         assert files[f'{root}/install-desktop.sh'][1] & 0o111, 'installer not executable'
-        assert files[f'{root}/io.github.RuchinAudichya.Velo.png'][0].startswith(b'\x89PNG\r\n\x1a\n'), 'invalid desktop icon'
+        assert files[f'{root}/io.github.NexusOnePlus.Wasp.png'][0].startswith(b'\x89PNG\r\n\x1a\n'), 'invalid desktop icon'
     assert set(files) == expected, f'unexpected archive contents: {set(files) ^ expected}'
     for name in binaries:
         data, mode = files[name]

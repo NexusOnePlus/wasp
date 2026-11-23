@@ -231,7 +231,7 @@ fn empty(what: &'static str, metrics: Metrics, cx: &App) -> impl IntoElement + u
 /// folder belongs to whichever daemon is running the plugins, and adding to
 /// it and re-reading it are things every front end asks that daemon for. A
 /// desktop window's Reload is also for somebody who has just dropped a
-/// `.wasm` beside `velod` by hand; a follower tab's is for somebody whose
+/// `.wasm` beside `waspd` by hand; a follower tab's is for somebody whose
 /// host is another tab.
 ///
 /// With a line saying what Reload does, because "reload" over a list of
@@ -578,7 +578,7 @@ fn notifications(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> Any
 
     let general = setting_card(
         vec![setting_row(
-            "Start Velo when you sign in",
+            "Start Wasp when you sign in",
             Some(
                 "Runs quietly in the background so messages and calls arrive even with the window closed.",
             ),
@@ -932,9 +932,9 @@ fn advanced(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyEleme
                     (crate::tr!(Renderer).to_string(), "GPUI".to_string()),
                     (
                         "Version".to_string(),
-                        match option_env!("VELO_REV").filter(|rev| !rev.is_empty()) {
-                            Some(rev) => format!("Velo {} ({rev})", env!("CARGO_PKG_VERSION")),
-                            None => format!("Velo {}", env!("CARGO_PKG_VERSION")),
+                        match option_env!("WASP_REV").filter(|rev| !rev.is_empty()) {
+                            Some(rev) => format!("Wasp {} ({rev})", env!("CARGO_PKG_VERSION")),
+                            None => format!("Wasp {}", env!("CARGO_PKG_VERSION")),
                         },
                     ),
                 ],
@@ -983,8 +983,14 @@ fn shortcuts() -> Vec<(String, String)> {
         "Alt"
     };
     [
-        ("Search chats and messages", format!("{ctrl} K")),
+        ("Command palette", format!("{ctrl} K")),
         ("Search in this chat", format!("{ctrl} F")),
+        (
+            "Chats / Status / Channels / Communities",
+            format!("{alt} 1–4"),
+        ),
+        ("Emoji picker", format!("{ctrl} E")),
+        ("GIF search", format!("{ctrl} Shift G")),
         ("Next chat", format!("{alt} ↓")),
         ("Previous chat", format!("{alt} ↑")),
         ("Next unread chat", format!("{alt} Shift ↓")),

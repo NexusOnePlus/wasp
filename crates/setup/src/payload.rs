@@ -16,7 +16,7 @@ pub struct Entry {
 /// Everything in the payload, in the order it should be written.
 pub fn entries() -> Result<Vec<Entry>, String> {
     let bad = || "the installer's payload is damaged".to_string();
-    let rest = PAYLOAD.strip_prefix(b"VELO1").ok_or_else(bad)?;
+    let rest = PAYLOAD.strip_prefix(b"WASP1").ok_or_else(bad)?;
     let (count, mut rest) = take::<4>(rest).ok_or_else(bad)?;
     let mut entries = Vec::new();
     for _ in 0..u32::from_le_bytes(count) {

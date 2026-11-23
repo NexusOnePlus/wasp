@@ -123,7 +123,7 @@ fn detached_command(program: &std::path::Path) -> Command {
 /// point of the split — so the one name it does have to know is the one thing
 /// worth making overridable. A TUI, or a second GUI, says here what to start;
 /// everyone else gets the pair the release packages together.
-const FRONT_END_ENV: &str = "VELO_FRONT_END";
+const FRONT_END_ENV: &str = "WASP_FRONT_END";
 
 /// Where to find the front end.
 ///
@@ -140,7 +140,7 @@ const FRONT_END_ENV: &str = "VELO_FRONT_END";
 /// anyway. A `cargo`-run build finds its sibling in `target/debug` without
 /// any of this.
 fn front_end_program() -> Option<std::path::PathBuf> {
-    const NAME: &str = if cfg!(windows) { "velo.exe" } else { "velo" };
+    const NAME: &str = if cfg!(windows) { "wasp.exe" } else { "wasp" };
     if let Some(named) = std::env::var_os(FRONT_END_ENV).filter(|value| !value.is_empty()) {
         // The user's own variable naming their own program: theirs to
         // resolve however they wrote it.
@@ -156,7 +156,7 @@ fn front_end_program() -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
 
-    /// The release ships `velo` and `velod` in one directory, so the
+    /// The release ships `velo` and `waspd` in one directory, so the
     /// daemon's own location is the first place to look — and the name it
     /// looks for is the platform's.
     #[test]

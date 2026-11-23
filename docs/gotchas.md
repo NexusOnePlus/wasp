@@ -15,7 +15,7 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   socket inherits a `0700` directory. A client checks who answered on both,
   and for one reason: the name is predictable and not reserved, so somebody
   else can be there first — the socket under the `/tmp` fallback, the pipe at
-  `\\.\pipe\velo-<SID>`. `first_pipe_instance` on the listener guards the
+  `\\.\pipe\wasp-<SID>`. `first_pipe_instance` on the listener guards the
   daemon once it exists, which is the wrong half of it: the daemon then
   refuses to start and the client talks to whoever got there. The kernel knows
   who is on the other end either way — a peer uid on the socket, the serving
@@ -157,7 +157,7 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   the window because it draws part of the log and a page with its own session
   draws all of it, the daemon because it holds the session and because a page
   keeps its choice in a browser store no daemon can read, so the next
-  `velod` would otherwise start back at `info`. `ClientRequest::SetLogLevel`
+  `waspd` would otherwise start back at `info`. `ClientRequest::SetLogLevel`
   is the sentence between them, and it is applied *and* persisted where it
   lands: a person raising the level is asking about the session that is
   running, and the file is what keeps them from asking again after every
@@ -178,7 +178,7 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   shipped as `oxidezap` wherever a user could not see it — the data folder
   (`%LOCALAPPDATA%\oxidezap`, holding the sign-in), `Downloads\OxideZap`,
   `HKCU\Software\OxideZap`, the `Run` value and the notification app ID.
-  `velo_platform::legacy_names::migrate` renames each into Velo's name, and
+  `velo_platform::legacy_names::migrate` renames each into Wasp's name, and
   only when that name is free: nothing is merged or overwritten, so a stray
   new folder made by a development build wins and the old one stays put. The
   window and the daemon call it as their first line, *before* logging,
@@ -194,8 +194,8 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   Plugins built against 1.0 import from `oxidezap` and no longer link; the
   module is `velo` now.
   The web build's browser storage keys (`velo.theme`, `velo.log_level`,
-  `velo.plugin.*`) moved without a bridge: Velo 1.0 shipped no web build.
-- **The front end owns no session.** `velo` starts `velod` when none is
+  `velo.plugin.*`) moved without a bridge: Wasp 1.0 shipped no web build.
+- **The front end owns no session.** `velo` starts `waspd` when none is
   listening and speaks to it; the two ship together and the release packages
   them in one directory. A front end that cannot reach the daemon has no
   fallback, by design — a second session on the same store is the thing the
@@ -208,7 +208,7 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   is said in the hello (`has_window`), not counted off the signal channel:
   every client reads that channel, so a TUI or a notifier would otherwise
   stand in for a window that is not there. The one front end name the daemon
-  has to know is also the one thing worth overriding, so `VELO_FRONT_END`
+  has to know is also the one thing worth overriding, so `WASP_FRONT_END`
   names another — a TUI, a second GUI — and the shipped pair is only the
   default. The way back is the same door: the tray's Hide, and a click on
   the icon while a window is attached, relay `HideWindow`, and the front end
@@ -571,7 +571,7 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   somebody else may write is a file they can unlink and replace, and the
   replacement inherits the id's approval. Allowing the link would mean a
   verdict on its directory, and on that directory's directory, with a race at
-  every step; `VELO_PLUGIN_DIR` is how a module is loaded from somewhere
+  every step; `WASP_PLUGIN_DIR` is how a module is loaded from somewhere
   else, and it is checked the same way. An answer recorded against a name
   rather than against bytes
   is one somebody else's file under that name inherits — and a writable
@@ -736,7 +736,7 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   MiB of pixels, and the front end already carries a decoder for the video it
   plays in a conversation. A saved camera preference supplies the device and
   requested mode for the next open. Without one, the open takes the first
-  device unless `VELO_CAMERA` names an index or a backend-specific name.
+  device unless `WASP_CAMERA` names an index or a backend-specific name.
   That override handles a virtual camera occupying index 0, and the log
   line next to every open (`cameras in reach`) says what there was to choose
   from. Sending the self-view as the very stream the peer

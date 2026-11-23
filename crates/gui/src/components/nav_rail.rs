@@ -1,10 +1,10 @@
-//! The window's destinations.
+//! The sidebar's destination switcher.
 //!
-//! Chats, Status, Channels and Communities share the same navigation on both targets.
-//!
-//! One list of destinations, drawn along whichever axis there is room for: a
-//! strip down the side of a window, a bar across the foot of a phone. The
-//! axis follows the responsive layout.
+//! It used to be a full-height rail beside the chat list. That rail was a
+//! second left edge for the window: it took width from every conversation so
+//! four icons could sit in a strip of their own. The destinations belong to
+//! the sidebar, so the switcher now lives at the foot of it, as one floating
+//! capsule that the list never has to compete with.
 
 use gpui::prelude::*;
 use gpui::{App, Entity, InteractiveElement, IntoElement, ParentElement, Styled, div};
@@ -17,172 +17,90 @@ use crate::components::parts;
 use crate::responsive::ResponsiveLayout;
 use crate::theme::Metrics;
 
-/// A full-window screen the rail opens over the destinations.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RailScreen {
-    Calls,
-    Files,
-}
-
-pub fn render_nav_rail(
+/// The four destinations, in one capsule at the foot of the sidebar.
+pub fn render_destination_pill(
     current: Destination,
-    // Calls or Files when one of them is on screen. Then it, and not the
-    // destination underneath, is what the rail shows as selected.
-    screen: Option<RailScreen>,
     unread: [usize; 4],
-    // Who is signed in, drawn as the photo at the foot of the strip — the
-    // way into your profile and Settings, as in the desktop messengers.
-    account: Option<crate::components::AccountSummary>,
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let metrics = *layout.metrics();
     let is_mobile = layout.is_mobile();
-    // A phone's tab bar is sized by the finger; a desktop strip is sized by
-    // the icon it holds. Using the touch target at every width put a 60px rail
-    // beside 34px header icons — two control scales in one window, and the
-    // phone's minimum applied where nothing else in the app uses it.
-    let gap = metrics.space_sm();
+    // A phone's capsule is sized by the finger; a desktop one by the icon it
+    // holds, so it does not become a second control scale in the window.
     let target = if is_mobile {
-        let count = (Destination::ALL.len() + 3) as f32;
-        metrics
-            .touch_target()
-            .min((layout.viewport().width - gap * (count - 1.0)) / count)
+        metrics.touch_target()
     } else {
         metrics.icon_button()
     };
-    let thickness = target + metrics.space_lg();
+    let gap = if is_mobile {
+        metrics.space_sm()
+    } else {
+        metrics.space_xxs()
+    };
 
-    let base = div()
-        .id("navigation-rail")
-        .tab_group()
-        .flex_shrink_0()
+    let pill = div()
+        .id("destination-pill")
         .flex()
         .items_center()
         .gap(gap)
-        .bg(cx.theme().sidebar)
-        .border_color(cx.theme().border);
+        .p(metrics.space_xxs())
+        .rounded_full()
+        .bg(cx.theme().popover)
+        .border_1()
+        .border_color(cx.theme().border)
+        .shadow_md()
+        .children(
+            Destination::ALL
+                .into_iter()
+                .zip(unread)
+                .map(|(destination, badge)| {
+                    render_destination(
+                        destination,
+                        destination == current,
+                        badge,
+                        target,
+                        entity.clone(),
+                        metrics,
+                        cx,
+                    )
+                }),
+        );
 
-    let base = if is_mobile {
-        // A phone's tab bar spans the foot, so its items spread across it.
-        base.w_full()
-            .h(thickness)
-            .flex_row()
+    if is_mobile {
+        // The phone keeps the capsule across the foot, where a thumb reaches
+        // it and where the old tab bar was.
+        div()
+            .w_full()
+            .flex_shrink_0()
+            .flex()
             .justify_center()
+            .pt(metrics.space_xs())
+            .pb(metrics.space_sm())
+            .bg(cx.theme().sidebar)
             .border_t_1()
+            .border_color(cx.theme().border)
+            .child(pill)
     } else {
-        // A strip beside a list starts where the list starts. Centred down the
-        // window, two icons float in the middle of nothing and line up with
-        // no part of what they switch between.
-        base.h_full()
-            .w(thickness)
-            .overflow_y_scroll()
-            .flex_col()
-            .justify_start()
-            .pt(metrics.space_lg())
-            .border_r_1()
-    };
-
-    let files_entity = entity.clone();
-    let calls_entity = entity.clone();
-    let settings_entity = entity.clone();
-    let profile_entity = entity.clone();
-    base.children(
-        Destination::ALL
-            .into_iter()
-            .zip(unread)
-            .map(|(destination, badge)| {
-                render_destination(
-                    destination,
-                    screen.is_none() && destination == current,
-                    badge,
-                    target,
-                    entity.clone(),
-                    metrics,
-                    cx,
-                )
-            }),
-    )
-    .child(
-        Button::new("nav-calls")
-            .ghost()
-            .selected(screen == Some(RailScreen::Calls))
-            .icon(crate::components::ProductIcon::Phone)
-            .tooltip("Calls")
-            .accessibility_label("Calls")
-            .size(target)
-            .on_click(move |_, _, cx| calls_entity.update(cx, |app, cx| app.open_call_history(cx))),
-    )
-    .child(
-        Button::new("nav-files")
-            .ghost()
-            .selected(screen == Some(RailScreen::Files))
-            .icon(crate::components::ProductIcon::FileText)
-            .tooltip("Files & downloads")
-            .accessibility_label("Files and downloads")
-            .size(target)
-            .on_click(move |_, _, cx| {
-                files_entity.update(cx, |app, cx| {
-                    // One screen at a time: Files replaces Calls.
-                    app.calls_open = false;
-                    app.files_open = true;
-                    if let Some(view) = &app.files_view {
-                        view.update(cx, |view, cx| view.refresh(cx));
-                    }
-                    cx.notify();
-                });
-            }),
-    )
-    // Settings and your photo sit at the foot of the strip, apart from the
-    // places you go between: they are about you, not about a conversation.
-    .when(!is_mobile, |el| el.child(div().flex_1()))
-    .child(
-        Button::new("nav-settings")
-            .ghost()
-            .icon(gpui_component::IconName::Settings)
-            .tooltip("Settings")
-            .accessibility_label("Settings")
-            .size(target)
-            .on_click(move |_, window, cx| {
-                settings_entity.update(cx, |app, cx| app.open_settings(window, cx))
-            }),
-    )
-    .children(account.map(|account| {
-        Button::new("nav-profile")
-            .ghost()
-            .size(target)
-            .tooltip("Profile")
-            .accessibility_label("Profile")
-            .child(
-                crate::components::Avatar::new(
-                    account.name.clone(),
-                    &account.name,
-                    metrics.icon_button() * 0.8,
-                )
-                .picture(account.avatar_key.clone(), None)
-                .on(cx.theme().sidebar),
-            )
-            .on_click(move |_, window, cx| {
-                profile_entity.update(cx, |app, cx| {
-                    app.open_settings(window, cx);
-                    app.set_settings_section(crate::app::SettingsSection::Account, cx);
-                })
-            })
-    }))
-    .when(!is_mobile, |el| el.pb(metrics.space_lg()))
+        // Floating over the list's lower edge. The caller positions and
+        // occludes it; this wrapper only centres the capsule.
+        div()
+            .w_full()
+            .flex_shrink_0()
+            .flex()
+            .justify_center()
+            .px(metrics.space_lg())
+            .child(pill)
+    }
 }
 
 /// One destination. It selects where the window is, the way a chat row selects
-/// a conversation, and the selected one stays visibly selected — which is what
-/// `Button::selected` carries.
-#[allow(clippy::too_many_arguments)]
+/// a conversation, and the selected one stays visibly selected.
 fn render_destination(
     destination: Destination,
     is_current: bool,
     badge: usize,
-    // What the rail sized itself for: a finger below the breakpoint, an icon
-    // above it.
     target: gpui::Pixels,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
@@ -195,11 +113,6 @@ fn render_destination(
         Destination::Communities => crate::components::ProductIcon::Users.into(),
     };
 
-    // A `Button`: destinations need keyboard activation and a focus ring.
-    // This is the only route to each list, so a
-    // pointer-only rail would put a whole destination out of reach of the
-    // keyboard — and the focus ring the theme defines is drawn by the
-    // library's controls, not by anything hand-rolled.
     let button = Button::new(destination.id())
         .ghost()
         .selected(is_current)
@@ -212,11 +125,12 @@ fn render_destination(
         .flex()
         .items_center()
         .justify_center()
-        .rounded(metrics.radius_md())
+        .rounded_full()
         .tooltip(destination.label())
         .when(is_current, |el| el.bg(cx.theme().list_active))
         .cursor_pointer()
         .on_click(move |_, window, cx| {
+            log::info!("destination button pressed: {:?}", destination);
             entity.update(cx, |app, cx| app.set_destination(destination, window, cx));
         })
         .child(icon.size(metrics.icon()).text_color(if is_current {
@@ -226,14 +140,12 @@ fn render_destination(
         }));
 
     // Button clips its internal content to the icon box. Keep the badge beside
-    // it so all digits survive on compact desktop buttons too.
+    // it so all digits survive on compact buttons too.
     div()
         .relative()
         .size(target)
         .flex_shrink_0()
         .child(button)
-        // A count, not a dot: how many conversations are waiting is the thing
-        // worth knowing before deciding to look.
         .when(badge > 0, |el| {
             el.child(
                 div()
@@ -259,16 +171,13 @@ fn render_destination(
                     .font_features(crate::components::parts::tabular())
                     .text_size(metrics.text_micro())
                     .text_color(cx.theme().primary_foreground)
-                    .child(
-                        div()
-                            .id("nav-badge-label")
-                            .debug_selector(|| "nav-badge-label".into())
-                            .child(if badge > 99 {
-                                "99+".to_string()
-                            } else {
-                                badge.to_string()
-                            }),
-                    ),
+                    .child(div().debug_selector(|| "nav-badge-label".into()).child(
+                        if badge > 99 {
+                            "99+".to_string()
+                        } else {
+                            badge.to_string()
+                        },
+                    )),
             )
         })
 }

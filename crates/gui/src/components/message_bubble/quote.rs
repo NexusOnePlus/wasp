@@ -44,8 +44,10 @@ pub fn render_quote(
         .h_auto()
         .flex()
         .gap(metrics.space_md())
+        .px(metrics.space_xs())
         .py(metrics.space_xxs())
         .rounded(metrics.radius_sm())
+        .bg(hue.opacity(0.1))
         .child(
             div()
                 .w(metrics.selection_bar_width())
@@ -72,6 +74,14 @@ pub fn render_quote(
         )
         .cursor_pointer()
         .on_click(move |_, _window, cx| {
-            entity.update(cx, |app, cx| app.jump_to_message(&target, cx));
+            entity.update(cx, |app, cx| {
+                if !app.jump_to_message(&target, cx) {
+                    app.notify_user(
+                        "That message is not loaded yet.",
+                        crate::app::notices::Tone::Info,
+                        cx,
+                    );
+                }
+            });
         })
 }

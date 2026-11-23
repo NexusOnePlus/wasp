@@ -104,6 +104,13 @@ pub fn render_message_list(
     let ids = Arc::clone(&cache.ids);
     let text = Arc::clone(&cache.text);
     let items = Arc::clone(&cache.items);
+    // One pass for the whole frame: each reader is named only under the last
+    // message they read, so a run of three does not repeat the same line three
+    // times. Filled on the first row the list asks for — the render that owns
+    // this view may still hold the app mutably, and reading it here would be
+    // a read inside an update.
+    let read_by: std::rc::Rc<std::cell::OnceCell<std::collections::HashMap<String, Vec<String>>>> =
+        std::rc::Rc::new(std::cell::OnceCell::new());
 
     let gutter = layout.conversation_padding();
     let media_state = state.clone();
@@ -162,6 +169,11 @@ pub fn render_message_list(
             // a gutter there hung the scrollbar a gutter's width inside the
             // pane, floating over the conversation rather than at its edge.
             list(state.clone(), move |ix, _window, cx| {
+                let read_by = read_by.get_or_init(|| {
+                    entity
+                        .read(cx)
+                        .read_receipt_names_by_last_message(&chat_jid, &messages)
+                });
                 let media_id = match items.get(ix) {
                     Some(TimelineItem::Message { ix, .. }) => messages
                         .get(*ix)
@@ -190,6 +202,7 @@ pub fn render_message_list(
                         &chat_jid,
                         is_group,
                         is_own_number,
+                        read_by,
                         layout,
                         metrics,
                         cx,
@@ -230,6 +243,7 @@ fn render_row(
     chat_jid: &SharedString,
     is_group: bool,
     is_own_number: bool,
+    read_by: &std::collections::HashMap<String, Vec<String>>,
     layout: ResponsiveLayout,
     metrics: Metrics,
     cx: &mut App,
@@ -252,7 +266,11 @@ fn render_row(
             .py(metrics.space_md())
             .child(render_encryption_notice(metrics, cx))
             .into_any_element(),
-        TimelineItem::Message { ix, starts_run } => {
+        TimelineItem::Message {
+            ix,
+            starts_run,
+            ends_run,
+        } => {
             // `ids` is built from these same messages and indexed the same
             // way, so the two are asked for together: a row that cannot find
             // one cannot find the other either.
@@ -313,6 +331,13 @@ fn render_row(
             });
             let props = BubbleProps {
                 ids: ids.clone(),
+                // The face is drawn at the foot of a run, so the key is
+                // needed on every row of it, not only the first. Gating this
+                // on `starts_run` left every multi-message run with a
+                // silhouette on the last bubble.
+                sender_avatar: (is_group && !msg.is_from_me)
+                    .then(|| app.sender_avatar_key(&msg.sender))
+                    .flatten(),
                 text: text.clone(),
                 message: Arc::clone(msg),
                 chat_jid: chat_jid.clone(),
@@ -326,6 +351,14 @@ fn render_row(
                     .as_ref()
                     .is_some_and(|quote| quote.sender == "Me" || app.is_own_number(&quote.sender)),
                 starts_run: *starts_run,
+                ends_run: *ends_run,
+                read_by: read_by.get(message_id).cloned().unwrap_or_default(),
+                highlighted: app.highlighted_message.as_deref() == Some(message_id.as_str()),
+                link_preview_pending: app.link_preview_pending(message_id),
+                link_preview_image: msg
+                    .link_preview
+                    .as_ref()
+                    .and_then(|preview| app.link_preview_image(message_id, preview)),
                 video_player_state: app.video_player_state(message_id),
                 video_frame: app.video_current_frame(message_id),
                 decoded_image,

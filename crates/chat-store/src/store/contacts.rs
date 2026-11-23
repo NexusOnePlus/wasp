@@ -1,7 +1,7 @@
 //! Contact names, from wherever they arrive: push names riding on live
 //! messages, business verified names, and the app-state contact action.
 //!
-//! The three upserts below read as one function called three times, and are
+//! The upserts below read as one function called several times, and are
 //! not: what differs between them is the column list, which is the whole of
 //! an upsert. One that took every name would write the columns its caller
 //! knows nothing about — a push name arriving on a message would blank the
@@ -49,6 +49,29 @@ pub(super) fn upsert_contact_push_name(
         .do_update()
         .set(dsl::push_name.eq(push_name))
         .filter(dsl::push_name.is_null().or(dsl::push_name.ne(push_name)))
+        .execute(conn)?;
+    Ok(changed > 0)
+}
+
+pub(super) fn upsert_contact_username(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    jid: &str,
+    username: &str,
+) -> QueryResult<bool> {
+    use diesel::query_dsl::methods::FilterDsl;
+    use schema::contacts::dsl;
+    let jid = contact_key(jid);
+    let changed = diesel::insert_into(dsl::contacts)
+        .values((
+            dsl::device_id.eq(device_id),
+            dsl::jid.eq(&jid),
+            dsl::username.eq(username),
+        ))
+        .on_conflict((dsl::device_id, dsl::jid))
+        .do_update()
+        .set(dsl::username.eq(username))
+        .filter(dsl::username.is_null().or(dsl::username.ne(username)))
         .execute(conn)?;
     Ok(changed > 0)
 }

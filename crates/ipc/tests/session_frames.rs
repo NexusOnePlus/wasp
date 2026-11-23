@@ -49,6 +49,7 @@ fn a_receipt(receipt_type: ReceiptType) -> UiEvent {
         chat_jid: "1@s.whatsapp.net".into(),
         message_ids: vec!["3EB0".into()],
         receipt_type,
+        sender: Some("1@s.whatsapp.net".into()),
     }
 }
 
@@ -199,6 +200,7 @@ fn an_omitted_field_comes_back_as_what_it_was() {
         downloadable: None,
         is_animated: true,
         duration_secs: Some(3),
+        is_gif: true,
         data_is_preview: true,
         waveform: None,
     });

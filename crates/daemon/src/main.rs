@@ -1,4 +1,4 @@
-//! `velod`: holds the WhatsApp session, shows a tray presence, and serves
+//! `waspd`: holds the WhatsApp session, shows a tray presence, and serves
 //! front ends over a local socket.
 //!
 //! The process around [`velo_daemon`], which is where everything it
@@ -28,7 +28,7 @@ mod macos_main;
 fn main() -> Result<()> {
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!(
-            "Usage: velod [OPTIONS]\n\nOptions:\n      --headless       Run headless without system tray integration\n      --account <id>   Run as a named account profile (own socket, lock,\n                       database and media cache; also VELO_ACCOUNT)\n  -h, --help           Print help"
+            "Usage: waspd [OPTIONS]\n\nOptions:\n      --headless       Run headless without system tray integration\n      --account <id>   Run as a named account profile (own socket, lock,\n                       database and media cache; also WASP_ACCOUNT)\n  -h, --help           Print help"
         );
         return Ok(());
     }
@@ -62,19 +62,19 @@ fn main() -> Result<()> {
         std::process::exit(2);
     }
     if let Some(id) = account_from_flag
-        && std::env::var_os("VELO_ACCOUNT").is_none()
+        && std::env::var_os("WASP_ACCOUNT").is_none()
     {
         // Single-threaded startup, before the runtime exists: no thread can
         // observe the environment changing under it.
         unsafe {
-            std::env::set_var("VELO_ACCOUNT", id);
+            std::env::set_var("WASP_ACCOUNT", id);
         }
     }
-    if let Some(raw) = std::env::var_os("VELO_ACCOUNT")
+    if let Some(raw) = std::env::var_os("WASP_ACCOUNT")
         && velo_wire::validate_account_id(&raw.to_string_lossy()).is_none()
     {
         eprintln!(
-            "error [invalid_account_id]: VELO_ACCOUNT must match [A-Za-z0-9][A-Za-z0-9_-]*, got {:?}",
+            "error [invalid_account_id]: WASP_ACCOUNT must match [A-Za-z0-9][A-Za-z0-9_-]*, got {:?}",
             raw.to_string_lossy()
         );
         std::process::exit(2);
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
     }
     #[cfg(windows)]
     if let Err(e) = velo_platform::windows_desktop::register_identity() {
-        log::warn!("could not register Velo's notification name and logo: {e}");
+        log::warn!("could not register Wasp's notification name and logo: {e}");
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -151,7 +151,7 @@ async fn run(hub: Arc<tray::TrayHub>) -> Result<()> {
     // the binding exists only where the non-macOS branch below reads it.
     #[cfg(not(target_os = "macos"))]
     let headless =
-        std::env::args().any(|a| a == "--headless") || std::env::var_os("VELOD_HEADLESS").is_some();
+        std::env::args().any(|a| a == "--headless") || std::env::var_os("WASPD_HEADLESS").is_some();
     #[cfg(not(target_os = "macos"))]
     let tray = if headless {
         log::info!("running in headless mode: system tray disabled");

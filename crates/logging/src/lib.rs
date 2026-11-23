@@ -6,7 +6,7 @@
 //! level raised in Settings was refused by the logger underneath it. The
 //! second is that the answer has to survive a restart, and both processes
 //! that write logs have to read the same one — a level a person sets in the
-//! window and a level `velod` starts at are one setting, not two.
+//! window and a level `waspd` starts at are one setting, not two.
 //!
 //! So the shape here is the shape the rest of the tree already has: one
 //! interface, two implementations, and no `cfg` above it. A desktop reads

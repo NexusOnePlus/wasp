@@ -30,7 +30,7 @@ pub fn render_window_bar(cx: &App) -> impl IntoElement + use<> {
                 .child(
                     // Tinted with the accent, so the mark follows the colour
                     // chosen in Appearance.
-                    Icon::from(ProductIcon::VeloMark)
+                    Icon::from(ProductIcon::WaspMark)
                         .size(metrics.icon_small())
                         .text_color(cx.theme().primary),
                 )
@@ -38,7 +38,7 @@ pub fn render_window_bar(cx: &App) -> impl IntoElement + use<> {
                     div()
                         .text_size(metrics.text_small())
                         .text_color(parts::subtle(cx))
-                        .child("Velo"),
+                        .child("Wasp"),
                 ),
         )
 }

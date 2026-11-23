@@ -18,13 +18,14 @@ use crate::retained_image::RetainedImage;
 use std::sync::Arc;
 
 use gpui::{
-    App, Entity, InteractiveElement, IntoElement, ParentElement, RenderImage, SharedString,
-    StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _,
+    App, Entity, InteractiveElement, IntoElement, ObjectFit, ParentElement, RenderImage,
+    SharedString, StatefulInteractiveElement as _, Styled, StyledImage as _, div, img,
+    prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::ContextMenuExt as _;
-use gpui_component::{Sizable as _, h_flex, v_flex};
+use gpui_component::{Icon, IconName, Sizable as _, h_flex, v_flex};
 
 pub use audio::SPEEDS;
 pub use system::render_encryption_notice;
@@ -36,11 +37,12 @@ use quote::render_quote;
 use reactions::{render_hover_actions, render_reaction_picker, render_reactions};
 
 use crate::app::{
-    BubbleIds, CopyMessage, DeleteSentMessage, EditMessage, OpenMessageLink, ReactToMessage,
-    ReplyToMessage, RetryMessage, WhatsAppApp, can_delete_sent,
+    BubbleIds, CopyMessage, DeleteSentMessage, EditMessage, OpenMessageInfo, OpenMessageLink,
+    ReactToMessage, RegenerateLinkPreview, ReplyToMessage, RetryMessage, WhatsAppApp,
+    can_delete_sent,
 };
 use crate::components::parts;
-use crate::components::{BubbleText, bubble_status_ticks, render_rich_text};
+use crate::components::{Avatar, BubbleText, bubble_status_ticks, render_rich_text};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 use crate::utils::format_time_local;
@@ -51,6 +53,9 @@ use velo_core::ChatMessage;
 pub struct BubbleProps {
     /// This row's element ids, formatted when the timeline was built.
     pub ids: BubbleIds,
+    /// The sender's picture, where the daemon has resolved one for this
+    /// group sender. `None` draws the silhouette, not a gap.
+    pub sender_avatar: Option<String>,
     /// This row's text, parsed when the timeline was built. Travels with the
     /// row for the same reason the ids do: deriving it here is deriving it
     /// per frame for text that cannot change without a rebuild.
@@ -76,6 +81,18 @@ pub struct BubbleProps {
     /// First message of a run by this author, which is what earns the sender
     /// name and the wider gap above.
     pub starts_run: bool,
+    /// Whether the group's last bubble is this one. The avatar is drawn at
+    /// the foot of the run, as the phone does, while the name stays on the
+    /// first bubble at the top.
+    pub ends_run: bool,
+    /// Names of the people who have read this outgoing group message.
+    pub read_by: Vec<String>,
+    /// Whether the timeline just jumped to this row.
+    pub highlighted: bool,
+    /// This outgoing message's link card is still being fetched.
+    pub link_preview_pending: bool,
+    /// The decoded thumbnail for the link card, shared across frames.
+    pub link_preview_image: Option<gpui::ImageSource>,
     pub video_player_state: Option<VideoPlayerState>,
     pub video_frame: Option<Arc<RenderImage>>,
     pub decoded_image: Option<RetainedImage>,
@@ -117,6 +134,7 @@ pub fn render_message_bubble(
     let metrics = *layout.metrics();
     let ids = props.ids;
     let message = props.message;
+    let sender_avatar = props.sender_avatar.clone();
     // A row nobody typed belongs to the conversation, not to a side of it.
     if let Some(notice) = &message.system {
         return div()
@@ -156,10 +174,45 @@ pub fn render_message_bubble(
     let sender_hue = cx.product().speaker(&message.sender);
 
     let product = cx.product();
-    let bubble_bg = if is_from_me {
+    // Media is not a message with a picture in it: it is the picture. The
+    // bubble's own surface is what drew the coloured frame around every
+    // photo, sticker and video — the padding kept the image inside it, and
+    // the sent bubble's ultramarine read as a blue border. A row whose only
+    // content is media therefore gets no surface and the smallest padding
+    // the theme has; what remains is the wallpaper around a picture, which
+    // is what every other messenger shows.
+    //
+    // Captions keep their bubble: the text still needs a ground to sit on,
+    // and a caption without one is harder to read than the frame was to
+    // remove.
+    let media_only = message.media.is_some()
+        && content.is_empty()
+        && message.quoted.is_none()
+        && message.poll.is_none()
+        && message.business.is_none();
+    // A photo with a caption is one message, not a caption inside a photo's
+    // blue box. The picture keeps the wallpaper as its ground and the words
+    // keep a bubble of their own, the way WhatsApp draws a captioned send.
+    let captioned_media = message.media.is_some()
+        && (!content.is_empty() || message.quoted.is_some())
+        && message.poll.is_none();
+    // An emoji on its own is not a sentence in a blue box: it is the message,
+    // at emoji size, over the wallpaper. The sender name and avatar still
+    // give it a side and an author.
+    let emoji_only = message.media.is_none()
+        && message.quoted.is_none()
+        && message.poll.is_none()
+        && message.business.is_none()
+        && is_emoji_only(&message.content);
+    let bubble_surface = if is_from_me {
         product.hsla(product.palette.message_sent)
     } else {
         product.hsla(product.palette.message_received)
+    };
+    let bubble_bg = if media_only || emoji_only || captioned_media {
+        gpui::hsla(0., 0., 0., 0.)
+    } else {
+        bubble_surface
     };
 
     let retry_entity = entity.clone();
@@ -203,6 +256,10 @@ pub fn render_message_bubble(
         // plus the action bar beside it is wider than a narrow pane, and
         // without this the overflow went out through the window's edge.
         .min_w_0()
+        .when(props.highlighted, |el| {
+            el.bg(cx.theme().primary.opacity(0.12))
+                .rounded(metrics.radius_md())
+        })
         .flex()
         .group(ids.group.clone())
         .map(|el| {
@@ -237,6 +294,19 @@ pub fn render_message_bubble(
                     )),
             )
         })
+        // A group reads as people when the face is beside what they said.
+        // The gutter is reserved on every row so a run's bubbles line up;
+        // only the first row of a run draws a picture.
+        .when(!is_from_me && props.is_group, |el| {
+            el.child(render_sender_gutter(
+                &message,
+                sender_avatar,
+                props.ends_run,
+                entity.clone(),
+                metrics,
+                cx,
+            ))
+        })
         .child(
             v_flex()
                 .min_w_0()
@@ -250,8 +320,16 @@ pub fn render_message_bubble(
                         // with an unbreakable token, a URL, or a caption, it
                         // is painted inside the bubble or not at all.
                         .overflow_hidden()
-                        .px(metrics.bubble_padding_x())
-                        .py(metrics.bubble_padding_y())
+                        .px(if media_only || emoji_only || captioned_media {
+                            metrics.space_xs()
+                        } else {
+                            metrics.bubble_padding_x()
+                        })
+                        .py(if media_only || emoji_only || captioned_media {
+                            metrics.space_xs()
+                        } else {
+                            metrics.bubble_padding_y()
+                        })
                         // Asymmetric corners: the tight one marks the side the
                         // message came from, so authorship survives even when
                         // the two bubble colours are close.
@@ -307,15 +385,19 @@ pub fn render_message_bubble(
                                         })
                                         .child(name)
                                 }))
-                                .children(message.quoted.as_ref().map(|quoted| {
-                                    render_quote(
-                                        quoted,
-                                        props.quoted_sender_is_self,
-                                        entity.clone(),
-                                        metrics,
-                                        cx,
-                                    )
-                                }))
+                                .children(if captioned_media {
+                                    None
+                                } else {
+                                    message.quoted.as_ref().map(|quoted| {
+                                        render_quote(
+                                            quoted,
+                                            props.quoted_sender_is_self,
+                                            entity.clone(),
+                                            metrics,
+                                            cx,
+                                        )
+                                    })
+                                })
                                 .children(message.business.as_ref().map(|_| {
                                     business::render_header(
                                         content.business(),
@@ -368,9 +450,37 @@ pub fn render_message_bubble(
                                 .child(
                                     div()
                                         .flex()
-                                        .flex_wrap()
-                                        .items_end()
-                                        .gap(metrics.space_md())
+                                        .when(captioned_media, |row| {
+                                            row.flex_col()
+                                                .gap(metrics.space_xxs())
+                                                .px(metrics.bubble_padding_x())
+                                                .py(metrics.bubble_padding_y())
+                                                .rounded(metrics.radius_bubble())
+                                                .map(|row| {
+                                                    if is_from_me {
+                                                        row.rounded_br(metrics.radius_bubble_tail())
+                                                    } else {
+                                                        row.rounded_bl(metrics.radius_bubble_tail())
+                                                    }
+                                                })
+                                                .bg(bubble_surface)
+                                        })
+                                        .when(!captioned_media, |row| {
+                                            row.flex_wrap().items_end().gap(metrics.space_md())
+                                        })
+                                        .children(if captioned_media {
+                                            message.quoted.as_ref().map(|quoted| {
+                                                render_quote(
+                                                    quoted,
+                                                    props.quoted_sender_is_self,
+                                                    entity.clone(),
+                                                    metrics,
+                                                    cx,
+                                                )
+                                            })
+                                        } else {
+                                            None
+                                        })
                                         .when(message.poll.is_none() && !content.is_empty(), |el| {
                                             el.child(
                                                 div()
@@ -388,7 +498,11 @@ pub fn render_message_bubble(
                                                     // conversation and out of
                                                     // the window.
                                                     .min_w_0()
-                                                    .text_size(metrics.text_body())
+                                                    .text_size(if emoji_only {
+                                                        metrics.text_body() * 2.6
+                                                    } else {
+                                                        metrics.text_body()
+                                                    })
                                                     // Inter Regular at ~1.4: the
                                                     // reading measure Signal uses
                                                     // for message text, tighter
@@ -396,7 +510,18 @@ pub fn render_message_bubble(
                                                     // ratio, which spread long
                                                     // messages into ruled paper.
                                                     .font_weight(gpui::FontWeight::NORMAL)
-                                                    .line_height(gpui::relative(1.42))
+                                                    .line_height(gpui::relative(if emoji_only {
+                                                        1.1
+                                                    } else {
+                                                        1.42
+                                                    }))
+                                                    .when(emoji_only, |el| {
+                                                        el.font_family(
+                                                            crate::platform::fonts::emoji_family(
+                                                                cx,
+                                                            ),
+                                                        )
+                                                    })
                                                     .text_color(cx.theme().foreground)
                                                     .child(render_rich_text(
                                                         content,
@@ -430,6 +555,32 @@ pub fn render_message_bubble(
                                 })),
                         ),
                 )
+                .children(if props.link_preview_pending {
+                    Some(
+                        render_link_preview_skeleton(layout.max_bubble_width(), metrics, cx)
+                            .into_any_element(),
+                    )
+                } else {
+                    message.link_preview.clone().map(|preview| {
+                        render_link_preview(
+                            preview,
+                            props.link_preview_image.clone(),
+                            layout.max_bubble_width(),
+                            metrics,
+                            cx,
+                        )
+                        .into_any_element()
+                    })
+                })
+                .when(!props.read_by.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .mt(metrics.space_xxs())
+                            .text_size(metrics.text_micro())
+                            .text_color(parts::subtle(cx))
+                            .child(read_by_label(&props.read_by)),
+                    )
+                })
                 .when(!link_buttons.is_empty(), |el| {
                     // Opening an address is a command, so each one is a
                     // `Button` — that is what carries focus and keyboard
@@ -566,6 +717,17 @@ pub fn render_message_bubble(
             } else {
                 menu
             };
+            let menu = if is_from_me {
+                menu.menu(
+                    "Message info",
+                    Box::new(OpenMessageInfo {
+                        jid: menu_jid.clone(),
+                        id: menu_id.clone().into(),
+                    }),
+                )
+            } else {
+                menu
+            };
             let menu = if menu_text.is_empty() {
                 menu
             } else {
@@ -580,6 +742,24 @@ pub fn render_message_bubble(
             // ranges answer only the pointer, and a menu item is activatable
             // once the menu is open, which those ranges never are.
             let mut menu = menu;
+            // A card fetched when the thumbnail cap was lower — or one the
+            // sender's client shrunk — can be replaced here without touching
+            // the message on the wire.
+            let preview_target = menu_message
+                .link_preview
+                .as_ref()
+                .map(|preview| preview.url.clone())
+                .or_else(|| crate::platform::link_preview::first_url(&menu_message.content));
+            if let Some(url) = preview_target {
+                menu = menu.menu(
+                    "Regenerate preview",
+                    Box::new(RegenerateLinkPreview {
+                        jid: menu_jid.clone(),
+                        id: menu_id.clone().into(),
+                        url: url.into(),
+                    }),
+                );
+            }
             for target in menu_links.iter() {
                 menu = menu.menu(
                     crate::tr!(open_target, target),
@@ -622,7 +802,308 @@ pub fn render_message_bubble(
         .into_any_element()
 }
 
+/// Whether a message is nothing but emoji.
+///
+/// WhatsApp draws these without a bubble and much larger: a single face is
+/// not a sentence, and a blue box around one reads as a mistake. Joiners,
+/// variation selectors, skin tones and keycap marks belong to the cluster
+/// they follow; digits and `#`/`*` count only inside a keycap sequence, so
+/// "2024" never qualifies. Three emoji is the cutoff — past that the line is
+/// a message again and wraps like one.
+fn is_emoji_only(content: &str) -> bool {
+    let has_keycap = content.contains('\u{20E3}');
+    let mut clusters = 0usize;
+    let mut joined = false;
+    for ch in content.chars() {
+        if ch.is_whitespace() {
+            joined = false;
+            continue;
+        }
+        let value = ch as u32;
+        // A zero-width joiner glues the next scalar onto the cluster that
+        // just ended. Selectors, keycaps and skin tones belong to the
+        // previous scalar and start nothing on their own.
+        if value == 0x200D {
+            joined = true;
+            continue;
+        }
+        if matches!(value, 0xFE0F | 0xFE0E | 0x20E3) || (0x1F3FB..=0x1F3FF).contains(&value) {
+            continue;
+        }
+        let member = is_emoji_scalar(value) || (has_keycap && matches!(ch, '0'..='9' | '#' | '*'));
+        if !member {
+            return false;
+        }
+        if !joined {
+            clusters += 1;
+        }
+        joined = false;
+    }
+    (1..=3).contains(&clusters)
+}
+
+/// The scalar values Unicode assigns to emoji presentation by default.
+fn is_emoji_scalar(value: u32) -> bool {
+    matches!(
+        value,
+        0x00A9
+            | 0x00AE
+            | 0x203C
+            | 0x2049
+            | 0x2122
+            | 0x2139
+            | 0x2194..=0x21AA
+            | 0x231A..=0x231B
+            | 0x2328
+            | 0x23CF
+            | 0x23E9..=0x23F3
+            | 0x23F8..=0x23FA
+            | 0x24C2
+            | 0x25AA..=0x25FE
+            | 0x2600..=0x27BF
+            | 0x2934..=0x2935
+            | 0x2B05..=0x2B55
+            | 0x3030
+            | 0x303D
+            | 0x3297
+            | 0x3299
+            | 0x1F000..=0x1FAFF
+    )
+}
+
 /// The time and, on our own messages, its tick.
+/// The face beside a group message, or the empty column that keeps a run
+/// aligned with the message it continues.
+fn render_sender_gutter(
+    message: &ChatMessage,
+    avatar: Option<String>,
+    show: bool,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let size = metrics.avatar_inline();
+    let name = message.author_label().into_owned();
+    div()
+        .w(size)
+        .flex_shrink_0()
+        .flex()
+        .items_end()
+        .justify_center()
+        .when(show, |el| {
+            let person = message.sender.clone();
+            let click_name = name.clone();
+            el.child(
+                div()
+                    .id(SharedString::from(format!("sender-avatar-{}", message.id)))
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| {
+                        let person = person.clone();
+                        let click_name = click_name.clone();
+                        entity.update(cx, |app, cx| {
+                            app.message_person(person, Some(click_name), window, cx);
+                        });
+                    })
+                    .child(
+                        Avatar::new(message.sender.clone(), &name, size)
+                            .picture(avatar, None)
+                            .on(cx.theme().background),
+                    ),
+            )
+        })
+}
+
+/// The card WhatsApp draws under a message that carries a link.
+///
+/// The card's shape while its page is still being read.
+///
+/// The bubble used to look finished and then grow a card a second later,
+/// which read as "there is no preview" rather than "this is loading". The
+/// bars occupy the same height the real card will, so the message does not
+/// jump when the fields arrive.
+fn render_link_preview_skeleton(
+    max_width: gpui::Pixels,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    div()
+        .id("link-preview-loading")
+        .debug_selector(|| "link-preview-loading".into())
+        .mt(metrics.space_xxs())
+        .w_full()
+        .max_w(max_width)
+        .overflow_hidden()
+        .rounded(metrics.radius_md())
+        .bg(cx.theme().secondary)
+        .border_1()
+        .border_color(cx.theme().border)
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .w_full()
+                .px(metrics.space_sm())
+                .py(metrics.space_xs())
+                .flex()
+                .flex_col()
+                .gap(metrics.space_xs())
+                .child(
+                    div()
+                        .w(metrics.space_xxxl() * 3.0)
+                        .h(metrics.space_xs())
+                        .rounded_full()
+                        .bg(cx.theme().border),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .h(metrics.space_sm())
+                        .rounded_full()
+                        .bg(cx.theme().border),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .aspect_ratio(1.9)
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(cx.theme().background)
+                .child(
+                    Icon::new(IconName::LoaderCircle)
+                        .size(metrics.icon())
+                        .text_color(cx.theme().muted_foreground),
+                ),
+        )
+}
+
+/// The sender's client already fetched the page; this side only keeps the
+/// four fields it sent. A card without an address is not drawn at all, so the
+/// button that opens it always has somewhere to go.
+fn render_link_preview(
+    preview: velo_core::LinkPreview,
+    image: Option<gpui::ImageSource>,
+    max_width: gpui::Pixels,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let url = preview.url.clone();
+    let host = SharedString::from(preview.host().to_string());
+    let site = preview
+        .site_name
+        .clone()
+        .filter(|site| !site.trim().is_empty())
+        .unwrap_or_else(|| host.to_string());
+    let title = preview
+        .title
+        .clone()
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| host.to_string());
+    let description = preview
+        .description
+        .clone()
+        .filter(|description| !description.is_empty());
+    let has_image = image.is_some();
+    let monogram = host
+        .chars()
+        .next()
+        .map(|letter| letter.to_uppercase().to_string())
+        .unwrap_or_else(|| "#".to_string());
+    div()
+        .id("link-preview")
+        .debug_selector(|| "link-preview".into())
+        .mt(metrics.space_xxs())
+        .w_full()
+        .max_w(max_width)
+        .overflow_hidden()
+        .rounded(metrics.radius_md())
+        .bg(cx.theme().secondary)
+        .border_1()
+        .border_color(cx.theme().border)
+        .cursor_pointer()
+        .on_click(move |_, _, cx| cx.open_url(&url))
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .px(metrics.space_sm())
+                .py(metrics.space_xs())
+                .flex()
+                .flex_col()
+                .gap(metrics.space_xxs())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(metrics.space_xs())
+                        // A page with no picture - a private repository, a
+                        // 404, a site that never published one - still gets a
+                        // visual mark instead of a card that looks unfinished.
+                        .when(!has_image, |row| {
+                            row.child(
+                                div()
+                                    .size(metrics.space_xl())
+                                    .flex_shrink_0()
+                                    .rounded(metrics.radius_sm())
+                                    .bg(cx.theme().primary.opacity(0.14))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(metrics.text_micro())
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(cx.theme().primary)
+                                    .child(monogram),
+                            )
+                        })
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_size(metrics.text_micro())
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(cx.theme().muted_foreground)
+                                .truncate()
+                                .child(site),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.text_small())
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(cx.theme().foreground)
+                        .truncate()
+                        .child(title),
+                )
+                .children(description.map(|description| {
+                    div()
+                        .text_size(metrics.text_meta())
+                        .text_color(cx.theme().muted_foreground)
+                        .truncate()
+                        .child(description)
+                })),
+        )
+        .children(image.map(|image| {
+            div()
+                .w_full()
+                .aspect_ratio(1.9)
+                .flex_shrink_0()
+                .child(img(image).size_full().object_fit(ObjectFit::Cover))
+        }))
+}
+
+/// "Read by Ana, Luis and 2 more" without listing a whole group.
+fn read_by_label(names: &[String]) -> String {
+    let visible = names.iter().take(3).cloned().collect::<Vec<_>>();
+    let remaining = names.len().saturating_sub(visible.len());
+    if remaining == 0 {
+        format!("Read by {}", visible.join(", "))
+    } else {
+        format!("Read by {} and {remaining} more", visible.join(", "))
+    }
+}
+
 fn render_meta(
     time: SharedString,
     status: Option<velo_core::MessageStatus>,
@@ -667,4 +1148,20 @@ fn render_meta(
                 .child(time),
         )
         .children(status.map(|status| bubble_status_ticks(status, metrics.icon_small(), cx)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_emoji_only;
+
+    #[test]
+    fn only_emoji_earn_the_bubbleless_treatment() {
+        for emoji in ["👍", "😂😂", "❤️", "👨‍👩‍👧", "🇪🇸", "1️⃣", "✌🏽"]
+        {
+            assert!(is_emoji_only(emoji), "{emoji} is emoji");
+        }
+        for text in ["hola", "👍 ok", "2024", "#1", ":)", "👍👍👍👍", "  ", ""] {
+            assert!(!is_emoji_only(text), "{text:?} is not emoji-only");
+        }
+    }
 }

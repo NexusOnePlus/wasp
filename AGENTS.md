@@ -1,4 +1,4 @@
-# Velo
+# Wasp
 
 Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap/whatsapp-rust).
 GPUI front end. The same tree builds a desktop app and a web front end for
@@ -89,7 +89,7 @@ cargo test -p velo-plugin-host --all-features -- --ignored
 `cargo xtask help` lists the repository's own tooling — prefer asking it to
 assuming, since tasks are added there. Running the client is the window and the
 daemon, and the window looks for the daemon beside itself; `cargo build
---release` then run the front-end binary. `velo-cli` is a third binary, a
+--release` then run the front-end binary. `wasp-cli` is a third binary, a
 front end onto the same daemon. The web build, plugin builds, the browser test
 runner and the profiling and source-map builds are in
 **[docs/building.md](docs/building.md)**.

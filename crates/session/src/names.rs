@@ -322,7 +322,7 @@ impl NameBook {
             }
         };
         let name = contact
-            .and_then(|contact| contact.display_name().map(str::to_owned))
+            .and_then(|contact| contact.display_label().map(|label| label.into_owned()))
             .filter(|name| !name.trim().is_empty());
         let mut cache = lock(&self.cache);
         if cache.generation == generation {

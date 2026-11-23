@@ -22,7 +22,7 @@
   make Windows trust a file and is not a substitute; see SIGNING.md.
 
 .EXAMPLE
-  ./sign.ps1 -Thumbprint 0123...ABCD -Files target\release\velo.exe,target\release\velod.exe
+  ./sign.ps1 -Thumbprint 0123...ABCD -Files target\release\wasp.exe,target\release\waspd.exe
 #>
 param(
     [Parameter(Mandatory = $true)][string[]]$Files,
@@ -31,8 +31,8 @@ param(
     # $env:WINDOWS_SIGNING_PFX_PASSWORD.
     [string]$PfxBase64 = $env:WINDOWS_SIGNING_PFX_BASE64,
     [string]$TimestampUrl = $(if ($env:WINDOWS_SIGNING_TIMESTAMP_URL) { $env:WINDOWS_SIGNING_TIMESTAMP_URL } else { 'http://timestamp.digicert.com' }),
-    [string]$Description = 'Velo',
-    [string]$DescriptionUrl = $(if ($env:WINDOWS_SIGNING_DESCRIPTION_URL) { $env:WINDOWS_SIGNING_DESCRIPTION_URL } else { 'https://github.com/Ruchin-Audichya/velo' })
+    [string]$Description = 'Wasp',
+    [string]$DescriptionUrl = $(if ($env:WINDOWS_SIGNING_DESCRIPTION_URL) { $env:WINDOWS_SIGNING_DESCRIPTION_URL } else { 'https://github.com/NexusOnePlus/wasp' })
 )
 
 $ErrorActionPreference = 'Stop'

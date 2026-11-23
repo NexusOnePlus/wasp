@@ -38,7 +38,7 @@ const PIPE: usize = 1 << 18;
 /// # Errors
 ///
 /// Something else already holds this account — another tab, on the web —
-/// which is the same refusal a second `velod` gets from the startup lock.
+/// which is the same refusal a second `waspd` gets from the startup lock.
 ///
 /// The returned stream is the client's end: write requests into it, read
 /// frames out of it, exactly as a socket. Dropping it ends the connection,

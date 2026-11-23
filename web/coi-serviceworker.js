@@ -76,16 +76,16 @@ if (typeof window === "undefined") {
     // a click must never be sent to whichever tab happens to be focused.
     const notificationClients = new Map();
     self.addEventListener("message", (event) => {
-        const id = event.data?.veloClientId;
+        const id = event.data?.waspClientId;
         if (typeof id === "string" && event.source?.id) {
             notificationClients.set(id, event.source.id);
         }
     });
 
     self.addEventListener("notificationclick", (event) => {
-        const tag = event.notification.data?.veloTag;
-        const origin = event.notification.data?.veloClientId;
-        if (typeof tag !== "string" || !tag.startsWith("velo-chat-")) {
+        const tag = event.notification.data?.waspTag;
+        const origin = event.notification.data?.waspClientId;
+        if (typeof tag !== "string" || !tag.startsWith("wasp-chat-")) {
             return;
         }
         event.notification.close();
@@ -97,8 +97,8 @@ if (typeof window === "undefined") {
             if (page) {
                 await page.focus();
                 page.postMessage({
-                    veloNotificationTag: tag,
-                    veloAccountEpoch: event.notification.data?.veloAccountEpoch,
+                    waspNotificationTag: tag,
+                    waspAccountEpoch: event.notification.data?.waspAccountEpoch,
                 });
             } else {
                 // The originating tab is gone. Open the application but do

@@ -12,10 +12,11 @@ use gpui_component::{Icon, IconName};
 
 use crate::app::{Destination, MessageListCache, OfflineRecovery, WhatsAppApp};
 use crate::components::{
-    ChatListProps, EmptyState, InputAreaView, PluginContext, ProductIcon, StatusListProps,
-    StatusSelection, StatusViewProps, ViewerProps, parts, plugin_ui, render_call_card,
-    render_chat_header, render_chat_list, render_conversation_search, render_media_viewer,
-    render_message_list, render_nav_rail, render_status_list, render_status_view,
+    ChatListProps, EmptyState, InputAreaView, PastePreviewProps, PluginContext, ProductIcon,
+    StatusListProps, StatusSelection, StatusViewProps, ViewerProps, parts, plugin_ui,
+    render_attachment_tray, render_call_card, render_chat_header, render_chat_list,
+    render_conversation_search, render_destination_pill, render_media_viewer, render_message_list,
+    render_status_list, render_status_view,
 };
 use crate::responsive::ResponsiveLayout;
 use crate::theme::Metrics;
@@ -106,7 +107,6 @@ pub fn render_connected_view(
     // visible than a chat on another screen.
     let visible = (app.destination().has_conversations()
         && layout.show_chat_area()
-        && !app.paste_preview_showing()
         && app.media_viewer(cx).is_none())
     .then(|| selected_jid.clone())
     .flatten();
@@ -158,6 +158,12 @@ pub fn render_connected_view(
     let message_cache = open_chat
         .as_ref()
         .map(|jid| app.get_message_list_cache(jid, typing.clone(), layout, cx));
+    // The conversation on screen is the one whose pictures are worth fetching
+    // without a tap. Bounded and attempted once per message; see
+    // `auto_download_recent_images`.
+    if let Some(jid) = open_chat.as_deref() {
+        app.auto_download_recent_images(jid, cx);
+    }
     // A search hit picked before its chat's messages had loaded: the cache
     // just built is what the jump scrolls through, so this is the first
     // moment it can land.
@@ -186,6 +192,24 @@ pub fn render_connected_view(
                 cx,
             )),
             "conversation-search-in",
+        )
+        .into_any_element()
+    });
+    // Files waiting to go out sit between the conversation and the composer,
+    // not over both. The reader can still see what they are replying to while
+    // they write the caption, which is the whole reason this stopped being a
+    // full-screen modal.
+    let attachment_tray = app.pending_paste_preview().map(|preview| {
+        render_attachment_tray(
+            PastePreviewProps {
+                files: &preview.files,
+                list_scroll: &preview.list_scroll,
+                app: entity.clone(),
+                can_send: app.can_send(),
+                focus_handle: app.paste_preview_focus(),
+                metrics: *layout.metrics(),
+            },
+            cx,
         )
         .into_any_element()
     });
@@ -287,6 +311,14 @@ pub fn render_connected_view(
                 Some((author.jid.clone(), key))
             })
             .collect(),
+        previews: feed
+            .authors()
+            .iter()
+            .filter_map(|author| {
+                app.status_thumbnail(&feed, author)
+                    .map(|image| (author.jid.clone(), image))
+            })
+            .collect(),
         feed,
         can_load_more: app.status_can_load_more(cx),
         selected: StatusSelection::of(app.status_pane().author()),
@@ -314,7 +346,9 @@ pub fn render_connected_view(
             && open_chat.is_some()
             && !is_offline,
         viewer: viewer.is_some(),
-        paste_preview: false,
+        paste_preview: attachment_tray.is_some(),
+        // The palette is drawn by the root, above this view.
+        palette: false,
         message_edit: false,
         message_delete: false,
         // The card floats above this view rather than inside it, so the root
@@ -322,7 +356,12 @@ pub fn render_connected_view(
         call_card: false,
     });
 
-    let rail = render_rail(app, entity.clone(), layout, cx);
+    let destination_unread = [
+        app.unread_chat_count(),
+        app.status_unseen(),
+        app.unread_destination_count(Destination::Channels),
+        app.unread_destination_count(Destination::Communities),
+    ];
 
     // Borrowed last, once nothing else needs `app` mutably: the header and
     // the empty state are the only readers of the chat itself, and everything
@@ -359,7 +398,40 @@ pub fn render_connected_view(
                     .relative()
                     .h_full()
                     .flex_shrink_0()
-                    .child(sidebar)
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_1().min_h_0().child(sidebar))
+                    .when(layout.is_mobile(), |sidebar| {
+                        sidebar.child(render_destination_pill(
+                            app.destination(),
+                            destination_unread,
+                            entity.clone(),
+                            layout,
+                            cx,
+                        ))
+                    })
+                    .when(!layout.is_mobile(), |sidebar| {
+                        sidebar.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom(layout.metrics().space_lg())
+                                .flex()
+                                .justify_center()
+                                // The capsule owns its pixels. Without this,
+                                // the list's row hitboxes under it won every
+                                // click and a destination opened a chat.
+                                .occlude()
+                                .child(render_destination_pill(
+                                    app.destination(),
+                                    destination_unread,
+                                    entity.clone(),
+                                    layout,
+                                    cx,
+                                )),
+                        )
+                    })
                     .when(!layout.is_mobile(), |sidebar| {
                         let drag_entity = entity.clone();
                         let reset_entity = entity.clone();
@@ -369,8 +441,7 @@ pub fn render_connected_view(
                                     drag_entity.update(cx, |app, cx| {
                                         let layout = app.responsive_layout(window, cx);
                                         if !layout.is_mobile() {
-                                            let width =
-                                                event.event.position.x - layout.rail_width();
+                                            let width = event.event.position.x;
                                             let wanted = Some(
                                                 f32::from(width) / layout.metrics().rem_size(),
                                             );
@@ -409,6 +480,7 @@ pub fn render_connected_view(
                         availability: availability.as_ref(),
                         members,
                         search_bar,
+                        attachment_tray,
                         input_area,
                         can_send,
                         offline_recovery,
@@ -479,14 +551,12 @@ pub fn render_connected_view(
     // foot where there is not — and on a phone only while the list is on
     // screen, because a conversation there is the whole window.
     let shell = if layout.is_mobile() {
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .child(panes)
-            .when(layout.show_sidebar(), |el| el.child(rail))
+        // The capsule is already the sidebar's own footer on a phone: the
+        // list and the bar are one pane, and adding another here drew it
+        // twice.
+        div().flex().flex_col().size_full().child(panes)
     } else {
-        div().flex().size_full().child(rail).child(panes)
+        div().flex().size_full().child(panes)
     };
 
     div().relative().size_full().child(shell).children(viewer)
@@ -499,40 +569,6 @@ pub fn render_connected_view(
 /// to ring at the far end with no card, no Accept and no Decline anywhere in
 /// the window. It floats and takes no input of its own, so the screen
 /// underneath stays usable for the whole call.
-/// The navigation strip, with its unread counts and the account photo.
-///
-/// Its own function so the screens that replace the chat panes — Calls,
-/// Files — keep it: a full-window screen with no way back but a text link
-/// is a dead end, which the desktop messengers never are.
-pub fn render_rail(
-    app: &WhatsAppApp,
-    entity: Entity<WhatsAppApp>,
-    layout: crate::responsive::ResponsiveLayout,
-    cx: &App,
-) -> impl IntoElement + use<> {
-    let screen = if app.calls_open {
-        Some(crate::components::RailScreen::Calls)
-    } else if app.files_open {
-        Some(crate::components::RailScreen::Files)
-    } else {
-        None
-    };
-    render_nav_rail(
-        app.destination(),
-        screen,
-        [
-            app.unread_chat_count(),
-            app.status_unseen(),
-            app.unread_destination_count(Destination::Channels),
-            app.unread_destination_count(Destination::Communities),
-        ],
-        app.account_summary(),
-        entity,
-        layout,
-        cx,
-    )
-}
-
 pub fn render_call_overlay(
     app: &mut WhatsAppApp,
     window: &mut Window,
@@ -563,6 +599,7 @@ struct ChatAreaProps<'a> {
     /// answered for.
     members: Option<&'a velo_core::GroupRoster>,
     search_bar: Option<gpui::AnyElement>,
+    attachment_tray: Option<gpui::AnyElement>,
     input_area: Option<Entity<InputAreaView>>,
     /// Whether anything can be sent from here at all.
     can_send: bool,
@@ -596,6 +633,7 @@ fn render_chat_area(
         availability,
         members,
         search_bar,
+        attachment_tray,
         input_area,
         can_send,
         offline_recovery,
@@ -713,7 +751,7 @@ fn render_chat_area(
                     if let Some(recovery) = offline_recovery {
                         el.child(render_offline_strip(entity.clone(), recovery, metrics, cx))
                     } else {
-                        el.children(input_area)
+                        el.children(attachment_tray).children(input_area)
                     }
                 })
                 .on_drop({

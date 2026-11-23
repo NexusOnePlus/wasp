@@ -35,9 +35,9 @@ mod messages;
 
 pub(crate) use messages::deliver;
 
-const OPEN_ID: &str = "velo-open";
-const HIDE_ID: &str = "velo-hide";
-const QUIT_ID: &str = "velo-quit";
+const OPEN_ID: &str = "wasp-open";
+const HIDE_ID: &str = "wasp-hide";
+const QUIT_ID: &str = "wasp-quit";
 
 /// Start the icon and keep it following the hub.
 ///
@@ -53,7 +53,7 @@ pub async fn start(hub: Arc<TrayHub>) -> Result<Box<dyn super::Tray>> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
     std::thread::Builder::new()
-        .name("velo-tray".to_string())
+        .name("wasp-tray".to_string())
         .spawn(move || run(hub, initial, state_rx, ready_tx))
         .context("starting the tray thread")?;
 
@@ -116,7 +116,7 @@ fn build(initial: &TrayState) -> Result<TrayIcon, String> {
         .map_err(|e| format!("building the tray menu: {e}"))?;
 
     TrayIconBuilder::new()
-        .with_id("velo")
+        .with_id("wasp")
         .with_menu_on_left_click(false)
         .with_tooltip(initial.single_line())
         .with_menu(Box::new(menu))
@@ -211,7 +211,7 @@ fn apply(tray: &TrayIcon, state: &TrayState) {
 
 fn icon_for(state: &TrayState) -> tray_icon::Icon {
     const SIDE: usize = 32;
-    let mut rgba = include_bytes!("../../../../packaging/windows/velo-tray.rgba").to_vec();
+    let mut rgba = include_bytes!("../../../../packaging/windows/wasp-tray.rgba").to_vec();
     if state.unread > 0 {
         for y in 0..12 {
             for x in 20..SIDE {

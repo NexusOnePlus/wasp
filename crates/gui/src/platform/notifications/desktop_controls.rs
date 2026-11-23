@@ -55,7 +55,7 @@ mod imp {
     pub(super) fn set_start_at_sign_in(enabled: bool) -> Result<(), String> {
         let daemon = std::env::current_exe()
             .map_err(|error| error.to_string())?
-            .with_file_name("velod.exe");
+            .with_file_name("waspd.exe");
         windows_desktop::set_start_at_sign_in(enabled, &daemon)
     }
 

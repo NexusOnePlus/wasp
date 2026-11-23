@@ -92,6 +92,11 @@ pub enum UiEvent {
         message_ids: Vec<String>,
         #[serde(with = "receipt_wire")]
         receipt_type: ReceiptType,
+        /// The person whose device sent the receipt. A group receipt names a
+        /// participant; a direct receipt names the peer. Absent for the
+        /// server's own ack, which is about the message rather than a reader.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sender: Option<String>,
     },
     /// The client assigned the real WhatsApp id to a just-sent message; the UI
     /// renames its optimistic bubble so receipts/reactions keyed by the real

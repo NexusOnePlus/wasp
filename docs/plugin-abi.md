@@ -1,4 +1,4 @@
-# The Velo plugin ABI
+# The Wasp plugin ABI
 
 What a `.wasm` has to do to be a plugin, written for somebody who is not using
 the Rust SDK. The SDK is a convenience over exactly this — nothing in it is
@@ -332,8 +332,8 @@ sandbox.
 
 ## Where a plugin lives
 
-`~/.local/share/velo/plugins` on Linux, `%LOCALAPPDATA%` on Windows, and
-`VELO_PLUGIN_DIR` overrides it. **The file's name is the plugin's id** —
+`~/.local/share/wasp/plugins` on Linux, `%LOCALAPPDATA%` on Windows, and
+`WASP_PLUGIN_DIR` overrides it. **The file's name is the plugin's id** —
 `autoreply.wasm` is `autoreply` — and that id is what a user's answer is
 recorded against, what its settings are filed under, and what two files may
 not share.
@@ -343,7 +343,7 @@ mode both, the directory and every module in it: an answer recorded against a
 name is one somebody else's file under that name would inherit. A symlink is
 refused rather than followed — the target's own mode says nothing about who
 may replace it — so a module has to be a file in that directory. Point
-`VELO_PLUGIN_DIR` at your build directory instead while writing one.
+`WASP_PLUGIN_DIR` at your build directory instead while writing one.
 
 An approval is recorded against the **id and the mask, not a hash of the
 bytes**, so replacing the file with a new build does not ask again. That is

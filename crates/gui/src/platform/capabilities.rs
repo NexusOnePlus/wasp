@@ -155,7 +155,7 @@ mod imp {
     /// a tab nobody is using is not a call.
     ///
     /// This is the one place a follower differs from a page attached to an
-    /// `velod`, which is allowed — and the contrast is what makes the
+    /// `waspd`, which is allowed — and the contrast is what makes the
     /// distinction right rather than arbitrary: there the devices are the
     /// daemon's *by design* and nobody expects the window to hold them, while
     /// here both tabs are windows and the wrong one would.

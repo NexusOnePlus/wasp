@@ -1,7 +1,7 @@
 //! Linux desktops match a window to its launcher by this ID. X11 also accepts
 //! icon pixels directly; Wayland obtains the icon from the installed launcher.
 
-pub const APP_ID: &str = "io.github.RuchinAudichya.Velo";
+pub const APP_ID: &str = "io.github.NexusOnePlus.Wasp";
 
 pub fn apply(options: &mut gpui::WindowOptions, cx: &gpui::App) {
     options.app_id = Some(APP_ID.to_owned());
@@ -19,7 +19,7 @@ mod imp {
 
     fn icon(_: &gpui::App) -> anyhow::Result<image::RgbaImage> {
         Ok(image::load_from_memory(include_bytes!(
-            "../../../../packaging/linux/io.github.RuchinAudichya.Velo.png"
+            "../../../../packaging/linux/io.github.NexusOnePlus.Wasp.png"
         ))?
         .to_rgba8())
     }
@@ -28,7 +28,7 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     pub(super) fn apply(options: &mut gpui::WindowOptions, _: &gpui::App) {
-        let bytes = include_bytes!("../../../../packaging/windows/velo.png");
+        let bytes = include_bytes!("../../../../packaging/windows/wasp.png");
         match image::load_from_memory(bytes) {
             Ok(icon) => options.icon = Some(std::sync::Arc::new(icon.to_rgba8())),
             Err(error) => log::warn!("could not load the window icon: {error}"),
@@ -49,11 +49,10 @@ mod tests {
             let mut options = gpui::WindowOptions::default();
             super::apply(&mut options, cx);
             assert_eq!(options.app_id.as_deref(), Some(super::APP_ID));
-            let icon = options.icon.expect("the Velo PNG produces a window icon");
+            let icon = options.icon.expect("the Wasp PNG produces a window icon");
             assert_eq!(icon.dimensions(), (256, 256));
-            assert_eq!(icon.get_pixel(0, 0).0, [0, 0, 0, 0]);
-            // The green tile, left of the speech bubble.
-            assert_eq!(icon.get_pixel(20, 128).0, [33, 192, 99, 255]);
+            // The lime tile is the mark's background.
+            assert_eq!(icon.get_pixel(20, 128).0, [208, 253, 55, 255]);
         });
     }
 }

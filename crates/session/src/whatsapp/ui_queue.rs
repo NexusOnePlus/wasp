@@ -859,6 +859,7 @@ mod tests {
                 chat_jid: "test@s.whatsapp.net".into(),
                 message_ids: vec!["x".repeat(4096)],
                 receipt_type: velo_core::ReceiptType::Read,
+                sender: Some("test@s.whatsapp.net".into()),
             },
             UiEvent::ReactionReceived {
                 chat_jid: "test@s.whatsapp.net".into(),

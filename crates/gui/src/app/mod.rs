@@ -29,6 +29,7 @@ mod message_actions;
 mod messages;
 pub mod notices;
 mod paging;
+pub(crate) mod palette;
 mod plugins_ctl;
 mod recording;
 mod recovery;
@@ -141,6 +142,8 @@ enum KeyboardOwner {
     /// Files pasted or dropped into the composer, waiting for explicit
     /// confirmation before anything is uploaded.
     PastePreview,
+    /// The floating command bar, which owns the arrows and Enter while open.
+    Palette,
     /// The fullscreen viewer, which owns the arrow keys while it is up.
     Viewer,
     /// A screen with its own controls — Settings. It is handed the window's
@@ -170,8 +173,10 @@ pub struct KeyboardSurfaces {
     /// `leave_connected_view` does not close it — while the error screen that
     /// replaces the conversation draws nothing of it.
     pub viewer: bool,
-    /// The modal preview for files waiting to be sent.
+    /// The inline tray for files waiting to be sent.
     pub paste_preview: bool,
+    /// The floating command bar.
+    pub palette: bool,
     pub message_edit: bool,
     pub message_delete: bool,
     /// The call card, which only the connected screens float.
@@ -181,19 +186,18 @@ pub struct KeyboardSurfaces {
 /// Files waiting in the send-confirmation modal: pasted from the clipboard
 /// or dropped onto the conversation, previewed with an optional caption
 /// before anything is uploaded.
-struct PendingPastePreview {
-    jid: String,
-    reply: Option<ReplyDraft>,
-    files: Vec<crate::components::PreviewFile>,
-    /// The caption box. `None` where no window was available to build one
-    /// in — the modal still confirms, it just sends without a caption.
-    caption: Option<Entity<gpui_component::input::InputState>>,
-    /// The file list's scroll position, so a batch taller than the modal
-    /// scrolls instead of painting into the caption and the controls.
-    list_scroll: gpui::ScrollHandle,
+pub(crate) struct PendingPastePreview {
+    pub(crate) jid: String,
+    pub(crate) reply: Option<ReplyDraft>,
+    pub(crate) files: Vec<crate::components::PreviewFile>,
+    /// The file list's scroll position, kept for the surfaces that can show a
+    /// batch larger than the tray.
+    pub(crate) list_scroll: gpui::ScrollHandle,
     /// Whether the captured destination was the conversation on screen before
-    /// this modal deliberately hid it from read/paging accounting.
-    chat_was_visible: bool,
+    /// the tray opened.
+    pub(crate) chat_was_visible: bool,
+    /// Which waiting picture is open full-screen above the tray.
+    pub(crate) expanded: Option<usize>,
 }
 
 /// The layout a set of row heights was measured against.
@@ -381,6 +385,14 @@ pub struct CopyMessage {
     pub text: gpui::SharedString,
 }
 
+/// Show who has delivered or read one of our messages.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct OpenMessageInfo {
+    pub jid: gpui::SharedString,
+    pub id: gpui::SharedString,
+}
+
 /// Open one of a message's links.
 ///
 /// Carries its subject like [`CopyMessage`]: a timeline has no selection,
@@ -389,6 +401,15 @@ pub struct CopyMessage {
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = message, no_json)]
 pub struct OpenMessageLink {
+    pub url: gpui::SharedString,
+}
+
+/// Re-read a link's page and replace its card with a fresh, sharper one.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct RegenerateLinkPreview {
+    pub jid: gpui::SharedString,
+    pub id: gpui::SharedString,
     pub url: gpui::SharedString,
 }
 
@@ -422,8 +443,8 @@ pub struct DeleteSentMessage {
 }
 
 use crate::components::{
-    AccountSummary, InputAreaEvent, InputAreaView, PastePreviewProps, ReplyDraft,
-    new_timeline_state, render_paste_preview,
+    AccountSummary, InputAreaEvent, InputAreaView, MentionMember, ReplyDraft, new_timeline_state,
+    render_attachment_lightbox, render_command_palette, render_message_info,
 };
 use crate::retained_image::RetainedImage;
 use log::{debug, error, info, warn};
@@ -465,6 +486,34 @@ pub const VIEWER_CONTEXT: &str = "MediaViewer";
 
 /// Maximum number of video players to keep cached (each holds decoded frames)
 const MAX_VIDEO_PLAYERS: usize = 10;
+
+/// Pictures an automatic scan may queue before it stops looking.
+///
+/// The scan runs once per conversation change, so the queue is the thing that
+/// remembers what did not fit in the two slots. Dropping the rest here was why
+/// a conversation opened with a handful of rows offering a download until the
+/// reader pressed them.
+const MAX_AUTO_MEDIA_QUEUE: usize = 32;
+
+/// How many automatic media downloads may run at once.
+const AUTO_MEDIA_CONCURRENCY: usize = 2;
+
+/// One picture an automatic scan found and a free slot has not reached yet.
+struct AutoMediaRequest {
+    chat_jid: String,
+    message_id: String,
+    downloadable: DownloadableMedia,
+    kind: AutoMediaKind,
+}
+
+/// What an automatic fetch should do with the bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AutoMediaKind {
+    /// Decode straight into the bubble.
+    Still,
+    /// An animated GIF: hand it to the video player, which loops it.
+    Gif,
+}
 
 /// How many bytes of decoded images to keep cached.
 ///
@@ -514,6 +563,16 @@ const _: () = assert!(MIN_DECODED_IMAGES < MAX_DECODED_IMAGES);
 /// quietly providing before it was removed.
 const MAX_DECODED_IMAGES: usize = 50;
 
+/// Longest edge of a status card's thumbnail.
+///
+/// A card is a few hundred points wide; 384 keeps it sharp on a high-density
+/// display without decoding the full story into the interface's memory.
+const STATUS_THUMB_EDGE: u32 = 384;
+/// How many status cards keep a decoded thumbnail.
+const MAX_STATUS_THUMBNAILS: usize = 32;
+/// How many link cards keep a decoded thumbnail.
+const MAX_LINK_PREVIEW_IMAGES: usize = 32;
+
 /// How many conversations keep their built timeline.
 ///
 /// Each entry holds the rows *and* a second full copy of the history they
@@ -532,9 +591,9 @@ const MAX_CACHED_TIMELINES: usize = 8;
 pub(crate) const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
 
 /// Download media with timeout - returns Ok(data) or Err(error message)
-async fn download_with_timeout(
-    download_rx: tokio::sync::oneshot::Receiver<Result<std::sync::Arc<Vec<u8>>, Failure>>,
-) -> Result<std::sync::Arc<Vec<u8>>, Failure> {
+async fn download_with_timeout<T>(
+    download_rx: tokio::sync::oneshot::Receiver<Result<T, Failure>>,
+) -> Result<T, Failure> {
     let download = async {
         download_rx.await.unwrap_or_else(|_| {
             // The sender went with the connection, which comes back.
@@ -621,6 +680,22 @@ impl ActiveMedia {
 // Answering a call must not require a pointer.
 actions!(calls, [AcceptCall, DeclineCall]);
 
+// The floating command bar and the two keys that move inside it.
+actions!(palette, [OpenCommandPalette, PaletteUp, PaletteDown]);
+
+// Destination shortcuts, and the composer's emoji panel.
+actions!(
+    navigation,
+    [
+        SwitchToChats,
+        SwitchToStatus,
+        SwitchToChannels,
+        SwitchToCommunities,
+        ToggleEmoji,
+        OpenGifPicker
+    ]
+);
+
 /// Initialize chat list and call popup key bindings
 pub fn init_app_bindings(cx: &mut gpui::App) {
     crate::components::InputAreaView::init_bindings(cx);
@@ -642,7 +717,11 @@ pub fn init_app_bindings(cx: &mut gpui::App) {
         KeyBinding::new("space", ToggleSelectedCommunity, Some("ChatList && !Input")),
         // Window-wide: reachable whatever owns focus, because both are ways
         // *out* of wherever the user currently is.
-        window_binding("secondary-k", FocusSearch, cx),
+        window_binding("secondary-k", OpenCommandPalette, cx),
+        // Moving inside the palette is scoped to the surface, so the same
+        // arrows keep their caret meaning in the composer.
+        KeyBinding::new("up", PaletteUp, Some("CommandPalette")),
+        KeyBinding::new("down", PaletteDown, Some("CommandPalette")),
         // WhatsApp Desktop's own shortcut for a new chat.
         window_binding("secondary-n", forward::NewChat, cx),
         window_binding(
@@ -661,6 +740,14 @@ pub fn init_app_bindings(cx: &mut gpui::App) {
             None,
         ),
         window_binding("secondary-,", OpenSettings, cx),
+        // One modifier and the number of the destination, in the order the
+        // capsule draws them.
+        KeyBinding::new("alt-1", SwitchToChats, None),
+        KeyBinding::new("alt-2", SwitchToStatus, None),
+        KeyBinding::new("alt-3", SwitchToChannels, None),
+        KeyBinding::new("alt-4", SwitchToCommunities, None),
+        window_binding("secondary-e", ToggleEmoji, cx),
+        window_binding("secondary-shift-g", OpenGifPicker, cx),
         // Moving between conversations without the mouse, the way Signal
         // Desktop does: Alt and the arrows walk the list from anywhere, the
         // composer included, because Alt-arrow means nothing to a text field.
@@ -726,6 +813,12 @@ pub struct WhatsAppApp {
     pub(crate) shared_files_sort: crate::views::shared_files::Sort,
     /// Message hits from every chat for the sidebar's search.
     pub(crate) global_search: global_search::GlobalSearch,
+    /// The floating command bar, when it is open.
+    pub(crate) palette: palette::Palette,
+    /// The message whose receipt panel is open, as `(chat_jid, message_id)`.
+    pub(crate) message_info: Option<(String, String)>,
+    /// The row the timeline last jumped to, drawn with a quiet highlight.
+    pub(crate) highlighted_message: Option<String>,
     /// The Shared files panel's search box. Made on the first frame that has
     /// a window, like the Files view's.
     pub(crate) shared_files_search: Option<Entity<InputState>>,
@@ -776,6 +869,21 @@ pub struct WhatsAppApp {
     /// the first returns would multiply that budget in wasm memory.
     incoming_file_reading: bool,
     paste_preview: Option<PendingPastePreview>,
+    /// Outgoing messages whose link card is still being fetched, by local id.
+    /// The bubble draws a skeleton for these instead of appearing to have no
+    /// preview at all while the page is read.
+    pending_link_previews: HashSet<String>,
+    /// Profile-picture cache keys for group senders, keyed by JID.
+    ///
+    /// Chats carry their own key. A sender inside a group is not a chat row,
+    /// so the key `AvatarReady` brings has nowhere else to live; without this
+    /// map every message would draw the silhouette even after the picture had
+    /// been fetched.
+    sender_avatars: HashMap<String, String>,
+    /// The group whose senders were last demanded, and how many messages that
+    /// demand saw. A frame that draws the same conversation again is not a
+    /// reason to walk its history for JIDs.
+    sender_avatar_demand: Option<(String, usize)>,
     /// Accepted selections that completed while another confirmation was open.
     /// Keeping these instead of dropping a late picker/drop result guarantees
     /// every accepted attachment gets the same explicit confirmation surface.
@@ -1014,6 +1122,12 @@ pub struct WhatsAppApp {
     materialization_cache: Option<Arc<dyn crate::session::MediaCache>>,
     /// Automatic attempts: false while pending/failed, true after success.
     channel_preview_attempts: std::collections::HashMap<(String, String), bool>,
+    /// Pictures this window has already tried to fetch without a tap, and the
+    /// conversation whose recent tail was last scanned for them.
+    auto_media_attempts: HashSet<(String, String)>,
+    auto_media_scan: Option<(String, usize)>,
+    /// Automatic fetches waiting for one of the two download slots.
+    auto_media_queue: std::collections::VecDeque<AutoMediaRequest>,
     image_downloads_in_flight: std::collections::HashSet<String>,
     /// Native document destinations, scoped to the account, chat and message
     /// that initiated the save. Browser handoffs never enter this map.
@@ -1062,6 +1176,17 @@ pub struct WhatsAppApp {
     /// Uses RefCell for interior mutability since we need to cache during immutable render.
     /// Uses IndexMap to maintain insertion order for deterministic FIFO eviction.
     decoded_images: RefCell<IndexMap<String, (Cached, RetainedImage)>>,
+    /// Status-card thumbnails, decoded once per update and kept small.
+    ///
+    /// The list used to hand GPUI the full-resolution status photo on every
+    /// frame; GPUI keeps a completed decode in its global asset cache until
+    /// the owner retires it, and a card was never an owner. These are
+    /// downscaled, bounded, and retained through [`RetainedImage`], so a
+    /// twenty-megapixel story costs a card-sized texture rather than a
+    /// process-lifetime photo.
+    status_thumbnails: RefCell<IndexMap<String, (ImageIdentity, RetainedImage)>>,
+    /// Link-card thumbnails, keyed by message id.
+    link_preview_images: RefCell<IndexMap<String, (ImageIdentity, RetainedImage)>>,
     sticker_validation: RefCell<IndexMap<String, StickerValidation>>,
     /// Cache of message list data per chat to avoid expensive recomputation on every render.
     /// Key is the chat JID, value is the cached data.
@@ -1311,6 +1436,182 @@ impl WhatsAppApp {
         }
     }
 
+    /// The cached picture for a group sender, once the daemon has said which
+    /// Whether the card for this outgoing message is still being read.
+    pub(crate) fn link_preview_pending(&self, message_id: &str) -> bool {
+        self.pending_link_previews.contains(message_id)
+    }
+
+    /// The decoded card for a link, shared across frames.
+    pub(crate) fn link_preview_image(
+        &self,
+        message_id: &str,
+        preview: &velo_core::LinkPreview,
+    ) -> Option<gpui::ImageSource> {
+        if preview.thumbnail.is_empty() {
+            return None;
+        }
+        let identity = ImageIdentity::of(&preview.thumbnail, gpui::ImageFormat::Jpeg, false);
+        let mut cache = self.link_preview_images.borrow_mut();
+        let hit = cache.get_index_of(message_id).and_then(|at| {
+            let (_, (seen, image)) = cache.get_index(at)?;
+            (*seen == identity).then(|| (at, image.source(false)))
+        });
+        if let Some((at, source)) = hit {
+            let last = cache.len() - 1;
+            cache.move_index(at, last);
+            return Some(source);
+        }
+        let image = RetainedImage::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Jpeg,
+            preview.thumbnail.clone(),
+        ));
+        let source = image.source(false);
+        cache.shift_remove(message_id);
+        cache.insert(message_id.to_string(), (identity, image));
+        while cache.len() > MAX_LINK_PREVIEW_IMAGES {
+            cache.shift_remove_index(0);
+        }
+        Some(source)
+    }
+
+    /// A bounded, downscaled thumbnail for one author's latest status photo.
+    ///
+    /// The bytes the feed holds may be full-resolution and may be released
+    /// when the destination changes; this cache owns the small decode that
+    /// the card actually paints, so the preview does not disappear with the
+    /// originals.
+    pub(crate) fn status_thumbnail(
+        &self,
+        feed: &velo_core::StatusFeed,
+        author: &velo_core::StatusAuthor,
+    ) -> Option<gpui::ImageSource> {
+        // The newest update that has a picture, whether the bytes are still
+        // here or only their cache key is: the feed releases status payloads
+        // when the destination changes, and a card that only trusted `data`
+        // went back to an avatar at that moment and stayed there.
+        //
+        // Asked of the feed the card was built from, not of the live chat by
+        // index: `updates` are positions in the feed's own message slice, and
+        // a page of history arriving between the two made those positions
+        // point at another update.
+        let media = feed
+            .updates_of(author)
+            .filter_map(|message| {
+                let media = message.media.as_ref()?;
+                (!media.data.is_empty()
+                    || media.cache_key.is_some()
+                    || media.preview_cache_key.is_some())
+                .then_some(media)
+            })
+            .last()?;
+        let from_disk;
+        let (data, cache_key) = if !media.data.is_empty() {
+            (media.data.as_slice(), None)
+        } else {
+            let key = media
+                .cache_key
+                .as_deref()
+                .or(media.preview_cache_key.as_deref())?;
+            from_disk = self.media_cache()?.read(key).ok()?;
+            (from_disk.as_slice(), Some(key))
+        };
+        let source_format =
+            mime_to_image_format(&media.mime_type).unwrap_or(gpui::ImageFormat::Jpeg);
+        let identity = match cache_key {
+            Some(key) => ImageIdentity::of_keyed(key, data, source_format, media.data_is_preview),
+            None => ImageIdentity::of(data, source_format, media.data_is_preview),
+        };
+        let mut cache = self.status_thumbnails.borrow_mut();
+        let hit = cache.get_index_of(&author.jid).and_then(|at| {
+            let (_, (seen, image)) = cache.get_index(at)?;
+            (*seen == identity).then(|| (at, image.source(false)))
+        });
+        if let Some((at, source)) = hit {
+            let last = cache.len() - 1;
+            cache.move_index(at, last);
+            return Some(source);
+        }
+        let decoded = image::ImageReader::new(std::io::Cursor::new(data))
+            .with_guessed_format()
+            .ok()?
+            .decode()
+            .ok()?;
+        let thumb = decoded.thumbnail(STATUS_THUMB_EDGE, STATUS_THUMB_EDGE);
+        let mut encoded = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(
+            &mut std::io::Cursor::new(&mut encoded),
+            82,
+        )
+        .encode_image(&thumb)
+        .ok()?;
+        let image = RetainedImage::new(gpui::Image::from_bytes(gpui::ImageFormat::Jpeg, encoded));
+        let source = image.source(false);
+        cache.shift_remove(&author.jid);
+        cache.insert(author.jid.clone(), (identity, image));
+        while cache.len() > MAX_STATUS_THUMBNAILS {
+            cache.shift_remove_index(0);
+        }
+        Some(source)
+    }
+
+    pub(crate) fn sender_avatar_key(&self, jid: &str) -> Option<String> {
+        self.sender_avatars.get(jid).cloned().or_else(|| {
+            self.find_chat(jid)
+                .and_then(|chat| chat.avatar_cache_key.clone())
+        })
+    }
+
+    /// Ask for the pictures of the people who spoke in a group.
+    ///
+    /// The conversation header already demands its own chat. Its senders are
+    /// separate JIDs with separate pictures, and the only place their cache
+    /// keys can arrive is the `AvatarReady` event. Recent senders first, and
+    /// bounded: a group can have a thousand members, but the timeline only
+    /// draws what is loaded.
+    fn demand_sender_avatars(&mut self, chat_jid: &str) {
+        let Some(chat) = self.find_chat(chat_jid) else {
+            return;
+        };
+        if !chat.is_group {
+            return;
+        }
+        let count = chat.messages.len();
+        if self.sender_avatar_demand.as_ref() == Some(&(chat_jid.to_string(), count)) {
+            return;
+        }
+        let mut unique = HashSet::new();
+        let demands: Vec<crate::session::avatar::ChatDemand> = chat
+            .messages
+            .iter()
+            .rev()
+            .filter(|message| {
+                !message.is_from_me && !message.sender.is_empty() && message.system.is_none()
+            })
+            .map(|message| message.sender.clone())
+            .filter(|jid| unique.insert(jid.clone()))
+            .take(60)
+            .map(|jid| crate::session::avatar::ChatDemand {
+                cache_key: self.sender_avatars.get(&jid).cloned(),
+                picture_id: None,
+                jid,
+            })
+            .collect();
+        self.sender_avatar_demand = Some((chat_jid.to_string(), count));
+        debug!(
+            "demanding {} group sender avatars for {}",
+            demands.len(),
+            chat_jid
+        );
+        if demands.is_empty() {
+            return;
+        }
+        self.avatar_manager.demand_chats(&demands);
+        if let Some(session) = &self.client {
+            self.avatar_manager.flush_demands(session);
+        }
+    }
+
     /// Demand avatar image for an individual open chat (e.g. from the header).
     pub fn demand_avatar_for_chat(&mut self, chat: &Chat) {
         self.avatar_manager
@@ -1425,11 +1726,21 @@ impl WhatsAppApp {
                     FromDaemon::Avatar { jid, key } => entity.update(cx, |app, cx| {
                         app.last_avatar_window_fingerprint = None;
                         app.avatar_manager.on_avatar_ready(&jid, &key);
+                        // Group senders are not chat rows, so the key has
+                        // nowhere to live unless it is kept here: a bubble
+                        // asked for it by `sender_avatar_key`, and a picture
+                        // that arrived for a member used to be dropped for
+                        // want of that map.
+                        if key.is_empty() {
+                            app.sender_avatars.remove(&jid);
+                        } else {
+                            app.sender_avatars.insert(jid.clone(), key.clone());
+                        }
                         if let Some(chat) = app.find_chat_mut(&jid) {
                             chat.ready_avatar(key);
                             app.invalidate_chat_cache();
-                            cx.notify();
                         }
+                        cx.notify();
                     }),
                     FromDaemon::AvatarLoaded => entity.update(cx, |_app, cx| cx.notify()),
                     FromDaemon::AvatarFailed { jid, retryable } => entity.update(cx, |app, _cx| {
@@ -1449,7 +1760,14 @@ impl WhatsAppApp {
                         messages,
                         next,
                     } => entity.update(cx, |app, cx| {
+                        let is_status = jid == velo_core::STATUS_BROADCAST_JID;
                         app.apply_message_page(jid, messages, next, cx);
+                        if is_status {
+                            // The page usually arrives after the destination
+                            // was chosen, so the first prefetch saw an empty
+                            // broadcast. Try again once its updates are here.
+                            app.auto_download_status_previews(cx);
+                        }
                     }),
                     FromDaemon::Chats {
                         chats,
@@ -1463,7 +1781,11 @@ impl WhatsAppApp {
                     // Who is in a group, for the line under its name.
                     FromDaemon::Members(roster) => entity.update(cx, |app, cx| {
                         app.rosters_in_flight.remove(&roster.jid);
+                        let open = app.selected_chat.as_deref() == Some(roster.jid.as_str());
                         app.group_rosters.insert(roster.jid.clone(), roster);
+                        if open {
+                            app.refresh_mentions_for_selected_chat(cx);
+                        }
                         cx.notify();
                     }),
                     // Released rather than remembered as a failure: the next
@@ -1542,6 +1864,9 @@ impl WhatsAppApp {
             shared_files_filter: Default::default(),
             shared_files_sort: Default::default(),
             global_search: Default::default(),
+            palette: palette::Palette::default(),
+            message_info: None,
+            highlighted_message: None,
             shared_files_search: None,
             files_open: false,
             files_view: None,
@@ -1557,7 +1882,10 @@ impl WhatsAppApp {
             incoming_file_epoch: 0,
             incoming_file_reading: false,
             paste_preview: None,
+            sender_avatars: HashMap::new(),
+            sender_avatar_demand: None,
             pending_attachment_previews: VecDeque::new(),
+            pending_link_previews: HashSet::new(),
             #[cfg(test)]
             attachment_attempts: Vec::new(),
             chat_list_scroll: VirtualListScrollHandle::new(),
@@ -1636,6 +1964,9 @@ impl WhatsAppApp {
             #[cfg(test)]
             materialization_cache: None,
             channel_preview_attempts: std::collections::HashMap::new(),
+            auto_media_attempts: HashSet::new(),
+            auto_media_scan: None,
+            auto_media_queue: std::collections::VecDeque::new(),
             image_downloads_in_flight: std::collections::HashSet::new(),
             saved_documents: HashMap::new(),
             document_downloads_in_flight: std::collections::HashSet::new(),
@@ -1654,6 +1985,8 @@ impl WhatsAppApp {
             video_players: HashMap::new(),
             video_update_task: None,
             decoded_images: RefCell::new(IndexMap::new()),
+            status_thumbnails: RefCell::new(IndexMap::new()),
+            link_preview_images: RefCell::new(IndexMap::new()),
             sticker_validation: RefCell::new(IndexMap::new()),
             message_list_cache: RefCell::new(HashMap::new()),
             chat_list_cache: RefCell::new(None),
@@ -2092,6 +2425,119 @@ impl WhatsAppApp {
         }
     }
 
+    /// The people who have read an outgoing message, by display name.
+    ///
+    /// Only receipts at read or played count: delivered is not read, and the
+    /// line under a bubble would otherwise claim more than the sender knows.
+    #[cfg(test)]
+    pub(crate) fn read_receipt_names(&self, chat_jid: &str, message: &ChatMessage) -> Vec<String> {
+        let Some(chat) = self.find_chat(chat_jid) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = message
+            .receipts
+            .iter()
+            .filter(|(_, status)| **status >= MessageStatus::Read)
+            .map(|(jid, _)| self.receipt_name(chat, jid))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Who to name under each message, keyed by message id, with each reader
+    /// named only on the last message they read.
+    ///
+    /// A receipt is per message, but the label is a statement about a run: if
+    /// somebody read the first and the second, repeating "Read by Pride"
+    /// under both says the same thing twice and makes the timeline look like
+    /// a log. The last message a person read is the one that carries their
+    /// name; everything before it is implied by it.
+    pub(crate) fn read_receipt_names_by_last_message(
+        &self,
+        chat_jid: &str,
+        messages: &[Arc<ChatMessage>],
+    ) -> HashMap<String, Vec<String>> {
+        let Some(chat) = self.find_chat(chat_jid) else {
+            return HashMap::new();
+        };
+        // Reader -> index of the newest message they have read.
+        let mut last_read: HashMap<&str, usize> = HashMap::new();
+        for (index, message) in messages.iter().enumerate() {
+            if !message.is_from_me {
+                continue;
+            }
+            for (reader, status) in &message.receipts {
+                if *status >= MessageStatus::Read {
+                    last_read.insert(reader.as_str(), index);
+                }
+            }
+        }
+        let mut labels: HashMap<String, Vec<String>> = HashMap::new();
+        for (reader, index) in last_read {
+            if let Some(message) = messages.get(index) {
+                labels
+                    .entry(message.id.clone())
+                    .or_default()
+                    .push(self.receipt_name(&chat, reader));
+            }
+        }
+        for names in labels.values_mut() {
+            names.sort();
+            names.dedup();
+        }
+        labels
+    }
+
+    /// Every receipt on one message, with the person and how far they got.
+    pub(crate) fn message_receipt_rows(
+        &self,
+        chat_jid: &str,
+        message_id: &str,
+    ) -> Vec<(String, MessageStatus)> {
+        let Some(chat) = self.find_chat(chat_jid) else {
+            return Vec::new();
+        };
+        let Some(message) = chat
+            .messages
+            .iter()
+            .find(|message| message.id == message_id)
+        else {
+            return Vec::new();
+        };
+        let mut rows: Vec<(String, MessageStatus)> = message
+            .receipts
+            .iter()
+            .map(|(jid, status)| (self.receipt_name(chat, jid), *status))
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        rows
+    }
+
+    fn receipt_name(&self, chat: &Chat, jid: &str) -> String {
+        if let Some(name) = chat.participants.get(jid) {
+            return name.clone();
+        }
+        if let Some(name) = self.find_chat(jid).map(|chat| chat.name.clone()) {
+            return name;
+        }
+        // A receipt can name the device (`5599:12@…`) or the LID while the
+        // chat row is keyed by the base user. Matching on the user part
+        // finds the name the reader already has; without it the panel showed
+        // a bare address and looked as if the name failed to resolve.
+        if let Ok(target) = jid.parse::<Jid>() {
+            if let Some(chat) = self.chats.iter().find(|chat| {
+                chat.jid
+                    .parse::<Jid>()
+                    .is_ok_and(|other| other.user_base() == target.user_base())
+            }) {
+                return chat.name.clone();
+            }
+            return target.user_base().to_string();
+        }
+        jid.to_string()
+    }
+
     /// The account's own number, when the session has said.
     pub fn account_jid(&self) -> Option<&str> {
         self.account_jid.as_deref()
@@ -2188,6 +2634,10 @@ impl WhatsAppApp {
                 built
             })
         };
+
+        // The conversation's senders, not just the conversation: a group
+        // bubble draws a face, and that face is another JID's picture.
+        self.demand_sender_avatars(chat_jid);
 
         // Asked before the rows are handed over, because the question is
         // about the frame that was drawn: a splice replaces measurements with
@@ -2532,8 +2982,13 @@ impl WhatsAppApp {
         self.incoming_file_epoch = self.incoming_file_epoch.wrapping_add(1);
         self.incoming_file_reading = false;
         self.paste_preview = None;
+        self.sender_avatars.clear();
+        self.sender_avatar_demand = None;
+        self.message_info = None;
+        self.highlighted_message = None;
         self.delete_confirmation = None;
         self.pending_attachment_previews.clear();
+        self.pending_link_previews.clear();
         self.notified_messages.clear();
         crate::platform::clear_notifications();
         self.pending_notification_tags.clear();
@@ -2578,6 +3033,8 @@ impl WhatsAppApp {
         self.chat_list_cache.borrow_mut().take();
         self.status_feed_cache.borrow_mut().take();
         self.decoded_images.borrow_mut().clear();
+        self.status_thumbnails.borrow_mut().clear();
+        self.link_preview_images.borrow_mut().clear();
         self.avatar_manager.clear();
         self.avatar_manager.set_session(None);
         self.last_avatar_window_fingerprint = None;
@@ -2611,6 +3068,9 @@ impl WhatsAppApp {
         self.video_players.clear();
         self.downloads_in_flight.clear();
         self.channel_preview_attempts.clear();
+        self.auto_media_attempts.clear();
+        self.auto_media_scan = None;
+        self.auto_media_queue.clear();
         self.image_downloads_in_flight.clear();
         self.saved_documents.clear();
         self.document_downloads_in_flight.clear();
@@ -2743,9 +3203,15 @@ impl WhatsAppApp {
         self.is_connected()
     }
 
-    /// Whether the conversation is covered by the send-confirmation modal.
-    pub fn paste_preview_showing(&self) -> bool {
-        self.paste_preview.is_some()
+    /// The files waiting above the composer, when there are any.
+    pub(crate) fn pending_paste_preview(&self) -> Option<&PendingPastePreview> {
+        self.paste_preview.as_ref()
+    }
+
+    /// The focus target for the attachment tray, used when the caption box
+    /// could not be built (no window was available).
+    pub(crate) fn paste_preview_focus(&self) -> &FocusHandle {
+        &self.paste_preview_focus
     }
 
     /// Whether the user chose to stop waiting and read what is here.
@@ -3164,6 +3630,20 @@ impl WhatsAppApp {
             };
             self.set_destination(destination, window, cx);
         }
+        if self.selected_chat.as_deref() != Some(jid.as_str()) {
+            self.highlighted_message = None;
+        }
+        // A tray belongs to the conversation it was opened in. Leaving that
+        // conversation used to leave the files floating over the next one,
+        // where Send would have posted them to a chat they were never pasted
+        // into.
+        if self
+            .paste_preview
+            .as_ref()
+            .is_some_and(|preview| preview.jid != jid)
+        {
+            self.cancel_paste_preview(cx);
+        }
         // Opening a chat by hand is the explicit user action a notification
         // permission prompt needs: on the web the startup ask runs without
         // transient activation and most browsers ignore it, so without this
@@ -3185,6 +3665,9 @@ impl WhatsAppApp {
                 .insert(self.destination.id(), Some(jid.clone()));
         }
         self.stop_user_media();
+        // The new conversation gets its own automatic-media scan, even if it
+        // was last looked at with the same number of rows.
+        self.auto_media_scan = None;
         // Leaving a chat mid-composition: release its typing indicator now,
         // or it would stay "typing..." and the eventual paused would land on
         // the newly selected chat instead.
@@ -3255,9 +3738,19 @@ impl WhatsAppApp {
         if self.selected_chat.as_deref() != Some(jid.as_str()) && self.reply_to.is_some() {
             self.cancel_reply(cx);
         }
+        let switched_chat = self.selected_chat.as_deref() != Some(jid.as_str());
         self.selected_chat = Some(jid.clone());
         if let Some(chat) = self.find_chat(&jid).cloned() {
             self.demand_avatar_for_chat(&chat);
+            let (members, everyone) = self.mention_members(&chat);
+            if let Some(ref input_area) = self.input_area {
+                input_area.update(cx, |view, cx| {
+                    if switched_chat {
+                        view.reset_mentions(cx);
+                    }
+                    view.set_mentions(members, everyone, cx);
+                });
+            }
         }
         if open != ChatOpen::Restore {
             self.navigate_to_chat();
@@ -3273,6 +3766,7 @@ impl WhatsAppApp {
             // panel being switched to rather than the one being left.
             self.ensure_input_area(window, cx);
             self.focus_composer(window, cx);
+            self.refresh_mentions_for_selected_chat(cx);
         }
 
         // One request, where this used to send receipts and a bounded chat
@@ -3349,6 +3843,80 @@ impl WhatsAppApp {
     /// Who is in `jid`, as far as this window has been told.
     pub fn group_members(&self, jid: &str) -> Option<&velo_core::GroupRoster> {
         self.group_rosters.get(jid)
+    }
+
+    /// Who the composer may `@`-mention in `chat`, and the addresses `@all`
+    /// stands for.
+    ///
+    /// Only a group has a roster to offer. The label follows the same order
+    /// every other surface uses: the saved name, their push name (which the
+    /// roster already carries), an `@handle` where the address book has one,
+    /// and the number last. `@all` heads the list so an empty filter offers it
+    /// first, the way WhatsApp does.
+    pub(crate) fn mention_members(
+        &self,
+        chat: &velo_core::Chat,
+    ) -> (Vec<MentionMember>, Vec<String>) {
+        let Some(roster) = self.group_rosters.get(&chat.jid) else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut everyone = Vec::new();
+        let mut members = Vec::with_capacity(roster.members.len() + 1);
+        if !roster.members.is_empty() {
+            members.push(MentionMember {
+                jid: String::new(),
+                label: "all".to_string(),
+                picture: None,
+                is_all: true,
+            });
+        }
+        for member in &roster.members {
+            if member.is_self {
+                continue;
+            }
+            let chat_name = self
+                .find_chat(&member.jid)
+                .map(|known| known.name.clone())
+                .filter(|name| !name.trim().is_empty() && name != "Unknown contact");
+            let label = member
+                .name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .or(chat_name)
+                .unwrap_or_else(|| velo_core::fallback_sender_name(&member.jid).into_owned());
+            let picture = self.sender_avatar_key(&member.jid).or_else(|| {
+                self.find_chat(&member.jid)
+                    .and_then(|known| known.avatar_cache_key.clone())
+            });
+            everyone.push(member.jid.clone());
+            members.push(MentionMember {
+                jid: member.jid.clone(),
+                label,
+                picture,
+                is_all: false,
+            });
+        }
+        (members, everyone)
+    }
+
+    /// Re-read the roster for the open chat and hand the picker its people.
+    ///
+    /// The roster arrives after the conversation opens, so the composer is
+    /// told about it whenever the daemon answers — and again after the input
+    /// area itself is created, which on mobile happens on the panel switch.
+    fn refresh_mentions_for_selected_chat(&mut self, cx: &mut Context<Self>) {
+        let Some(chat) = self
+            .selected_chat
+            .as_deref()
+            .and_then(|jid| self.find_chat(jid))
+            .cloned()
+        else {
+            return;
+        };
+        let (members, everyone) = self.mention_members(&chat);
+        if let Some(ref input_area) = self.input_area {
+            input_area.update(cx, |view, cx| view.set_mentions(members, everyone, cx));
+        }
     }
 
     /// Retry connection after an error
@@ -3499,6 +4067,9 @@ impl WhatsAppApp {
                 .detach();
 
             self.input_area = Some(input_area);
+            // The composer is only now able to hold the group's people; the
+            // roster itself may have arrived before the view existed.
+            self.refresh_mentions_for_selected_chat(cx);
         }
         // NOTE: Do NOT call input_area.update() here - it would trigger re-renders
         // on every parent render, defeating the purpose of component isolation.
@@ -3514,17 +4085,50 @@ impl WhatsAppApp {
         cx: &mut Context<Self>,
     ) {
         match event {
-            InputAreaEvent::SendMessage(text) => {
-                if self.edit_draft.is_some() {
+            InputAreaEvent::SendMessage {
+                text,
+                wire_text,
+                mentions,
+                link_preview,
+            } => {
+                if self.paste_preview.is_some() {
+                    // The composer is the caption while files wait. Enter
+                    // sends them, not a separate text message.
+                    let caption = Some(text.trim().to_string()).filter(|text| !text.is_empty());
+                    self.confirm_paste_preview_with(caption, cx);
+                } else if self.edit_draft.is_some() {
                     self.save_message_edit(text, window, cx);
                 } else {
-                    self.send_message(text, cx);
+                    self.send_message(text, wire_text, mentions.clone(), link_preview.clone(), cx);
                 }
             }
             InputAreaEvent::AttachFiles(category) => {
                 self.attach_category(*category, cx);
             }
             InputAreaEvent::PasteMedia => self.paste_media(cx),
+            InputAreaEvent::SendGif { bytes } => {
+                // The provider already handed us the MP4 WhatsApp plays; the
+                // session measures and thumbnails it like any other video.
+                let file = crate::platform::picker::Picked {
+                    file_name: "klipy.gif.mp4".to_string(),
+                    mime_type: "video/mp4".to_string(),
+                    kind: velo_core::OutgoingMedia::Gif,
+                    bytes: bytes.as_ref().clone(),
+                };
+                let Some((jid, reply, epoch)) = self.prepare_incoming_files(cx) else {
+                    return;
+                };
+                self.finish_incoming_file_read(epoch);
+                self.open_confirmation(
+                    jid,
+                    reply,
+                    crate::platform::picker::Chosen {
+                        files: vec![file],
+                        refused: Vec::new(),
+                    },
+                    cx,
+                );
+            }
             InputAreaEvent::StartRecording => {
                 self.start_recording(cx);
             }
@@ -3587,11 +4191,81 @@ impl WhatsAppApp {
     }
 
     /// Send a message to the currently selected chat
-    fn send_message(&mut self, text: &str, cx: &mut Context<Self>) {
+    fn send_message(
+        &mut self,
+        text: &str,
+        wire_text: &str,
+        mentions: Vec<String>,
+        prefetched: Option<velo_core::LinkPreview>,
+        cx: &mut Context<Self>,
+    ) {
         // Taken, not read: a reply is answered once. Leaving the draft in
         // place quoted the same message from every message that followed.
         let quoted = self.reply_to.take().map(QuotedMessage::from);
-        self.send_quoted(text, quoted, cx);
+        self.send_quoted(text, wire_text, mentions, quoted, prefetched, cx);
+    }
+
+    /// Read a link's page again and replace a low-resolution card.
+    pub(crate) fn regenerate_link_preview(
+        &mut self,
+        jid: &str,
+        message_id: &str,
+        url: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.find_chat(jid).is_none() {
+            return;
+        }
+        log::info!("link preview: regenerating {url}");
+        self.pending_link_previews.insert(message_id.to_string());
+        self.invalidate_message_cache(jid, cx);
+        let entity = cx.entity().downgrade();
+        let chat_jid = jid.to_string();
+        let msg_id = message_id.to_string();
+        let target = url.to_string();
+        let task = crate::platform::link_preview::fetch(cx, target.clone());
+        cx.spawn(async move |_, cx| {
+            let preview =
+                crate::platform::with_timeout(task, std::time::Duration::from_secs(8)).await;
+            let _ = entity.update(cx, |app, cx| {
+                app.pending_link_previews.remove(&msg_id);
+                match preview {
+                    Some(Ok(preview)) => {
+                        log::info!(
+                            "link preview: regenerated {target} (thumbnail {} bytes)",
+                            preview.thumbnail.len()
+                        );
+                        if let Some(chat) = app.find_chat_mut(&chat_jid)
+                            && let Some(message) = chat
+                                .messages
+                                .iter_mut()
+                                .find(|message| message.id == msg_id)
+                        {
+                            message.link_preview = Some(preview);
+                        }
+                    }
+                    Some(Err(error)) => {
+                        log::warn!("link preview: regenerating {target} failed: {error}");
+                        app.notify_user(
+                            crate::tr!(CouldNotUpdateThatLinkPreview),
+                            crate::app::notices::Tone::Problem,
+                            cx,
+                        );
+                    }
+                    None => {
+                        log::warn!("link preview: regenerating {target} timed out");
+                        app.notify_user(
+                            crate::tr!(CouldNotUpdateThatLinkPreview),
+                            crate::app::notices::Tone::Problem,
+                            cx,
+                        );
+                    }
+                }
+                app.invalidate_message_cache(&chat_jid, cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Send `text`, quoting whatever the caller says it quotes.
@@ -3600,7 +4274,19 @@ impl WhatsAppApp {
     /// the *original* message's quote: retrying is presented as sending the
     /// failed message again, and the reply draft that produced it was
     /// consumed when it was first sent.
-    fn send_quoted(&mut self, text: &str, quoted: Option<QuotedMessage>, cx: &mut Context<Self>) {
+    ///
+    /// `text` is what the composer showed and the bubble draws; `wire_text`
+    /// has every `@name` turned back into the address WhatsApp marks, and
+    /// `mentions` lists those addresses.
+    fn send_quoted(
+        &mut self,
+        text: &str,
+        wire_text: &str,
+        mentions: Vec<String>,
+        quoted: Option<QuotedMessage>,
+        prefetched: Option<velo_core::LinkPreview>,
+        cx: &mut Context<Self>,
+    ) {
         // Check if connected before attempting to send
         if !self.is_connected() {
             warn!("Cannot send message: not connected");
@@ -3612,20 +4298,107 @@ impl WhatsAppApp {
         };
 
         let local_id = Self::next_local_id("local");
-        let Some(client) = &self.client else {
+        if self.client.is_none() {
             warn!("Cannot send message: client is unavailable");
             return;
-        };
-        client.send_message(&jid, text, local_id.clone(), quoted.clone());
+        }
 
         // Add to local chat immediately for responsiveness; the client renames
-        // it to the real id via MessageIdAssigned.
-        let mut msg = ChatMessage::new_outgoing(local_id, text.to_string());
+        // it to the real id via MessageIdAssigned. The send itself waits for a
+        // link preview when the text has an address, so the bubble is on
+        // screen while the page is being read rather than after it.
+        let mut msg = ChatMessage::new_outgoing(local_id.clone(), text.to_string());
         // The bubble shows its own quote from the moment it is drawn, the way
         // the reply will look once it comes back from the store.
-        msg.quoted = quoted;
+        msg.quoted = quoted.clone();
         if self.add_message_to_chat(&jid, msg, cx) {
             self.scroll_to_last_message();
+        }
+
+        // A card the composer already read is used as it is. Nothing is
+        // fetched again, and the wire message carries the same preview the
+        // bubble showed while the person was typing.
+        let prefetched = crate::platform::link_preview::first_url(text)
+            .and_then(|url| prefetched.filter(|preview| preview.url == url));
+        if let Some(preview) = prefetched {
+            let url = preview.url.clone();
+            log::info!(
+                "link preview: composer card for {url} (thumbnail {} bytes)",
+                preview.thumbnail.len()
+            );
+            if let Some(chat) = self.find_chat_mut(&jid)
+                && let Some(message) = chat.messages.iter_mut().find(|m| m.id == local_id)
+            {
+                message.link_preview = Some(preview.clone());
+            }
+            self.invalidate_message_cache(&jid, cx);
+            if let Some(client) = &self.client {
+                client.send_message(&jid, wire_text, local_id, quoted, Some(preview), mentions);
+            }
+        } else if let Some(url) = crate::platform::link_preview::first_url(text) {
+            log::info!("link preview: fetching {url}");
+            self.pending_link_previews.insert(local_id.clone());
+            self.invalidate_message_cache(&jid, cx);
+            let entity = cx.entity().downgrade();
+            let task = crate::platform::link_preview::fetch(cx, url.clone());
+            let send_jid = jid.clone();
+            let send_text = wire_text.to_string();
+            let send_local_id = local_id;
+            let send_quoted = quoted;
+            let send_mentions = mentions;
+            cx.spawn(async move |_, cx| {
+                let preview =
+                    crate::platform::with_timeout(task, std::time::Duration::from_secs(8)).await;
+                let preview = match preview {
+                    Some(Ok(preview)) => Some(preview),
+                    Some(Err(error)) => {
+                        log::warn!("link preview: {url} failed: {error}");
+                        None
+                    }
+                    None => {
+                        log::warn!("link preview: {url} timed out");
+                        None
+                    }
+                };
+                match &preview {
+                    Some(preview) => log::info!(
+                        "link preview: ready for {url} (thumbnail {} bytes)",
+                        preview.thumbnail.len()
+                    ),
+                    None => log::warn!("link preview: unavailable for {url}"),
+                }
+                let _ = entity.update(cx, |app, cx| {
+                    app.pending_link_previews.remove(&send_local_id);
+                    if let Some(preview) = &preview
+                        && let Some(chat) = app.find_chat_mut(&send_jid)
+                        && let Some(message) =
+                            chat.messages.iter_mut().find(|m| m.id == send_local_id)
+                    {
+                        message.link_preview = Some(preview.clone());
+                    }
+                    app.invalidate_message_cache(&send_jid, cx);
+                    if let Some(client) = &app.client {
+                        log::info!(
+                            "sending {} with link preview={} mentions={}",
+                            send_jid,
+                            preview.is_some(),
+                            send_mentions.len()
+                        );
+                        client.send_message(
+                            &send_jid,
+                            &send_text,
+                            send_local_id,
+                            send_quoted,
+                            preview,
+                            send_mentions,
+                        );
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        } else if let Some(client) = &self.client {
+            client.send_message(&jid, wire_text, local_id, quoted, None, mentions);
         }
         // The reply bar goes with the reply it composed.
         if let Some(input) = &self.input_area {
@@ -4200,11 +4973,16 @@ impl WhatsAppApp {
         chat_jid: String,
         message_ids: Vec<String>,
         receipt_type: ReceiptType,
+        sender: Option<String>,
         cx: &mut App,
     ) {
         let Some(status) = receipt_status(receipt_type.clone()) else {
             return;
         };
+        // The aggregate tick is the strongest state anybody reached. The
+        // per-person map is what the info panel names, so a receipt from our
+        // own other device must not appear as a reader.
+        let reader = sender.filter(|jid| !self.is_own_number(jid));
 
         let Some(chat) = self.find_chat_mut(&chat_jid) else {
             return;
@@ -4214,6 +4992,28 @@ impl WhatsAppApp {
         } else {
             chat.advance_status(&message_ids, status)
         };
+        let mut names_changed = false;
+        if let Some(reader) = reader
+            && status >= MessageStatus::Delivered
+        {
+            for id in &message_ids {
+                if let Some(message) = chat
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.id == *id && message.is_from_me)
+                {
+                    let previous = message.receipts.get(&reader).copied();
+                    if previous.is_none_or(|previous| status > previous) {
+                        names_changed = true;
+                    }
+                    message
+                        .receipts
+                        .entry(reader.clone())
+                        .and_modify(|current| current.advance(status))
+                        .or_insert(status);
+                }
+            }
+        }
         // A read receipt is also the peer telling us they opened the chat,
         // which clears our own unread state for the messages named.
         let read = if status.is_read() {
@@ -4222,15 +5022,17 @@ impl WhatsAppApp {
             0
         };
 
-        if advanced + read > 0 {
+        if advanced + read > 0 || names_changed {
             debug!(
                 "{:?} for {} message(s) in {}",
                 receipt_type,
                 advanced + read,
                 observe_str(&chat_jid)
             );
-            // Ticks and the unread badge changed; count-based cache guards
-            // can't see either.
+            // Ticks, the unread badge and the per-person read-by line all
+            // change without the row count moving; count-based cache guards
+            // cannot see any of them. A second reader whose receipt does not
+            // advance the aggregate tick still has to repaint the label.
             self.invalidate_message_cache(&chat_jid, cx);
             self.invalidate_chat_cache();
         }
@@ -4527,7 +5329,7 @@ fn notification_tag(jid: &str) -> String {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(1_099_511_628_211);
     }
-    format!("velo-chat-{hash:016x}")
+    format!("wasp-chat-{hash:016x}")
 }
 
 fn notification_chat_jid(chats: &[Arc<Chat>], tag: &str) -> Option<String> {
@@ -4700,6 +5502,33 @@ impl Render for WhatsAppApp {
             .on_action(cx.listener(|app, _: &FocusSearch, window, cx| {
                 app.focus_search(window, cx);
             }))
+            .on_action(cx.listener(|app, _: &OpenCommandPalette, window, cx| {
+                app.open_command_palette(window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &PaletteUp, _window, cx| {
+                app.step_command_palette(false, cx);
+            }))
+            .on_action(cx.listener(|app, _: &PaletteDown, _window, cx| {
+                app.step_command_palette(true, cx);
+            }))
+            .on_action(cx.listener(|app, _: &SwitchToChats, window, cx| {
+                app.set_destination(Destination::Chats, window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &SwitchToStatus, window, cx| {
+                app.set_destination(Destination::Status, window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &SwitchToChannels, window, cx| {
+                app.set_destination(Destination::Channels, window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &SwitchToCommunities, window, cx| {
+                app.set_destination(Destination::Communities, window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &ToggleEmoji, window, cx| {
+                app.toggle_emoji_picker(window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &OpenGifPicker, window, cx| {
+                app.open_gif_picker(window, cx);
+            }))
             .on_action(cx.listener(|app, _: &NextChat, window, cx| {
                 app.select_next_chat(window, cx);
             }))
@@ -4757,6 +5586,10 @@ impl Render for WhatsAppApp {
             .on_action(cx.listener(|app, react: &ReactToMessage, window, cx| {
                 app.toggle_reaction(&react.id, &react.emoji, window, cx);
             }))
+            .on_action(cx.listener(|app, info: &OpenMessageInfo, _window, cx| {
+                app.message_info = Some((info.jid.to_string(), info.id.to_string()));
+                cx.notify();
+            }))
             .on_action(cx.listener(|app, _: &forward::NewChat, window, cx| {
                 app.open_new_chat(window, cx);
             }))
@@ -4771,9 +5604,14 @@ impl Render for WhatsAppApp {
             .on_action(|copy: &CopyMessage, _window, cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.text.to_string()));
             })
-            .on_action(|link: &OpenMessageLink, _window, cx| {
+            .on_action(cx.listener(|_app, link: &OpenMessageLink, _window, cx| {
                 cx.open_url(&link.url);
-            });
+            }))
+            .on_action(
+                cx.listener(|app, preview: &RegenerateLinkPreview, _window, cx| {
+                    app.regenerate_link_preview(&preview.jid, &preview.id, &preview.url, cx);
+                }),
+            );
         let root = Self::register_chat_action_handlers(root, cx);
 
         // Whether this frame draws the app rather than a screen on the way to
@@ -4783,20 +5621,33 @@ impl Render for WhatsAppApp {
             AppState::Connected | AppState::Offline | AppState::OfflineLoggedOut { .. }
         );
 
-        let paste_preview = self.paste_preview.as_ref().map(|preview| {
-            render_paste_preview(
-                PastePreviewProps {
-                    files: &preview.files,
-                    caption: preview.caption.as_ref(),
-                    list_scroll: &preview.list_scroll,
-                    app: cx.entity().clone(),
-                    can_send: self.can_send(),
-                    focus_handle: &self.paste_preview_focus,
-                    metrics: cx.product().metrics,
-                },
-                cx,
+        let command_palette = self.palette.open.then(|| {
+            render_command_palette(&self.palette, cx.entity().clone(), cx.product().metrics, cx)
+                .into_any_element()
+        });
+        let palette_open = command_palette.is_some();
+        let attachment_lightbox = self.paste_preview.as_ref().and_then(|preview| {
+            let index = preview.expanded?;
+            let image = preview.files.get(index)?.image.clone()?;
+            Some(
+                render_attachment_lightbox(image, cx.entity().clone(), cx.product().metrics, cx)
+                    .into_any_element(),
             )
-            .into_any_element()
+        });
+        let message_info = self.message_info.as_ref().and_then(|(jid, id)| {
+            let chat = self.find_chat(jid)?;
+            let message = chat.messages.iter().find(|message| message.id == *id)?;
+            let rows = self.message_receipt_rows(jid, id);
+            Some(
+                render_message_info(
+                    &rows,
+                    &message.content,
+                    cx.entity().clone(),
+                    cx.product().metrics,
+                    cx,
+                )
+                .into_any_element(),
+            )
         });
         let message_delete = self
             .delete_confirmation
@@ -4839,10 +5690,9 @@ impl Render for WhatsAppApp {
         // Modal surfaces own mouse and keyboard input while open. Keep the
         // call state alive underneath them, but do not render an interactive
         // call card above a fullscreen viewer or confirmation surface.
-        let paste_preview_open = paste_preview.is_some();
         let message_delete_open = message_delete.is_some();
         let media_viewer_open = self.viewer.read(cx).showing().is_some();
-        let modal_open = paste_preview_open || message_delete_open || media_viewer_open;
+        let modal_open = message_delete_open || media_viewer_open;
         let call_overlay = (connected && !modal_open)
             .then(|| render_call_overlay(self, window, cx))
             .flatten();
@@ -4890,7 +5740,9 @@ impl Render for WhatsAppApp {
                 )
                 .children(offline_banner),
         )
-        .children(paste_preview)
+        .children(command_palette)
+        .children(attachment_lightbox)
+        .children(message_info)
         .children(message_delete.map(|modal| {
             crate::motion::fade_in(div().absolute().inset_0().child(modal), "modal-in")
         }))
@@ -4907,7 +5759,7 @@ impl Render for WhatsAppApp {
                 move |_, window, cx| {
                     entity.update(cx, |app, _| {
                         app.keyboard_surfaces.call_card = call_card;
-                        app.keyboard_surfaces.paste_preview = paste_preview_open;
+                        app.keyboard_surfaces.palette = palette_open;
                         app.keyboard_surfaces.message_delete = message_delete_open;
                     });
                     let entity = entity.downgrade();
@@ -4969,6 +5821,64 @@ fn slot_for_chat(rest: &[Arc<Chat>], chat: &Chat) -> usize {
         .unwrap_or(rest.len())
 }
 
+/// One image's bytes, for deciding whether a cached decode still describes
+/// them. The pointer is included because two payloads of the same length and
+/// format are otherwise indistinguishable after a thumbnail is replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImageIdentity {
+    bytes: usize,
+    format: gpui::ImageFormat,
+    preview: bool,
+    /// A cheap fingerprint of the decoded source.
+    ///
+    /// Not the buffer address: messages are cloned into render props and
+    /// cache reads hand back a fresh `Arc` every time, so an address said
+    /// "different picture" once per frame and made the thumbnail decode
+    /// again on every paint.
+    content: u64,
+}
+
+impl ImageIdentity {
+    fn of(data: &[u8], format: gpui::ImageFormat, preview: bool) -> Self {
+        Self {
+            bytes: data.len(),
+            format,
+            preview,
+            content: sampled_hash(data),
+        }
+    }
+
+    fn of_keyed(key: &str, data: &[u8], format: gpui::ImageFormat, preview: bool) -> Self {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        Self {
+            bytes: data.len(),
+            format,
+            preview,
+            content: hasher.finish(),
+        }
+    }
+}
+
+/// Fingerprint enough of a picture to notice it was replaced, without
+/// hashing a multi-megabyte story on every frame.
+fn sampled_hash(data: &[u8]) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data.len().hash(&mut hasher);
+    let take = data.len().min(64);
+    data[..take].hash(&mut hasher);
+    if data.len() > take {
+        data[data.len() - take..].hash(&mut hasher);
+    }
+    if data.len() > take * 2 {
+        let middle = data.len() / 2;
+        data[middle..middle + take].hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// What a decoded image was decoded from.
 ///
 /// A message's bytes are not fixed: a preview is replaced by the real
@@ -5007,6 +5917,88 @@ fn timeline_may_page(visible: Option<&str>, anchored: Option<&str>, chat_jid: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A media cache that answers every key with one picture.
+    ///
+    /// The point of the test below is that a status card can paint from the
+    /// disk when its bytes have been released, so the cache has to be the
+    /// only place the picture exists.
+    struct OnePicture(std::sync::Arc<Vec<u8>>);
+
+    impl crate::session::MediaCache for OnePicture {
+        fn read(&self, _: &str) -> Result<std::sync::Arc<Vec<u8>>, String> {
+            Ok(std::sync::Arc::clone(&self.0))
+        }
+
+        fn stage(&self, _: &str, _: &[u8]) -> Result<(), String> {
+            Err("read-only".into())
+        }
+
+        fn discard(&self, _: &str) {}
+    }
+
+    /// A status card whose bytes were released still draws its photo.
+    ///
+    /// `sweep_retained_media` empties `data` when Status is not on screen, and
+    /// the list used to fall straight back to an avatar and stay there. The
+    /// cache key survives that sweep, so the card reads the picture back.
+    #[gpui::test]
+    fn a_status_card_reads_its_photo_back_from_the_cache(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(8, 12)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let cache = std::sync::Arc::new(OnePicture(std::sync::Arc::new(png)));
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        app.update(cx, |app, _| {
+            app.app_state = AppState::Offline;
+            app.materialization_cache = Some(cache);
+            let mut chat = Chat::new(velo_core::STATUS_BROADCAST_JID.to_string());
+            chat.is_status = true;
+            let mut message = ChatMessage::new_incoming(
+                "status-0".into(),
+                velo_core::STATUS_BROADCAST_JID.into(),
+                String::new(),
+            );
+            let mut media =
+                velo_core::MediaContent::image(Arc::new(Vec::new()), "image/png".into(), false);
+            media.cache_key = Some("status-photo".into());
+            message.media = Some(media);
+            chat.messages.push(message);
+            app.chats = vec![std::sync::Arc::new(chat)];
+        });
+        let author = velo_core::StatusAuthor {
+            jid: "author@example.invalid".into(),
+            name: "Author".into(),
+            updates: vec![0],
+            latest: chrono::Utc::now(),
+            unseen: 0,
+        };
+        let source = app.read_with(cx, |app, _| {
+            let feed = velo_core::StatusFeed::from_chat(&app.chats[0]);
+            app.status_thumbnail(&feed, &author)
+        });
+        assert!(
+            source.is_some(),
+            "a released status photo has to come back from the media cache"
+        );
+    }
+
+    #[test]
+    fn image_identity_tells_two_cache_keys_apart() {
+        let data = [1_u8, 2, 3];
+        let one = ImageIdentity::of_keyed("one", &data, gpui::ImageFormat::Png, false);
+        let two = ImageIdentity::of_keyed("two", &data, gpui::ImageFormat::Png, false);
+        assert_ne!(one, two);
+        assert_eq!(
+            one,
+            ImageIdentity::of_keyed("one", &data, gpui::ImageFormat::Png, false)
+        );
+    }
 
     struct SelectionExitTestView {
         focus_handle: FocusHandle,
@@ -5436,7 +6428,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(|cx| {
-            cx.set_app_identity("io.github.RuchinAudichya.Velo.Test", "Velo Test");
+            cx.set_app_identity("io.github.NexusOnePlus.Wasp.Test", "Wasp Test");
             gpui_component::init(cx);
             crate::theme::init(cx);
             init_app_bindings(cx);
@@ -5515,7 +6507,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(|cx| {
-            cx.set_app_identity("io.github.RuchinAudichya.Velo.Test", "Velo Test");
+            cx.set_app_identity("io.github.NexusOnePlus.Wasp.Test", "Wasp Test");
             gpui_component::init(cx);
             crate::theme::init(cx);
             init_app_bindings(cx);
@@ -5605,7 +6597,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let app = cx.update(|cx| {
-            cx.set_app_identity("io.github.RuchinAudichya.Velo.Test", "Velo Test");
+            cx.set_app_identity("io.github.NexusOnePlus.Wasp.Test", "Wasp Test");
             cx.new(|cx| {
                 let mut app = WhatsAppApp::new(cx);
                 app.chats.push(Arc::new(Chat::with_name(

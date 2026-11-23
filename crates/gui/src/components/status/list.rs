@@ -6,8 +6,8 @@
 
 use gpui::prelude::*;
 use gpui::{
-    App, Entity, IntoElement, ParentElement, Pixels, SharedString, Size,
-    StatefulInteractiveElement, Styled, div, size,
+    App, Entity, IntoElement, ObjectFit, ParentElement, Pixels, SharedString, Size,
+    StatefulInteractiveElement, Styled, div, img, px, size,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -19,7 +19,7 @@ use std::{cell::RefCell, rc::Rc};
 use crate::app::WhatsAppApp;
 use crate::components::parts;
 use crate::components::status::status_ring;
-use crate::components::{EmptyState, ProductIcon};
+use crate::components::{Avatar, EmptyState, ProductIcon};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::Metrics;
 use crate::utils::format_status_time;
@@ -38,6 +38,8 @@ pub struct StatusListProps {
     /// Each author's profile picture, by JID, when their chat has one. The
     /// ring drew a silhouette for everyone before, photo or not.
     pub pictures: std::collections::HashMap<String, String>,
+    /// The already-downscaled photo on each author's latest update.
+    pub previews: std::collections::HashMap<String, gpui::ImageSource>,
 }
 
 /// Whose run the reader has open.
@@ -181,12 +183,15 @@ fn render_rows(
     // Virtualization has a fixed cost. Keep the existing layout when all
     // contacts fit in roughly one viewport.
     let authors = props.feed.authors().len();
-    let content_height = layout.chat_item_height() * (authors as f32 + 1.)
-        + metrics.space_sm()
-        + metrics.space_lg() * 2.
-        + section_height(metrics);
-    let long_list =
-        authors > 0 && content_height > layout.viewport().height - metrics.sidebar_header_height();
+    let pairs = authors.div_ceil(2);
+    let (_, card_height) = card_size(layout);
+    let content_height = card_height * (pairs as f32 + 1.)
+        + f32::from(metrics.space_sm())
+        + f32::from(metrics.space_lg()) * 2.0
+        + f32::from(section_height(metrics));
+    let long_list = authors > 0
+        && content_height
+            > f32::from(layout.viewport().height) - f32::from(metrics.sidebar_header_height());
     if eager || !long_list {
         return div()
             .id("status-list")
@@ -204,7 +209,7 @@ fn render_rows(
             )
             .into_any_element();
     }
-    let sizes = status_row_sizes(props.feed.authors().len(), layout);
+    let sizes = status_row_sizes(pairs, layout);
     let scroll = VirtualListScrollHandle::from(props.scroll.clone());
     let rows_entity = entity.clone();
     v_virtual_list(entity, "status-list", sizes, move |_, range, _, cx| {
@@ -214,25 +219,11 @@ fn render_rows(
                     0 => render_mine(&props, rows_entity.clone(), layout, true, cx)
                         .into_any_element(),
                     1 => section_label(crate::tr!(Recent), metrics, cx).into_any_element(),
-                    _ => {
-                        let author = &props.feed.authors()[ix - 2];
-                        render_author_row(
-                            author,
-                            props.selected.is(&author.jid),
-                            None,
-                            props.pictures.get(&author.jid).cloned(),
-                            rows_entity.clone(),
-                            layout,
-                            cx,
-                        )
-                        .into_any_element()
-                    }
+                    _ => render_status_pair(&props, (ix - 2) * 2, rows_entity.clone(), layout, cx),
                 };
                 div()
                     .px(metrics.space_md())
-                    .when(ix == props.feed.authors().len() + 1, |el| {
-                        el.pb(metrics.space_lg())
-                    })
+                    .when(ix == pairs + 1, |el| el.pb(metrics.space_lg()))
                     .child(row)
             })
             .collect()
@@ -242,31 +233,78 @@ fn render_rows(
     .into_any_element()
 }
 
+/// The two cards in one grid row, in the order the feed lists their authors.
+fn render_status_pair(
+    props: &StatusListProps,
+    first: usize,
+    entity: Entity<WhatsAppApp>,
+    layout: ResponsiveLayout,
+    cx: &App,
+) -> gpui::AnyElement {
+    let metrics = *layout.metrics();
+    let authors = props.feed.authors();
+    div()
+        .flex()
+        .gap(metrics.space_sm())
+        .children((first..first + 2).filter_map(|index| {
+            let author = authors.get(index)?;
+            Some(
+                render_author_card(
+                    props,
+                    author,
+                    props.selected.is(&author.jid),
+                    props.pictures.get(&author.jid).cloned(),
+                    entity.clone(),
+                    layout,
+                    cx,
+                )
+                .into_any_element(),
+            )
+        }))
+        .into_any_element()
+}
+
+/// Half the sidebar, with the portrait proportions of a story tile.
+fn card_size(layout: ResponsiveLayout) -> (f32, f32) {
+    let metrics = *layout.metrics();
+    let width = (f32::from(layout.sidebar_width())
+        - f32::from(metrics.space_md()) * 2.0
+        - f32::from(metrics.space_sm()))
+        / 2.0;
+    (width.max(0.0), (width * 1.38).max(0.0))
+}
+
 fn section_height(metrics: Metrics) -> Pixels {
     metrics.text_meta() * 1.5 + metrics.space_sm()
 }
 
 /// Cache geometry across repaints, including font and density changes.
-fn status_row_sizes(authors: usize, layout: ResponsiveLayout) -> Rc<Vec<Size<Pixels>>> {
+fn status_row_sizes(pairs: usize, layout: ResponsiveLayout) -> Rc<Vec<Size<Pixels>>> {
     type Cached = (usize, Pixels, Metrics, Rc<Vec<Size<Pixels>>>);
     thread_local! { static SIZES: RefCell<Option<Cached>> = const { RefCell::new(None) }; }
     let width = layout.sidebar_width();
     let metrics = *layout.metrics();
+    let (_, card_height) = card_size(layout);
     SIZES.with(|held| {
         let mut held = held.borrow_mut();
         if let Some((count, old_width, old_metrics, sizes)) = held.as_ref()
-            && *count == authors
+            && *count == pairs
             && *old_width == width
             && *old_metrics == metrics
         {
             return Rc::clone(sizes);
         }
-        let mut sizes = vec![size(width, layout.chat_item_height()); authors + 2];
-        sizes[0].height += metrics.space_sm() + metrics.space_lg();
+        let row_height = px(card_height) + metrics.space_sm();
+        let mut sizes = vec![size(width, row_height); pairs + 2];
+        // "My status" is still a chat row above the grid, not a tile: it is
+        // the place to post, and it has to keep the height it draws at or the
+        // first pair jumps when keyboard focus switches the list from the
+        // virtual path to the eager one.
+        sizes[0].height = layout.chat_item_height() + metrics.space_sm() + metrics.space_lg();
         sizes[1].height = section_height(metrics);
-        sizes[authors + 1].height += metrics.space_lg();
+        sizes[pairs + 1].height += metrics.space_lg();
         let sizes = Rc::new(sizes);
-        *held = Some((authors, width, metrics, Rc::clone(&sizes)));
+        *held = Some((pairs, width, metrics, Rc::clone(&sizes)));
         sizes
     })
 }
@@ -361,21 +399,11 @@ fn render_recent(
         ];
     }
 
-    let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(authors.len() + 1);
+    let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(authors.len().div_ceil(2) + 1);
     rows.push(section_label(crate::tr!(Recent), metrics, cx).into_any_element());
-    rows.extend(authors.iter().map(|author| {
-        let is_selected = props.selected.is(&author.jid);
-        render_author_row(
-            author,
-            is_selected,
-            None,
-            props.pictures.get(&author.jid).cloned(),
-            entity.clone(),
-            layout,
-            cx,
-        )
-        .into_any_element()
-    }));
+    for first in (0..authors.len()).step_by(2) {
+        rows.push(render_status_pair(props, first, entity.clone(), layout, cx));
+    }
     rows
 }
 
@@ -391,7 +419,125 @@ fn section_label(label: &'static str, metrics: Metrics, cx: &App) -> impl IntoEl
         .child(label)
 }
 
+/// One person, as a portrait tile rather than a chat row.
+fn render_author_card(
+    props: &StatusListProps,
+    author: &StatusAuthor,
+    is_selected: bool,
+    picture: Option<String>,
+    entity: Entity<WhatsAppApp>,
+    layout: ResponsiveLayout,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    #[cfg(test)]
+    {
+        tests::ROWS.with(|rows| rows.set(rows.get() + 1));
+        tests::CAPTURE.with(|capture| {
+            if let Some(ids) = capture.borrow_mut().as_mut() {
+                ids.push(author.jid.clone());
+            }
+        });
+    }
+    let metrics = *layout.metrics();
+    let (width, height) = card_size(layout);
+    let jid = author.jid.clone();
+    let name: SharedString = author.name.clone().into();
+    let image = props.previews.get(&author.jid).cloned();
+    let fallback_picture = picture.clone();
+    let avatar = layout.avatar_size() * 0.7;
+    let ring = if author.has_unseen() || is_selected {
+        cx.theme().primary
+    } else {
+        cx.theme().border
+    };
+    Button::new(SharedString::from(format!("status-{jid}")))
+        .debug_selector(|| format!("status-{jid}"))
+        .ghost()
+        .w(px(width))
+        .h(px(height))
+        .p(px(0.0))
+        .overflow_hidden()
+        .rounded(metrics.radius_lg())
+        .border_2()
+        .border_color(if is_selected {
+            cx.theme().primary
+        } else {
+            cx.theme().border
+        })
+        .relative()
+        .cursor_pointer()
+        .on_click(move |_, _window, cx| {
+            entity.update(cx, |app, cx| app.open_status(jid.clone(), cx));
+        })
+        .child(div().absolute().inset_0().map(|el| {
+            match image {
+                Some(image) => el.child(img(image).size_full().object_fit(ObjectFit::Cover)),
+                None => el.child(
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(cx.theme().secondary)
+                        .child(
+                            Avatar::new(author.jid.clone(), &author.name, px(width * 0.55))
+                                .picture(fallback_picture, None)
+                                .on(cx.theme().primary),
+                        ),
+                ),
+            }
+        }))
+        .child(
+            div()
+                .absolute()
+                .left(metrics.space_sm())
+                .top(metrics.space_sm())
+                .rounded_full()
+                .p(px(2.0))
+                .border_2()
+                .border_color(ring)
+                .child(
+                    Avatar::new(author.jid.clone(), &author.name, avatar)
+                        .picture(picture, None)
+                        .on(cx.theme().sidebar),
+                ),
+        )
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .px(metrics.space_md())
+                .py(metrics.space_sm())
+                .bg(parts::scrim(cx).opacity(0.62))
+                .flex()
+                .flex_col()
+                .gap(metrics.space_xxs())
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(metrics.text_small())
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(parts::on_scrim(cx))
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(metrics.text_micro())
+                        .text_color(parts::on_scrim(cx).opacity(0.8))
+                        .child(format!(
+                            "{} · {}",
+                            update_count(author.count()),
+                            format_status_time(&author.latest)
+                        )),
+                ),
+        )
+}
+
 /// One person, with the ring that says whether their run is watched.
+#[allow(dead_code)]
 fn render_author_row(
     author: &StatusAuthor,
     is_selected: bool,
@@ -557,24 +703,23 @@ mod tests {
             crate::responsive::MobilePanel::ChatList,
             Metrics::default(),
         );
-        let first = status_row_sizes(1000, layout);
-        assert!(Rc::ptr_eq(&first, &status_row_sizes(1000, layout)));
-        assert_eq!(first.len(), 1002);
+        let first = status_row_sizes(500, layout);
+        assert!(Rc::ptr_eq(&first, &status_row_sizes(500, layout)));
+        assert_eq!(first.len(), 502);
+        let (_, card_height) = card_size(layout);
+        let row_height = px(card_height) + layout.metrics().space_sm();
         assert_eq!(
             first[0].height,
             layout.chat_item_height() + layout.metrics().space_sm() + layout.metrics().space_lg()
         );
-        assert_eq!(
-            first[1001].height,
-            layout.chat_item_height() + layout.metrics().space_lg()
-        );
-        assert!(!Rc::ptr_eq(&first, &status_row_sizes(999, layout)));
+        assert_eq!(first[501].height, row_height + layout.metrics().space_lg());
+        assert!(!Rc::ptr_eq(&first, &status_row_sizes(499, layout)));
         let zoomed = ResponsiveLayout::new(
             layout.viewport(),
             crate::responsive::MobilePanel::ChatList,
             Metrics::new(24., layout.metrics().density()),
         );
-        assert_ne!(first[2].height, status_row_sizes(1000, zoomed)[2].height);
+        assert_ne!(first[2].height, status_row_sizes(500, zoomed)[2].height);
     }
 
     /// The account's own updates are keyed by the empty string in the feed,
@@ -622,6 +767,7 @@ mod visible_cost {
                     selected: self.selected.clone(),
                     scroll: self.scroll.clone(),
                     pictures: Default::default(),
+                    previews: Default::default(),
                 },
                 self.app.clone(),
                 layout,

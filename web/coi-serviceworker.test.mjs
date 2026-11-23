@@ -38,13 +38,13 @@ test("notification click opens the scoped focused page with the opaque tag", asy
         postMessage: (message) => delivered.push(message),
     };
     const listeners = workerWith([other, page]);
-    listeners.get("message")({ data: { veloClientId: "tab-191" }, source: { id: "page-191" } });
+    listeners.get("message")({ data: { waspClientId: "tab-191" }, source: { id: "page-191" } });
     const click = listeners.get("notificationclick");
     let closed = false;
     let completion;
     click({
         notification: {
-            data: { veloTag: "velo-chat-123", veloClientId: "tab-191", veloAccountEpoch: "0" },
+            data: { waspTag: "wasp-chat-123", waspClientId: "tab-191", waspAccountEpoch: "0" },
             close: () => { closed = true; },
         },
         waitUntil: (promise) => { completion = promise; },
@@ -52,8 +52,8 @@ test("notification click opens the scoped focused page with the opaque tag", asy
     await completion;
     assert.equal(closed, true);
     assert.equal(delivered.length, 1);
-    assert.equal(delivered[0].veloNotificationTag, "velo-chat-123");
-    assert.equal(delivered[0].veloAccountEpoch, "0");
+    assert.equal(delivered[0].waspNotificationTag, "wasp-chat-123");
+    assert.equal(delivered[0].waspAccountEpoch, "0");
 });
 
 test("a click cannot open a matching chat in a different account tab", async () => {
@@ -63,10 +63,10 @@ test("a click cannot open a matching chat in a different account tab", async () 
         focus: async () => {}, postMessage: (value) => received.push(value),
     };
     const listeners = workerWith([other]);
-    listeners.get("message")({ data: { veloClientId: "departed-tab" }, source: { id: "old-tab" } });
+    listeners.get("message")({ data: { waspClientId: "departed-tab" }, source: { id: "old-tab" } });
     let completion;
     listeners.get("notificationclick")({
-        notification: { data: { veloTag: "velo-chat-123", veloClientId: "departed-tab" }, close: () => {} },
+        notification: { data: { waspTag: "wasp-chat-123", waspClientId: "departed-tab" }, close: () => {} },
         waitUntil: (promise) => { completion = promise; },
     });
     await completion;
@@ -76,6 +76,6 @@ test("a click cannot open a matching chat in a different account tab", async () 
 test("unrelated notification clicks are ignored", () => {
     const click = workerWith([]).get("notificationclick");
     let closed = false;
-    click({ notification: { data: { veloTag: "other" }, close: () => { closed = true; } } });
+    click({ notification: { data: { waspTag: "other" }, close: () => { closed = true; } } });
     assert.equal(closed, false);
 });

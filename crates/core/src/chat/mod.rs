@@ -7,6 +7,7 @@
 //! [`retain`] what a conversation lets go of when it is holding too much.
 
 mod group_hierarchy;
+mod link_preview;
 mod media;
 mod merge;
 mod message;
@@ -14,6 +15,7 @@ mod reactions;
 mod retain;
 
 pub use group_hierarchy::{GroupHierarchy, SubgroupKind};
+pub use link_preview::LinkPreview;
 pub use media::{DownloadableMedia, MediaContent, MediaType, OutgoingMedia};
 pub use message::{ChatMessage, PollContent, Resend};
 pub use retain::ReleasedMedia;
@@ -418,7 +420,7 @@ mod tests {
     use super::*;
 
     /// One person, one name. The bug: the same participant was "Eu" on their
-    /// bubbles and "jlucaso" in the typing line, because the two surfaces
+    /// bubbles and "a raw address" in the typing line, because the two surfaces
     /// asked different sources. Everything that names an author asks here.
     #[test]
     fn every_surface_names_an_author_the_same_way() {

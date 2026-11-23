@@ -35,6 +35,10 @@ pub enum TimelineItem {
         /// Whether this message starts a new run by the same author, which
         /// decides the sender name and the gap above it.
         starts_run: bool,
+        /// Whether this message ends its run. The group's face belongs at
+        /// the foot of the run, where the phone puts it, not beside the first
+        /// bubble above it.
+        ends_run: bool,
     },
     /// Always last, when someone is typing.
     Typing(TypingSummary),
@@ -176,13 +180,19 @@ impl MessageListCache {
     fn row_matches(&self, ix: usize, other: &Self, other_ix: usize) -> bool {
         match (self.items.get(ix), other.items.get(other_ix)) {
             (
-                Some(TimelineItem::Message { ix, starts_run }),
+                Some(TimelineItem::Message {
+                    ix,
+                    starts_run,
+                    ends_run,
+                }),
                 Some(TimelineItem::Message {
                     ix: other_ix,
                     starts_run: other_starts_run,
+                    ends_run: other_ends_run,
                 }),
             ) => {
                 starts_run == other_starts_run
+                    && ends_run == other_ends_run
                     && self.messages.get(*ix).map(|m| &m.id)
                         == other.messages.get(*other_ix).map(|m| &m.id)
             }
@@ -257,8 +267,20 @@ fn build_items(messages: &[ChatMessage], typing: Option<TypingSummary>) -> Vec<T
             || previous
                 .map(|prev| prev.sender != message.sender || prev.is_from_me != message.is_from_me)
                 .unwrap_or(true);
+        let ends_run = messages
+            .get(ix + 1)
+            .map(|next| {
+                crosses_day(&message.timestamp, &next.timestamp)
+                    || next.sender != message.sender
+                    || next.is_from_me != message.is_from_me
+            })
+            .unwrap_or(true);
 
-        items.push(TimelineItem::Message { ix, starts_run });
+        items.push(TimelineItem::Message {
+            ix,
+            starts_run,
+            ends_run,
+        });
     }
 
     if let Some(summary) = typing {
@@ -302,6 +324,7 @@ mod tests {
                 .children(self.rows.iter().cloned().map(|(jid, is_group, message)| {
                     let props = BubbleProps {
                         chat_jid: jid.into(),
+                        sender_avatar: None,
                         ids: BubbleIds::of(&message),
                         selection_order: 0,
                         text: BubbleText::of_message(&message),
@@ -312,6 +335,11 @@ mod tests {
                         is_own_number: false,
                         quoted_sender_is_self: false,
                         starts_run: true,
+                        ends_run: true,
+                        read_by: Vec::new(),
+                        highlighted: false,
+                        link_preview_pending: false,
+                        link_preview_image: None,
                         video_player_state: None,
                         video_frame: None,
                         decoded_image: None,

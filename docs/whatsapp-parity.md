@@ -1,11 +1,11 @@
-# Velo vs WhatsApp: feature parity and known bugs
+# Wasp vs WhatsApp: feature parity and known bugs
 
 A working list, checked against the code and the running app on 19 Nov 2026.
 ✅ has it · ⚠️ partly · ❌ missing. **Priority** marks what to build next.
 
 ## Messages
 
-| Feature | Velo | Notes |
+| Feature | Wasp | Notes |
 | --- | --- | --- |
 | Text, emoji, *bold* / _italic_ / ~strike~ / `mono` | ✅ | |
 | Reply, react, edit, copy | ✅ | |
@@ -24,18 +24,18 @@ A working list, checked against the code and the running app on 19 Nov 2026.
 
 ## Media
 
-| Feature | Velo | Notes |
+| Feature | Wasp | Notes |
 | --- | --- | --- |
 | Send photos, videos, documents, stickers, GIFs | ✅ | |
 | Voice notes: record, play, 1× / 1.5× / 2× | ✅ | |
-| Preview before downloading | ✅ | Velo extra |
+| Preview before downloading | ✅ | Wasp extra |
 | Drag and drop, paste images | ✅ | |
 | Media viewer | ✅ | |
 | Per-chat files panel, global Files screen | ✅ | Restyled today |
 
 ## Chats
 
-| Feature | Velo | Notes |
+| Feature | Wasp | Notes |
 | --- | --- | --- |
 | Pin, mute, archive, mark unread, clear, delete | ✅ | Row and header menus |
 | New chat by number (Ctrl+N) | ✅ | |
@@ -49,7 +49,7 @@ A working list, checked against the code and the running app on 19 Nov 2026.
 
 ## Groups and contacts
 
-| Feature | Velo | Notes |
+| Feature | Wasp | Notes |
 | --- | --- | --- |
 | Group / contact info, members | ✅ | |
 | **Block / unblock a contact** | ❌ | **P1.** The library supports it |
@@ -59,7 +59,7 @@ A working list, checked against the code and the running app on 19 Nov 2026.
 
 ## Calls and Status
 
-| Feature | Velo | Notes |
+| Feature | Wasp | Notes |
 | --- | --- | --- |
 | Voice and video calls | ⚠️ | Work; still beta |
 | Call history with call-back | ✅ | Redesigned today |
@@ -69,7 +69,7 @@ A working list, checked against the code and the running app on 19 Nov 2026.
 
 ## Settings and desktop
 
-| Feature | Velo | Notes |
+| Feature | Wasp | Notes |
 | --- | --- | --- |
 | Themes, accent colours, wallpapers, text size | ✅ | |
 | Notifications, chimes, tray, start at sign-in | ✅ | |
@@ -94,7 +94,7 @@ Fixed on 19 Nov 2026:
 
 Still open:
 
-- A chat deleted or cleared in Velo may come back after a restart until
+- A chat deleted or cleared in Wasp may come back after a restart until
   WhatsApp syncs the change back; the background service does not record it
   itself. Needs a test on a throwaway chat.
 - Group members who have no chat with you never get a photo: WhatsApp gives
@@ -105,4 +105,4 @@ Still open:
 - Files: the "N files" count above the list counts downloads only, not the
   documents found in chats.
 - New chat: your own number is listed among contacts without "(You)".
-- Notifications show a generic icon instead of the Velo logo (Phase 3).
+- Notifications show a generic icon instead of the Wasp logo (Phase 3).

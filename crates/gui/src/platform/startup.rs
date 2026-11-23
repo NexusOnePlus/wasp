@@ -84,7 +84,7 @@ mod imp {
     /// worth being able to choose it from the URL when a machine's WebGPU is the
     /// thing that is broken.
     pub(super) fn application() -> gpui::Application {
-        gpui_platform::application().with_quit_mode(quit_mode())
+        crate::platform::http::install(gpui_platform::application().with_quit_mode(quit_mode()))
     }
 
     /// A desktop window is the GUI process. The daemon owns the persistent

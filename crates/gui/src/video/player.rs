@@ -51,6 +51,8 @@ pub struct VideoPlayer {
     needs_audio_start: bool,
     completion_tx: Option<oneshot::Sender<()>>,
     preparation: Arc<()>,
+    /// An animated GIF restarts at the end instead of stopping.
+    looping: bool,
 }
 
 impl Default for VideoPlayer {
@@ -73,7 +75,18 @@ impl VideoPlayer {
             needs_audio_start: false,
             completion_tx: None,
             preparation: Arc::new(()),
+            looping: false,
         }
+    }
+
+    /// Play this video as the animation it is, restarting at the end.
+    ///
+    /// WhatsApp sends an animated GIF as an MP4 with `gif_playback`; there is
+    /// no transport chrome and no reason to stop after one pass. The flag
+    /// outlives a pause, and is cleared by [`stop`](Self::stop) only through a
+    /// new player — the same bytes stay the same kind of media.
+    pub fn set_looping(&mut self, looping: bool) {
+        self.looping = looping;
     }
 
     /// Subscribe to playback completion (only one subscriber supported at a time).
@@ -220,7 +233,18 @@ impl VideoPlayer {
 
         let current_time = self.current_time();
 
-        if current_time >= decoder.duration() {
+        if current_time >= decoder.duration() && decoder.duration() > Duration::ZERO {
+            if self.looping {
+                // A new pass from the first frame. `stop` is skipped on
+                // purpose: it clears the completion and asks for a poster,
+                // where a loop is the animation carrying on.
+                self.playback_start = Some(Instant::now());
+                self.paused_at = None;
+                if let Some(decoder) = &mut self.decoder {
+                    decoder.seek(Duration::ZERO);
+                }
+                return true;
+            }
             // stop() clears completion_tx, so take it first or the notification is lost
             let completion_tx = self.completion_tx.take();
             self.stop();
@@ -290,6 +314,37 @@ mod tests {
         let mut replacement = VideoPlayer::new();
         replacement.set_downloading();
         assert!(!replacement.owns_preparation(&reopened));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_looping_player_starts_again_instead_of_finishing() {
+        let data = super::super::platform::tests::synthetic_video();
+        let decoder = StreamingVideoDecoder::new(&data).unwrap();
+        let duration = decoder.duration();
+        assert!(duration > Duration::ZERO);
+        let mut player = VideoPlayer::new();
+        player.load(decoder);
+        player.set_looping(true);
+        let mut completion = player.on_complete();
+        player.play();
+        // Put the clock at the end without waiting the clip out. The
+        // monotonic origin is recent, so moving `playback_start` backwards
+        // saturates at zero on a freshly started test process; a paused
+        // position is the same question asked without arithmetic on it.
+        player.playback_start = None;
+        player.paused_at = Some(duration + Duration::from_millis(20));
+        assert!(player.update());
+        assert_eq!(
+            player.state(),
+            VideoPlayerState::Playing,
+            "a GIF has to keep playing rather than stop at the end"
+        );
+        assert!(player.current_time() < duration);
+        assert!(
+            completion.try_recv().is_err(),
+            "a loop never tells the interface it finished"
+        );
     }
 
     #[cfg(not(target_family = "wasm"))]

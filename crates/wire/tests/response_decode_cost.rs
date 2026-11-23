@@ -40,7 +40,7 @@ fn paired(label: &str, frame: &[u8], rounds: usize) {
 #[test]
 #[ignore = "release-only paired timing comparison"]
 fn response_decode_timing() {
-    let rounds = std::env::var("VELO_BENCH_ROUNDS")
+    let rounds = std::env::var("WASP_BENCH_ROUNDS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|v| *v > 0)

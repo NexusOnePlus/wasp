@@ -156,15 +156,29 @@ impl WhatsAppApp {
                 }
             }
             UiEvent::AvatarReady { jid, key } => {
+                debug!(
+                    "avatar ready for {}: {}",
+                    jid,
+                    if key.is_empty() { "none" } else { "picture" }
+                );
                 self.avatar_manager.on_avatar_ready(&jid, &key);
+                // A group sender is not a chat row, so the key has to live
+                // here as well. An empty key is WhatsApp saying there is no
+                // picture: drop the pointer rather than keeping bytes that
+                // may have been replaced.
+                if key.is_empty() {
+                    self.sender_avatars.remove(&jid);
+                } else {
+                    self.sender_avatars.insert(jid.clone(), key.clone());
+                }
                 if let Some(chat) = self.find_chat_mut(&jid) {
                     // An empty key is WhatsApp saying this chat has no
                     // picture: the placeholder is the right drawing, and any
                     // cached bytes have to stop being pointed at.
                     chat.ready_avatar(key);
                     self.invalidate_chat_cache();
-                    cx.notify();
                 }
+                cx.notify();
             }
             UiEvent::AvatarFailed { jid, retryable } => {
                 let until = self.avatar_manager.on_avatar_failed(&jid, retryable);
@@ -372,8 +386,9 @@ impl WhatsAppApp {
                 chat_jid,
                 message_ids,
                 receipt_type,
+                sender,
             } => {
-                self.handle_receipt_received(chat_jid, message_ids, receipt_type, cx);
+                self.handle_receipt_received(chat_jid, message_ids, receipt_type, sender, cx);
                 cx.notify();
             }
             UiEvent::ReactionReceived {

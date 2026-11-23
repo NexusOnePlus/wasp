@@ -483,6 +483,7 @@ fn a_receipt_starts_no_picture_lookup() {
         chat_jid: "1@s.whatsapp.net".into(),
         message_ids: vec!["m1".into()],
         receipt_type: velo_core::ReceiptType::Read,
+        sender: Some("1@s.whatsapp.net".into()),
     });
 
     assert!(

@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-  Measure the installed Velo: cold start, idle memory, binary sizes.
+  Measure the installed Wasp: cold start, idle memory, binary sizes.
 
 .DESCRIPTION
   The before/after yardstick for performance work. Run it against the
-  installed build (per-user install under %LOCALAPPDATA%\Programs\Velo) on the
+  installed build (per-user install under %LOCALAPPDATA%\Programs\Wasp) on the
   same machine each time, with nothing else heavy running:
 
     pwsh tools/measure/desktop-baseline.ps1 -Label baseline
@@ -33,10 +33,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Resolve-Path (Join-Path $PSScriptRoot '..\..')
-$install = Join-Path $env:LOCALAPPDATA 'Programs\Velo'
-$window = Join-Path $install 'velo.exe'
-$service = Join-Path $install 'velod.exe'
-if (!(Test-Path $window)) { throw "Velo is not installed at $install" }
+$install = Join-Path $env:LOCALAPPDATA 'Programs\Wasp'
+$window = Join-Path $install 'wasp.exe'
+$service = Join-Path $install 'waspd.exe'
+if (!(Test-Path $window)) { throw "Wasp is not installed at $install" }
 
 function Stop-Window {
     Get-Process velo -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -97,7 +97,7 @@ function Measure-Service {
     Stop-Window
     try { Invoke-Service 'shutdown' | Out-Null } catch {}
     $deadline = (Get-Date).AddSeconds(15)
-    while ((Get-Process velod -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+    while ((Get-Process waspd -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
     $watch = [Diagnostics.Stopwatch]::StartNew()
     Start-Process $service | Out-Null
     $ready = if (Wait-Pipe 30000) { $watch.ElapsedMilliseconds } else { -1 }
@@ -121,14 +121,14 @@ $ram = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory 
 $os = (Get-CimInstance Win32_OperatingSystem)
 $version = (Get-Item $window).VersionInfo.ProductVersion
 $machine = "$($cpu.Name.Trim()) ($($cpu.NumberOfLogicalProcessors) threads), $ram GB RAM, $gpu, $($os.Caption) $($os.BuildNumber)"
-Write-Host "Velo $version on $machine"
+Write-Host "Wasp $version on $machine"
 
 $csv = Join-Path $root 'docs\measurements\desktop-baseline.csv'
 if (!(Test-Path $csv)) {
     'label,version,run,window_ms,service_ms,connected_ms,window_mb,service_mb,window_exe_mb,service_exe_mb,installer_mb,machine' | Set-Content -Encoding utf8 $csv
 }
 $size = { param($path) if (Test-Path $path) { [math]::Round((Get-Item $path).Length / 1MB, 1) } else { -1 } }
-$installer = Get-ChildItem (Join-Path $root 'dist') -Filter 'Velo-Setup-*.exe' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$installer = Get-ChildItem (Join-Path $root 'dist') -Filter 'Wasp-Setup-*.exe' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 
 for ($run = 1; $run -le $Runs; $run++) {
     $serviceTimes = Measure-Service
@@ -136,7 +136,7 @@ for ($run = 1; $run -le $Runs; $run++) {
     Start-Sleep -Seconds 20
     $row = @(
         $Label, $version, $run, $windowMs, $serviceTimes[0], $serviceTimes[1],
-        (Private-MB velo), (Private-MB velod),
+        (Private-MB velo), (Private-MB waspd),
         (& $size $window), (& $size $service), (& $size $installer.FullName),
         "`"$machine`""
     ) -join ','

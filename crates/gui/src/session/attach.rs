@@ -67,6 +67,10 @@ pub(super) struct Attached {
 /// The hello could not be written, which means the connection was gone before
 /// it began.
 #[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "the legacy single-account entry point is kept beside its account-scoped replacement"
+)]
 pub(super) fn begin(
     link: Link,
     media: Arc<dyn MediaCache>,

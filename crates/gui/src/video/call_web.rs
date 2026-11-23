@@ -22,7 +22,7 @@
 //!
 //! # Where this works
 //!
-//! Attached to an `velod`, which is where calls happen at all: a page
+//! Attached to an `waspd`, which is where calls happen at all: a page
 //! holding its own session cannot answer one, so the frames this decodes are
 //! the ones a daemon is already sending it.
 

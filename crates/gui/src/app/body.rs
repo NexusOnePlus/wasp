@@ -81,15 +81,7 @@ impl Render for Body {
                         if let Some(view) = app.call_history_view.clone().filter(|_| app.calls_open)
                         {
                             app.note_visible_conversation(None, window, cx);
-                            let layout = app.responsive_layout(window, cx);
-                            div()
-                                .size_full()
-                                .flex()
-                                .child(crate::views::render_rail(app, entity.clone(), layout, cx))
-                                .child(crate::motion::fade_in(
-                                    div().flex_1().min_w_0().h_full().child(view),
-                                    "view-calls",
-                                ))
+                            crate::motion::fade_in(div().size_full().child(view), "view-calls")
                                 .into_any_element()
                         } else if app.files_open {
                             app.note_visible_conversation(None, window, cx);
@@ -99,16 +91,8 @@ impl Render for Body {
                                     crate::components::files_view::FilesView::new(owner, window, cx)
                                 }));
                             }
-                            let layout = app.responsive_layout(window, cx);
                             let files = app.files_view.clone().unwrap();
-                            div()
-                                .size_full()
-                                .flex()
-                                .child(crate::views::render_rail(app, entity.clone(), layout, cx))
-                                .child(crate::motion::fade_in(
-                                    div().flex_1().min_w_0().h_full().child(files),
-                                    "view-files",
-                                ))
+                            crate::motion::fade_in(div().size_full().child(files), "view-files")
                                 .into_any_element()
                         } else {
                             if app.shared_files_search.is_none() {
@@ -784,6 +768,32 @@ pub(super) mod tests {
     }
 
     #[gpui::test]
+    fn every_destination_button_opens_its_own_destination(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        for (id, expected) in [
+            ("nav-chats", Destination::Chats),
+            ("nav-status", Destination::Status),
+            ("nav-channels", Destination::Channels),
+            ("nav-communities", Destination::Communities),
+        ] {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+            let button = cx.debug_bounds(id).unwrap_or_else(|| panic!("{id} button"));
+            cx.simulate_click(button.center(), gpui::Modifiers::default());
+            cx.run_until_parked();
+            cx.read(|cx| {
+                assert_eq!(
+                    app.read(cx).destination(),
+                    expected,
+                    "{id} opened the wrong destination"
+                )
+            });
+        }
+    }
+
+    #[gpui::test]
     fn navigation_rail_buttons_are_keyboard_reachable(cx: &mut gpui::TestAppContext) {
         let (mut cx, app) = connected_app_fixture(cx);
         cx.update(|window, cx| {
@@ -796,7 +806,9 @@ pub(super) mod tests {
         cx.read(|cx| assert_eq!(app.read(cx).destination(), Destination::Channels));
         cx.update(|window, cx| {
             window.blur(cx);
-            for _ in 0..7 {
+            // The sidebar's title actions, its search field, then the four
+            // destinations in the capsule. The last one is Communities.
+            for _ in 0..9 {
                 window.focus_next(cx);
             }
         });
@@ -902,6 +914,190 @@ pub(super) mod tests {
         });
     }
 
+    #[gpui::test]
+    fn a_group_receipt_names_the_reader_and_keeps_the_strongest_state(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                let mut chat = Chat::new("group@g.us".into());
+                chat.is_group = true;
+                chat.name = "Group".into();
+                chat.participants
+                    .insert("reader@s.whatsapp.net".into(), "Ana".into());
+                let mut message = ChatMessage::new_outgoing("local-1".into(), "hi".into());
+                message.is_from_me = true;
+                message.status = MessageStatus::Sent;
+                chat.messages.push(message);
+                app.chats.push(Arc::new(chat));
+
+                app.handle_receipt_received(
+                    "group@g.us".into(),
+                    vec!["local-1".into()],
+                    ReceiptType::Delivered,
+                    Some("reader@s.whatsapp.net".into()),
+                    cx,
+                );
+                app.handle_receipt_received(
+                    "group@g.us".into(),
+                    vec!["local-1".into()],
+                    ReceiptType::Read,
+                    Some("reader@s.whatsapp.net".into()),
+                    cx,
+                );
+                let message = &app.find_chat("group@g.us").unwrap().messages[0];
+                assert_eq!(
+                    message.receipts.get("reader@s.whatsapp.net"),
+                    Some(&MessageStatus::Read),
+                    "a later delivered receipt must not undo a read"
+                );
+                assert_eq!(
+                    app.read_receipt_names("group@g.us", message),
+                    vec!["Ana".to_string()]
+                );
+                assert_eq!(
+                    app.message_receipt_rows("group@g.us", "local-1"),
+                    vec![("Ana".to_string(), MessageStatus::Read)]
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn a_reader_is_named_only_under_the_last_message_they_read(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                let mut chat = Chat::new("group@g.us".into());
+                chat.is_group = true;
+                chat.name = "Group".into();
+                chat.participants
+                    .insert("reader@s.whatsapp.net".into(), "Ana".into());
+                chat.participants
+                    .insert("other@s.whatsapp.net".into(), "Bia".into());
+                for id in ["m-1", "m-2"] {
+                    let mut message = ChatMessage::new_outgoing(id.into(), "hi".into());
+                    message.is_from_me = true;
+                    chat.messages.push(message);
+                }
+                app.chats.push(Arc::new(chat));
+
+                // Ana read both; Bia only the first. Ana belongs under the
+                // second, Bia under the first, and neither label repeats.
+                for (ids, reader) in [
+                    (
+                        vec!["m-1".to_string(), "m-2".to_string()],
+                        "reader@s.whatsapp.net",
+                    ),
+                    (vec!["m-1".to_string()], "other@s.whatsapp.net"),
+                ] {
+                    app.handle_receipt_received(
+                        "group@g.us".into(),
+                        ids,
+                        ReceiptType::Read,
+                        Some(reader.to_string()),
+                        cx,
+                    );
+                }
+                let messages: Vec<Arc<ChatMessage>> = app
+                    .find_chat("group@g.us")
+                    .unwrap()
+                    .messages
+                    .iter()
+                    .cloned()
+                    .map(Arc::new)
+                    .collect();
+                let labels = app.read_receipt_names_by_last_message("group@g.us", &messages);
+                assert_eq!(labels.get("m-1"), Some(&vec!["Bia".to_string()]));
+                assert_eq!(labels.get("m-2"), Some(&vec!["Ana".to_string()]));
+                assert!(!labels.contains_key("m-3"));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn ctrl_k_opens_the_command_palette_and_escape_closes_it(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-k"
+        } else {
+            "ctrl-k"
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert!(app.palette.open);
+            assert_eq!(app.keyboard_owner, Some(KeyboardOwner::Palette));
+            assert!(
+                !app.palette.rows.is_empty(),
+                "the palette must offer at least the loaded chat"
+            );
+        });
+        assert!(
+            cx.debug_bounds("command-palette").is_some(),
+            "the floating command bar must be drawn"
+        );
+        assert!(
+            cx.debug_bounds("command-palette-row-0").is_some(),
+            "its first row must be reachable"
+        );
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.read(|cx| assert!(!app.read(cx).palette.open));
+    }
+
+    #[gpui::test]
+    fn palette_arrows_move_and_reopening_starts_clean(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                let mut second = Chat::new("second@example.invalid".into());
+                second.name = "Second person".into();
+                app.chats.push(Arc::new(second));
+                app.invalidate_chat_cache();
+                cx.notify();
+            });
+        });
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-k"
+        } else {
+            "ctrl-k"
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.read(|cx| assert!(app.read(cx).palette.rows.len() >= 2));
+
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        cx.read(|cx| assert_eq!(app.read(cx).palette.selected, 1));
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        cx.read(|cx| assert_eq!(app.read(cx).palette.selected, 0));
+
+        cx.simulate_keystrokes("s");
+        cx.run_until_parked();
+        cx.read(|cx| assert_eq!(app.read(cx).palette.query, "s"));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-k"
+        } else {
+            "ctrl-k"
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert_eq!(app.palette.query, "");
+            let input = app.palette.input.as_ref().expect("palette input");
+            assert_eq!(input.read(cx).value(), "");
+        });
+    }
+
     fn paste_preview_fixture(
         cx: &mut gpui::TestAppContext,
     ) -> (gpui::VisualTestContext, Entity<WhatsAppApp>) {
@@ -966,21 +1162,25 @@ pub(super) mod tests {
                 app.paste_preview
                     .as_ref()
                     .is_some_and(|preview| preview.chat_was_visible),
-                "the preview must remember that its destination was visible before the modal"
+                "the tray must remember that its destination was visible"
             );
             assert!(
-                app.visible_chat.is_none(),
-                "a conversation covered by the modal must not count as visible"
+                app.visible_chat.is_some(),
+                "the conversation stays visible beneath the inline tray"
             );
         });
         cx.update(|window, cx| {
             let app = app.read(cx);
-            let caption = app
-                .paste_preview
+            let composer = app
+                .input_area
                 .as_ref()
-                .and_then(|preview| preview.caption.as_ref())
-                .expect("caption input");
-            assert!(caption.read(cx).focus_handle(cx).is_focused(window));
+                .expect("composer")
+                .read(cx)
+                .focus_handle(cx);
+            assert!(
+                composer.is_focused(window),
+                "the caption belongs in the main composer"
+            );
         });
         assert!(
             cx.debug_bounds("paste-preview").is_some(),
@@ -1030,9 +1230,7 @@ pub(super) mod tests {
     }
 
     #[gpui::test]
-    fn paste_preview_background_does_not_activate_overlapping_call_control(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn attachment_tray_leaves_the_call_card_interactive(cx: &mut gpui::TestAppContext) {
         let (mut cx, app) = connected_app_fixture(cx);
         cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(1100.)));
         cx.run_until_parked();
@@ -1070,19 +1268,24 @@ pub(super) mod tests {
             assert!(app.call_state(cx).stage().is_some());
             assert!(app.paste_preview.is_some());
             assert!(
-                !app.keyboard_surfaces.call_card,
-                "a confirmation modal must temporarily hide the interactive call card"
+                app.keyboard_surfaces.call_card,
+                "an inline tray must not hide the interactive call card"
             );
-            assert_eq!(app.keyboard_owner, Some(KeyboardOwner::PastePreview));
+            assert_eq!(
+                app.keyboard_owner,
+                Some(KeyboardOwner::RingingCall("test-call-under-preview".into())),
+                "a ringing call still takes the keyboard over the tray"
+            );
         });
         let preview = cx
             .debug_bounds("paste-preview")
-            .expect("the modal preview must cover the window");
+            .expect("the attachment tray must be drawn");
         assert!(
-            preview.contains(&call_cancel_point),
-            "the modal covers the previously verified call control point"
+            !preview.contains(&call_cancel_point),
+            "the tray at the foot of the conversation does not cover the call card"
         );
 
+        // The card stays above the tray, so the control it drew still answers.
         cx.simulate_click(call_cancel_point, gpui::Modifiers::default());
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -1091,16 +1294,13 @@ pub(super) mod tests {
             let app = app.read(cx);
             assert!(
                 app.paste_preview.is_some(),
-                "background click keeps preview open"
+                "cancelling the call leaves the attachment waiting"
             );
             assert!(
-                app.call_state(cx).stage().is_some(),
-                "the overlapping call control must not receive the modal click"
+                app.call_state(cx).stage().is_none(),
+                "the call control received the click the tray must not intercept"
             );
-            assert!(
-                !app.keyboard_surfaces.call_card,
-                "the card stays suppressed while the modal is open"
-            );
+            assert_eq!(app.keyboard_owner, Some(KeyboardOwner::PastePreview));
         });
 
         let cancel = cx
@@ -1112,20 +1312,8 @@ pub(super) mod tests {
         cx.read(|cx| {
             let app = app.read(cx);
             assert!(app.paste_preview.is_none());
-            assert!(app.call_state(cx).stage().is_some());
-            assert_eq!(
-                app.keyboard_owner,
-                Some(KeyboardOwner::RingingCall("test-call-under-preview".into()))
-            );
-            assert!(
-                app.keyboard_surfaces.call_card,
-                "the card returns after close"
-            );
+            assert!(app.call_state(cx).stage().is_none());
         });
-
-        cx.simulate_click(call_cancel_point, gpui::Modifiers::default());
-        cx.run_until_parked();
-        cx.read(|cx| assert!(app.read(cx).call_state(cx).stage().is_none()));
     }
 
     #[gpui::test]
@@ -1227,26 +1415,13 @@ pub(super) mod tests {
     }
 
     #[gpui::test]
-    fn preview_modal_renders_a_caption_box(cx: &mut gpui::TestAppContext) {
-        let (mut cx, _app) = paste_preview_fixture(cx);
-        assert!(
-            cx.debug_bounds("paste-preview-caption").is_some(),
-            "the confirmation modal must offer a caption box"
-        );
-    }
-
-    #[gpui::test]
-    fn keyboard_paste_focuses_caption_and_enter_confirms(cx: &mut gpui::TestAppContext) {
+    fn typing_in_the_composer_captions_the_waiting_files(cx: &mut gpui::TestAppContext) {
         let (mut cx, app) = paste_preview_fixture(cx);
         cx.simulate_keystrokes("look");
         cx.read(|cx| {
             let app = app.read(cx);
-            let caption = app
-                .paste_preview
-                .as_ref()
-                .and_then(|preview| preview.caption.as_ref())
-                .expect("caption input");
-            assert_eq!(caption.read(cx).value(), "look");
+            let composer = app.input_area.as_ref().expect("composer");
+            assert_eq!(composer.read(cx).text(cx), "look");
         });
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
@@ -1259,19 +1434,12 @@ pub(super) mod tests {
     }
 
     #[gpui::test]
-    fn caption_typed_in_modal_is_sent_with_the_image(cx: &mut gpui::TestAppContext) {
+    fn composer_text_is_sent_with_the_waiting_image(cx: &mut gpui::TestAppContext) {
         let (mut cx, app) = paste_preview_fixture(cx);
         cx.update(|window, cx| {
-            let caption = app
-                .read(cx)
-                .paste_preview
-                .as_ref()
-                .expect("preview open")
-                .caption
-                .clone()
-                .expect("caption box built");
-            caption.update(cx, |caption, cx| {
-                caption.set_value("olha a foto", window, cx);
+            let composer = app.read(cx).input_area.clone().expect("composer");
+            composer.update(cx, |view, cx| {
+                view.swap_text("olha a foto", window, cx);
             });
         });
         let send = cx
@@ -1361,16 +1529,15 @@ pub(super) mod tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         cx.update(|window, cx| {
             let app = app.read(cx);
-            let caption = app
-                .paste_preview
+            let composer = app
+                .input_area
                 .as_ref()
-                .unwrap()
-                .caption
-                .as_ref()
-                .unwrap();
+                .expect("composer")
+                .read(cx)
+                .focus_handle(cx);
             assert!(
-                caption.read(cx).focus_handle(cx).is_focused(window),
-                "caption must own focus"
+                composer.is_focused(window),
+                "the composer is where the caption is typed"
             );
         });
         cx.simulate_keystrokes("myclip");
@@ -1416,7 +1583,7 @@ pub(super) mod tests {
     }
 
     #[gpui::test]
-    fn second_paste_while_preview_open_is_dropped(cx: &mut gpui::TestAppContext) {
+    fn second_paste_while_preview_open_appends(cx: &mut gpui::TestAppContext) {
         use gpui::{ClipboardItem, Image, ImageFormat};
 
         let (mut cx, app) = paste_preview_fixture(cx);
@@ -1437,8 +1604,8 @@ pub(super) mod tests {
                     .paste_preview
                     .as_ref()
                     .map(|preview| preview.files.len()),
-                Some(1),
-                "a paste while the modal is open must not queue a second preview"
+                Some(2),
+                "a second paste while the tray is open appends another file"
             );
         });
     }

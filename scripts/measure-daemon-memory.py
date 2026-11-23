@@ -43,9 +43,9 @@ def wait_for_workload(process, timeout):
 
 def run(binary, scenario, mode, timeout):
     env = os.environ.copy()
-    env.pop("VELO_MEMORY_REPORT", None)
+    env.pop("WASP_MEMORY_REPORT", None)
     if mode == "memory":
-        env["VELO_MEMORY_REPORT"] = "1"
+        env["WASP_MEMORY_REPORT"] = "1"
     command = [str(binary), "--exact",
                f"session_bridge::memory_scenario::account_scale_memory_{scenario}",
                "--ignored", "--nocapture", "--test-threads=1"]
@@ -62,14 +62,14 @@ def run(binary, scenario, mode, timeout):
         raise RuntimeError(f"Workload was not executed exactly once:\n{output}")
     stages = []
     for line in output.splitlines():
-        marker = "VELO_MEMORY "
+        marker = "WASP_MEMORY "
         if marker in line:
             stages.append(json.loads(line.split(marker, 1)[1]))
     expected = ["startup", "initialized", "attach", "sync_queued", "drained",
                 "detached", "queried", "released"]
     if mode == "memory" and [s["stage"] for s in stages] != expected:
         raise RuntimeError("Missing memory checkpoints; use the instrumented test binary")
-    if mode == "timing" and (stages or "VELO_ALLOCATOR counting" in output):
+    if mode == "timing" and (stages or "WASP_ALLOCATOR counting" in output):
         raise RuntimeError("Timing requires a binary built without memory-profiling")
     return {"wall_s": elapsed, "cpu_s": usage.ru_utime + usage.ru_stime,
             "user_s": usage.ru_utime, "system_s": usage.ru_stime,

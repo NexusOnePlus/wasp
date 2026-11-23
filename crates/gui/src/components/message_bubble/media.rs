@@ -160,6 +160,13 @@ pub(super) fn render_media_content(
                             .child(image),
                     )
                 }
+            } else if media_content.cache_key.is_some() || media_content.preview_cache_key.is_some()
+            {
+                // The daemon has already written this picture. It is waiting
+                // for the viewport's cache read, not for a tap; drawing the
+                // download offer here was the "Descargar" a reader saw after
+                // switching chats and coming back.
+                el.child(render_loading_placeholder(display_w, display_h, cx))
             } else if let Some(dl) = media_content.downloadable.clone() {
                 // Eager download failed but the metadata survived: keep the
                 // image fetchable on tap, like audio/video already are.
@@ -284,6 +291,10 @@ pub(super) fn render_media_content(
                                 })
                                 .into_any_element(),
                             })
+                        } else if media_content.cache_key.is_some()
+                            || media_content.preview_cache_key.is_some()
+                        {
+                            el.child(render_loading_placeholder(display_w, display_h, cx))
                         } else if let Some(dl) = media_content.downloadable.clone() {
                             el.child(render_download_placeholder(
                                 "sticker-dl",
@@ -463,6 +474,35 @@ fn render_download_placeholder(
                 });
             })
         })
+}
+
+/// A picture the cache already has, waiting for its background read.
+///
+/// No tap and no arrow: the bytes are on disk, and a placeholder that offers
+/// to fetch them again is what made a cached chat look like it was
+/// downloading every time the reader came back to it.
+fn render_loading_placeholder(width: f32, height: f32, cx: &App) -> impl IntoElement + use<> {
+    div()
+        .w(px(width))
+        .h(px(height))
+        .bg(cx.theme().secondary)
+        .rounded(cx.product().metrics.radius_lg())
+        .flex()
+        .flex_col()
+        .justify_center()
+        .items_center()
+        .gap(cx.product().metrics.space_sm())
+        .child(
+            Icon::new(IconName::LoaderCircle)
+                .size(cx.product().metrics.icon())
+                .text_color(cx.theme().muted_foreground),
+        )
+        .child(
+            div()
+                .text_size(cx.product().metrics.text_small())
+                .text_color(cx.theme().muted_foreground)
+                .child(crate::tr!(Loading)),
+        )
 }
 
 fn render_media_placeholder(
@@ -851,6 +891,7 @@ fn render_video_player(
 
     let button_id: SharedString = format!("video-{}", message_id).into();
     let state = video_player_state.unwrap_or(VideoPlayerState::Idle);
+    let is_gif = media_content.is_gif;
     let downloadable = media_content.downloadable.clone();
     let can_download = media_content.can_download();
     let is_playing = state.is_playing();
@@ -924,127 +965,129 @@ fn render_video_player(
                     .into_any_element()
             },
         )
-        .child(
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .justify_center()
-                .items_center()
-                // The viewer's pair of tokens, not the theme's inks: this is
-                // a dark wash over a picture, so what goes on it is the ink
-                // for a scrim in *either* preset. Drawn with `foreground` it
-                // was near-black on near-black the moment the light preset
-                // existed — and the wash itself was a literal colour, which
-                // is the same mistake one layer down.
-                .bg(scrim.opacity(0.4))
-                .when(is_playing, |el| el.bg(scrim.opacity(0.)))
-                .child(if is_loading {
-                    div()
-                        .size(metrics.media_control())
-                        .rounded_full()
-                        .bg(scrim.opacity(0.55))
-                        .flex()
-                        .justify_center()
-                        .items_center()
-                        .child(div().text_color(on_scrim).text_sm().child(
-                            if state == VideoPlayerState::Downloading {
-                                "↓"
-                            } else {
-                                "⏳"
-                            },
-                        ))
-                        .into_any_element()
-                } else if is_error {
-                    // toggle_video's Error arm restarts the download; without
-                    // a handler a transient failure left the video stuck.
-                    //
-                    // A `Button`, like the play and pause it stands in for:
-                    // this is a command rather than a surface, and drawn as a
-                    // `div` there was no way to reach a failed video from the
-                    // keyboard at all.
-                    div()
-                        .size(metrics.media_control())
-                        .rounded_full()
-                        .bg(cx.theme().danger.opacity(0.65))
-                        .flex()
-                        .justify_center()
-                        .items_center()
-                        .child(
-                            Button::new(button_id)
-                                .icon(
-                                    Icon::new(IconName::Redo)
-                                        .text_color(on_scrim)
-                                        .size(metrics.icon_media()),
-                                )
-                                .ghost()
-                                .disabled(downloadable.is_none())
-                                .when(downloadable.is_some(), |button| button.cursor_pointer())
-                                .on_click({
-                                    let downloadable = downloadable.clone();
-                                    move |_, _window, cx| {
-                                        if let Some(dl) = downloadable.clone() {
-                                            let msg_id = message_id.clone();
-                                            entity.update(cx, |app, cx| {
-                                                app.toggle_video(msg_id, dl, cx);
-                                            });
+        .when(!is_gif || !is_playing, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    // The viewer's pair of tokens, not the theme's inks: this is
+                    // a dark wash over a picture, so what goes on it is the ink
+                    // for a scrim in *either* preset. Drawn with `foreground` it
+                    // was near-black on near-black the moment the light preset
+                    // existed — and the wash itself was a literal colour, which
+                    // is the same mistake one layer down.
+                    .bg(scrim.opacity(0.4))
+                    .when(is_playing, |el| el.bg(scrim.opacity(0.)))
+                    .child(if is_loading {
+                        div()
+                            .size(metrics.media_control())
+                            .rounded_full()
+                            .bg(scrim.opacity(0.55))
+                            .flex()
+                            .justify_center()
+                            .items_center()
+                            .child(div().text_color(on_scrim).text_sm().child(
+                                if state == VideoPlayerState::Downloading {
+                                    "↓"
+                                } else {
+                                    "⏳"
+                                },
+                            ))
+                            .into_any_element()
+                    } else if is_error {
+                        // toggle_video's Error arm restarts the download; without
+                        // a handler a transient failure left the video stuck.
+                        //
+                        // A `Button`, like the play and pause it stands in for:
+                        // this is a command rather than a surface, and drawn as a
+                        // `div` there was no way to reach a failed video from the
+                        // keyboard at all.
+                        div()
+                            .size(metrics.media_control())
+                            .rounded_full()
+                            .bg(cx.theme().danger.opacity(0.65))
+                            .flex()
+                            .justify_center()
+                            .items_center()
+                            .child(
+                                Button::new(button_id)
+                                    .icon(
+                                        Icon::new(IconName::Redo)
+                                            .text_color(on_scrim)
+                                            .size(metrics.icon_media()),
+                                    )
+                                    .ghost()
+                                    .disabled(downloadable.is_none())
+                                    .when(downloadable.is_some(), |button| button.cursor_pointer())
+                                    .on_click({
+                                        let downloadable = downloadable.clone();
+                                        move |_, _window, cx| {
+                                            if let Some(dl) = downloadable.clone() {
+                                                let msg_id = message_id.clone();
+                                                entity.update(cx, |app, cx| {
+                                                    app.toggle_video(msg_id, dl, is_gif, cx);
+                                                });
+                                            }
                                         }
+                                    }),
+                            )
+                            .into_any_element()
+                    } else if !is_playing {
+                        Button::new(button_id)
+                            .icon(
+                                Icon::default()
+                                    .path("icons/play.svg")
+                                    .text_color(on_scrim)
+                                    .size(metrics.icon_media_large()),
+                            )
+                            .ghost()
+                            .disabled(!can_download)
+                            .when(can_download, |button| button.cursor_pointer())
+                            .on_click({
+                                let downloadable = downloadable.clone();
+                                move |_, _window, cx| {
+                                    if let Some(dl) = downloadable.clone() {
+                                        let msg_id = message_id.clone();
+                                        entity.update(cx, |app, cx| {
+                                            app.toggle_video(msg_id, dl, is_gif, cx);
+                                        });
                                     }
-                                }),
-                        )
-                        .into_any_element()
-                } else if !is_playing {
-                    Button::new(button_id)
-                        .icon(
-                            Icon::default()
-                                .path("icons/play.svg")
-                                .text_color(on_scrim)
-                                .size(metrics.icon_media_large()),
-                        )
-                        .ghost()
-                        .disabled(!can_download)
-                        .when(can_download, |button| button.cursor_pointer())
-                        .on_click({
-                            let downloadable = downloadable.clone();
-                            move |_, _window, cx| {
-                                if let Some(dl) = downloadable.clone() {
-                                    let msg_id = message_id.clone();
-                                    entity.update(cx, |app, cx| {
-                                        app.toggle_video(msg_id, dl, cx);
-                                    });
                                 }
-                            }
-                        })
-                        .into_any_element()
-                } else {
-                    Button::new(button_id)
-                        .icon(
-                            Icon::default()
-                                .path("icons/pause.svg")
-                                // The same ink as the controls it replaces:
-                                // this one sits over a *playing* frame rather
-                                // than the wash, which is exactly when a
-                                // fixed white is a guess about someone else's
-                                // video.
-                                .text_color(on_scrim.opacity(0.6))
-                                .size(metrics.icon_media_playing()),
-                        )
-                        .ghost()
-                        .cursor_pointer()
-                        .on_click({
-                            let downloadable = downloadable.clone();
-                            move |_, _window, cx| {
-                                if let Some(dl) = downloadable.clone() {
-                                    let msg_id = message_id.clone();
-                                    entity.update(cx, |app, cx| {
-                                        app.toggle_video(msg_id, dl, cx);
-                                    });
+                            })
+                            .into_any_element()
+                    } else {
+                        Button::new(button_id)
+                            .icon(
+                                Icon::default()
+                                    .path("icons/pause.svg")
+                                    // The same ink as the controls it replaces:
+                                    // this one sits over a *playing* frame rather
+                                    // than the wash, which is exactly when a
+                                    // fixed white is a guess about someone else's
+                                    // video.
+                                    .text_color(on_scrim.opacity(0.6))
+                                    .size(metrics.icon_media_playing()),
+                            )
+                            .ghost()
+                            .cursor_pointer()
+                            .on_click({
+                                let downloadable = downloadable.clone();
+                                move |_, _window, cx| {
+                                    if let Some(dl) = downloadable.clone() {
+                                        let msg_id = message_id.clone();
+                                        entity.update(cx, |app, cx| {
+                                            app.toggle_video(msg_id, dl, is_gif, cx);
+                                        });
+                                    }
                                 }
-                            }
-                        })
-                        .into_any_element()
-                }),
-        )
+                            })
+                            .into_any_element()
+                    }),
+            )
+        })
 }
 
 #[cfg(test)]

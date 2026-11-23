@@ -13,7 +13,7 @@ repository.workspace = true
 # the same `main` becomes the module's start function, which is what trunk
 # builds from `web/index.html`.
 [[bin]]
-name = "velo"
+name = "wasp"
 path = "src/main.rs"
 
 [build-dependencies]
@@ -41,7 +41,7 @@ gpui-base = { git = "https://github.com/longbridge/gpui-kit.git", features = ["g
 gpui-component = { git = "https://github.com/longbridge/gpui-kit.git", features = ["gpui-fast"] }
 gpui-kit-assets = { git = "https://github.com/longbridge/gpui-kit.git", features = ["gpui-fast"] }
 
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
 # Ordered maps for deterministic cache eviction
 indexmap = "2.14.2"
 log = { workspace = true }
@@ -96,6 +96,10 @@ wacore-binary = { workspace = true }
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 # Timers, on a platform that has a reactor to run them on.
 smol = "2.0.2"
+# Link previews, KLIPY search and the web front end's fetch path all go
+# through one HttpClient; this is the native side of it. Chosen over a
+# runtime-backed client because a preview is one request, not a service.
+ureq = "3.5.0"
 gpui_platform = { package = "gpui-fast-platform", version = "0.1.13", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 openh264 = "0.9.9" # H.264 software decoder
 

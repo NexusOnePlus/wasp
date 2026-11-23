@@ -4,7 +4,7 @@
 //! — the same two answers `velo-gui`'s `platform::prefs` gives for
 //! `theme.json`, and for the same reasons. It is written here rather than
 //! borrowed from there because both processes read this one: the window and
-//! `velod` are two processes logging about one account, and a level set
+//! `waspd` are two processes logging about one account, and a level set
 //! in Settings that only the window remembered would leave the process
 //! holding the session — where nearly everything worth reading is written —
 //! at `info` for ever.
@@ -76,7 +76,7 @@ mod imp {
                         .map(|home| home.join(".config"))
                 })?
         };
-        Some(dir.join("velo").join("log-level"))
+        Some(dir.join("wasp").join("log-level"))
     }
 
     pub(super) fn location() -> Option<String> {

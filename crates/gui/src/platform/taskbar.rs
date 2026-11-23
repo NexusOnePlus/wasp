@@ -1,4 +1,4 @@
-//! The count on Velo's taskbar button.
+//! The count on Wasp's taskbar button.
 //!
 //! How many chats are unread, drawn as a disc in the accent colour over the
 //! button's corner — what the desktop messengers show, so a glance at the

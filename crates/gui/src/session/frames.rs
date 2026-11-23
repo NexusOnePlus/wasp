@@ -21,6 +21,7 @@ use velo_ipc::{
     StateSnapshot, StateVersion,
 };
 
+use super::Downloaded;
 use super::media::MediaCache;
 use super::sink::ReaderSink;
 use super::{Awaiting, Failure, Fault, FromDaemon, Pending, StorageUsage};
@@ -304,8 +305,13 @@ impl<'a> Frames<'a> {
                         // the daemon holds these bytes under this key, so
                         // asking again is answered from its cache without
                         // fetching anything and this side fails to read the
-                        // same entry a second time.
-                        let _ = tx.send(bytes.map_err(Failure::permanent));
+                        // same entry a second time. The key travels with the
+                        // bytes so the row can remember where they landed.
+                        let _ = tx.send(
+                            bytes
+                                .map(|bytes| Downloaded { bytes, key })
+                                .map_err(Failure::permanent),
+                        );
                     }
                     // Nothing but a download asks for one.
                     waiting => {
@@ -1871,7 +1877,7 @@ mod tests {
             "reconnecting fails the same way forever, so nothing may promise it"
         );
         assert!(
-            mismatch.body.contains("Quit Velo"),
+            mismatch.body.contains("Quit Wasp"),
             "and the thing that helps is on the screen rather than behind the fold"
         );
     }

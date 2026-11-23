@@ -169,7 +169,7 @@ use std::path::PathBuf;
 ///
 /// 20: `SetLogLevel`. How loud the daemon is is a setting rather than a
 /// launch argument: nearly everything worth reading about a session is
-/// written at `debug`, and restarting `velod` to see it ends the very
+/// written at `debug`, and restarting `waspd` to see it ends the very
 /// connection being investigated. A v19 daemon does not recognise the
 /// request, so a v20 client asking one would be silently no louder.
 ///
@@ -316,7 +316,7 @@ pub const WEB_MEDIA_PATH: &str = "/media";
 /// Only a Unix endpoint is a file with a name in a directory.
 #[cfg(unix)]
 const SOCKET_NAME: &str = "daemon.sock";
-const DIR_NAME: &str = "velo";
+const DIR_NAME: &str = "wasp";
 const MEDIA_DIR: &str = "media";
 
 /// Where the daemon listens and a client connects.
@@ -619,7 +619,7 @@ pub fn media_dir() -> Option<PathBuf> {
     Some(state_dir()?.join(media_dir_name()))
 }
 
-/// The account profile in force, from `VELO_ACCOUNT`.
+/// The account profile in force, from `WASP_ACCOUNT`.
 ///
 /// Validated, never sanitized: an invalid value falls back to the default
 /// profile rather than converging onto a real one (see
@@ -631,7 +631,7 @@ pub fn media_dir() -> Option<PathBuf> {
 /// from this, so two profiles never share state.
 #[must_use]
 pub fn account_id() -> Option<String> {
-    let raw = std::env::var_os("VELO_ACCOUNT")?;
+    let raw = std::env::var_os("WASP_ACCOUNT")?;
     velo_wire::validate_account_id(&raw.to_string_lossy())
 }
 
@@ -689,7 +689,7 @@ pub fn endpoint_path_for_account(id: &str) -> Option<PathBuf> {
         // The id the caller named, never the one in the environment: a caller
         // that says `work` must get `work`'s pipe whatever profile the shell
         // had selected. Delegating to `endpoint_path` would read
-        // `VELO_ACCOUNT`, so `accounts remove work` could resolve the pipe
+        // `WASP_ACCOUNT`, so `accounts remove work` could resolve the pipe
         // of whoever was selected instead.
         Some(account_pipe_name(&clean, &user_suffix()?))
     }
@@ -875,7 +875,7 @@ mod tests {
     /// profile is selected in the environment.
     ///
     /// The Windows branch used to fall back to `endpoint_path()`, which reads
-    /// `VELO_ACCOUNT`: `accounts remove work` could resolve the pipe of
+    /// `WASP_ACCOUNT`: `accounts remove work` could resolve the pipe of
     /// the currently selected account and wipe the wrong store.
     #[test]
     fn an_account_pipe_name_carries_the_id_it_was_given() {

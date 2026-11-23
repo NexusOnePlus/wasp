@@ -1,6 +1,6 @@
 # Receiving deliberately shared group history
 
-Investigation for [client #245](https://github.com/Ruchin-Audichya/velo/issues/245),
+Investigation for [client #245](https://github.com/NexusOnePlus/wasp/issues/245),
 2026-10-22. Static protocol analysis and synthetic SQLite tests only. No account
 was connected, and the issue author's authenticated observation was not repeated.
 

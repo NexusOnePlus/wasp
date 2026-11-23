@@ -293,7 +293,7 @@ fn watch_worker_clicks() {
         };
         let worker = window.navigator().service_worker();
         let handler = Closure::new(move |event: web_sys::MessageEvent| {
-            let epoch = js_sys::Reflect::get(&event.data(), &JsValue::from_str("veloAccountEpoch"))
+            let epoch = js_sys::Reflect::get(&event.data(), &JsValue::from_str("waspAccountEpoch"))
                 .ok()
                 .and_then(|value| value.as_string());
             if epoch.as_deref() != Some(&ACCOUNT_EPOCH.load(Ordering::Relaxed).to_string()) {
@@ -302,11 +302,11 @@ fn watch_worker_clicks() {
                 return;
             }
             let Ok(tag) =
-                js_sys::Reflect::get(&event.data(), &JsValue::from_str("veloNotificationTag"))
+                js_sys::Reflect::get(&event.data(), &JsValue::from_str("waspNotificationTag"))
             else {
                 return;
             };
-            if let Some(tag) = tag.as_string().filter(|tag| tag.starts_with("velo-chat-")) {
+            if let Some(tag) = tag.as_string().filter(|tag| tag.starts_with("wasp-chat-")) {
                 push_activation(tag);
             }
         });
@@ -324,7 +324,7 @@ fn identify_to_worker(worker: &web_sys::ServiceWorkerContainer) {
     let id = crate::platform::front_end_id().to_string();
     if js_sys::Reflect::set(
         &data,
-        &JsValue::from_str("veloClientId"),
+        &JsValue::from_str("waspClientId"),
         &JsValue::from_str(&id),
     )
     .is_ok()
@@ -370,19 +370,19 @@ fn show_from_worker(tag: &str, title: &str, body: &str) -> bool {
         let data = js_sys::Object::new();
         if js_sys::Reflect::set(
             &data,
-            &JsValue::from_str("veloTag"),
+            &JsValue::from_str("waspTag"),
             &JsValue::from_str(&tag),
         )
         .is_err()
             || js_sys::Reflect::set(
                 &data,
-                &JsValue::from_str("veloClientId"),
+                &JsValue::from_str("waspClientId"),
                 &JsValue::from_str(&crate::platform::front_end_id().to_string()),
             )
             .is_err()
             || js_sys::Reflect::set(
                 &data,
-                &JsValue::from_str("veloAccountEpoch"),
+                &JsValue::from_str("waspAccountEpoch"),
                 &JsValue::from_str(&epoch.to_string()),
             )
             .is_err()
@@ -458,13 +458,13 @@ pub(super) fn clear_notifications() {
                     let notification: Notification = item.unchecked_into();
                     let id = js_sys::Reflect::get(
                         &notification.data(),
-                        &JsValue::from_str("veloClientId"),
+                        &JsValue::from_str("waspClientId"),
                     )
                     .ok()
                     .and_then(|value| value.as_string());
                     let epoch = js_sys::Reflect::get(
                         &notification.data(),
-                        &JsValue::from_str("veloAccountEpoch"),
+                        &JsValue::from_str("waspAccountEpoch"),
                     )
                     .ok()
                     .and_then(|value| value.as_string());

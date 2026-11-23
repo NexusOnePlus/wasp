@@ -339,9 +339,15 @@ impl Render for FilesView {
 
         div().size_full().flex().flex_col().gap(metrics.space_md()).px(metrics.space_xl()).pb(metrics.space_lg())
             .bg(cx.theme().background).text_color(cx.theme().foreground)
-            // The rail is the way back, as on every other screen.
+            // The back button is the way out; there is no rail to return by.
             .child(div().h(metrics.sidebar_header_height()).flex_shrink_0().flex().items_center().justify_between()
-                .child(div().text_size(metrics.text_title()).font_weight(FontWeight::SEMIBOLD).child("Files"))
+                .child(div().flex().items_center().gap(metrics.space_sm())
+                    .child({
+                        let back = self.owner.clone();
+                        Button::new("files-back").icon(IconName::ArrowLeft).ghost().small().tooltip("Back to chats")
+                            .on_click(move |_, _, cx| { let _ = back.update(cx, |app, cx| app.close_full_screen(cx)); })
+                    })
+                    .child(div().text_size(metrics.text_title()).font_weight(FontWeight::SEMIBOLD).child("Files")))
                 .child(div().flex().gap(metrics.space_xs())
                     .child(Button::new("files-folder").icon(IconName::FolderOpen).tooltip("Open the downloads folder").ghost().small()
                         .on_click(|_, _, cx| { if let Ok(path) = files::root() { cx.open_with_system(&path); } }))

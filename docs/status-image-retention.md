@@ -35,9 +35,9 @@ Video player ownership is a separate investigation.
 Run the ignored diagnostic in separate processes on the same Linux runner:
 
 ```sh
-VELO_IMAGE_PROFILE_MODE=legacy cargo test -p velo-gui \
+WASP_IMAGE_PROFILE_MODE=legacy cargo test -p velo-gui \
   synthetic_image_lifecycle_report -- --ignored --nocapture
-VELO_IMAGE_PROFILE_MODE=owned cargo test -p velo-gui \
+WASP_IMAGE_PROFILE_MODE=owned cargo test -p velo-gui \
   synthetic_image_lifecycle_report -- --ignored --nocapture
 ```
 

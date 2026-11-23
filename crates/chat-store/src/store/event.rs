@@ -16,7 +16,7 @@ use crate::store::chat_rows::{
 };
 use crate::store::contacts::{
     clear_contact_names, clear_contact_removal_tombstones, update_address_book_chat_names,
-    upsert_contact_names,
+    upsert_contact_names, upsert_contact_username,
 };
 use crate::store::history_sync::apply_history_sync;
 use crate::store::inbound::apply_inbound;
@@ -103,20 +103,33 @@ pub(super) fn apply_event(
         Event::HistorySync(lazy) => apply_history_sync(conn, device_id, lazy, cs),
         Event::ContactUpdate(update) => {
             clear_contact_removal_tombstones(conn, device_id, &update.jid.to_string())?;
-            upsert_contact_names(
-                conn,
-                device_id,
-                &update.jid.to_string(),
-                update.action.full_name.as_deref(),
-                update.action.first_name.as_deref(),
-            )?;
-            cs.chats |= update_address_book_chat_names(
-                conn,
-                device_id,
-                &update.jid.to_string(),
-                update.action.full_name.as_deref(),
-                update.action.first_name.as_deref(),
-            )?;
+            // A sync action may carry only the handle, or only a rename. Each
+            // column list is written on its own so a handle update cannot
+            // blank the address-book name beside it.
+            if update.action.full_name.is_some() || update.action.first_name.is_some() {
+                upsert_contact_names(
+                    conn,
+                    device_id,
+                    &update.jid.to_string(),
+                    update.action.full_name.as_deref(),
+                    update.action.first_name.as_deref(),
+                )?;
+                cs.chats |= update_address_book_chat_names(
+                    conn,
+                    device_id,
+                    &update.jid.to_string(),
+                    update.action.full_name.as_deref(),
+                    update.action.first_name.as_deref(),
+                )?;
+            }
+            if let Some(username) = update
+                .action
+                .username
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+            {
+                upsert_contact_username(conn, device_id, &update.jid.to_string(), username)?;
+            }
             cs.contacts = true;
             Ok(())
         }

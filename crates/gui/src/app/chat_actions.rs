@@ -182,7 +182,7 @@ impl WhatsAppApp {
     ) {
         let Some(client) = self.client.as_ref() else {
             self.notify_user(
-                "Velo is not connected yet. Try again in a moment.",
+                "Wasp is not connected yet. Try again in a moment.",
                 notices::Tone::Problem,
                 cx,
             );
@@ -199,7 +199,7 @@ impl WhatsAppApp {
                     cx,
                 ),
                 Err(_) => app.notify_user(
-                    "Velo lost its connection before WhatsApp answered.",
+                    "Wasp lost its connection before WhatsApp answered.",
                     notices::Tone::Problem,
                     cx,
                 ),

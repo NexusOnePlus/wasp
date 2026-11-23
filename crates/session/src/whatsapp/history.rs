@@ -20,7 +20,7 @@ use whatsapp_rust::wacore_binary::jid::{Jid, observe_str};
 use velo_core::{Chat, ChatMessage, UiEvent};
 
 use super::WhatsAppClient;
-use super::convert::stored_with_unread_tail;
+use super::convert::{store_status, stored_with_unread_tail};
 use super::paging::chat_cursor;
 use super::ui_queue::Sender as UiEventSender;
 use crate::names::NameBook;
@@ -584,6 +584,7 @@ impl WhatsAppClient {
                 )
                 .await;
                 Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut msgs).await;
+                Self::hydrate_receipts(chat_store, &entry.jid, &mut msgs).await;
                 Self::hydrate_quoted_authors(client, names, &mut msgs).await;
                 // Groups *and* the status broadcast: both carry rows written
                 // by many people, and a hydrated row has no push name on it.
@@ -659,6 +660,7 @@ impl WhatsAppClient {
             .await;
             Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut chat.messages)
                 .await;
+            Self::hydrate_receipts(chat_store, &entry.jid, &mut chat.messages).await;
             Self::hydrate_quoted_authors(client, names, &mut chat.messages).await;
             if chat.is_group || chat.is_status {
                 let is_status = chat.is_status;
@@ -845,6 +847,50 @@ impl WhatsAppClient {
             // and drew a different set from the copy beside it.
             for (sender, emoji) in latest {
                 msg.add_reaction(emoji, sender);
+            }
+        }
+    }
+
+    /// Fold the durable per-person receipts back onto a page of messages.
+    ///
+    /// `MessageStatus` on a row is the aggregate tick; who read it lives in
+    /// `message_receipts`, and a reloaded page used to come back with an empty
+    /// map — so "Read by Ana" vanished the moment the window restarted, and
+    /// only came back for receipts that arrived afterwards. One read for the
+    /// page, like reactions, and best-effort for the same reason.
+    pub(super) async fn hydrate_receipts(
+        chat_store: &Arc<ChatStore>,
+        chat_jid: &Jid,
+        msgs: &mut [ChatMessage],
+    ) {
+        let ids: Vec<String> = msgs
+            .iter()
+            .filter(|msg| msg.is_from_me)
+            .map(|msg| msg.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let by_message = match chat_store.receipts_for_messages(chat_jid, &ids).await {
+            Ok(found) => found,
+            Err(e) => {
+                warn!(
+                    "failed to hydrate receipts for {}: {e}",
+                    observe_str(&chat_jid.to_string())
+                );
+                return;
+            }
+        };
+        for msg in msgs.iter_mut().filter(|msg| msg.is_from_me) {
+            let Some(entries) = by_message.get(&msg.id) else {
+                continue;
+            };
+            for entry in entries {
+                let status = store_status(entry.status);
+                msg.receipts
+                    .entry(entry.user_jid.to_string())
+                    .and_modify(|current| current.advance(status))
+                    .or_insert(status);
             }
         }
     }

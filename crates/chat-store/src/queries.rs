@@ -101,6 +101,7 @@ type ContactRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 type MediaRefRow = (Vec<u8>, String, Option<String>, Option<i64>, i64);
@@ -2039,6 +2040,59 @@ impl ChatStore {
             .collect())
     }
 
+    /// Every stored receipt for a page of one chat's messages.
+    ///
+    /// The single-message form is what the info panel asks for; history needs
+    /// the whole page at once, and one read per bubble was a pooled read per
+    /// bubble. Rows are keyed by message id on the way out so the caller can
+    /// fold them into already-converted messages.
+    pub async fn receipts_for_messages(
+        &self,
+        chat: &Jid,
+        msg_ids: &[String],
+    ) -> Result<HashMap<String, Vec<ReceiptEntry>>> {
+        use schema::message_receipts::dsl;
+        if msg_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let device_id = self.device_id();
+        let chat = chat.to_string();
+        let ids = msg_ids.to_vec();
+        let rows: Vec<(String, String, i32, i64)> = self
+            .db()
+            .read(move |conn| {
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
+                let mut rows = Vec::new();
+                for page in ids.chunks(BIND_CHUNK) {
+                    rows.extend(
+                        dsl::message_receipts
+                            .filter(
+                                dsl::device_id
+                                    .eq(device_id)
+                                    .and(dsl::chat_jid.eq_any(&keys))
+                                    .and(dsl::msg_id.eq_any(page)),
+                            )
+                            .select((dsl::msg_id, dsl::user_jid, dsl::receipt_type, dsl::ts_ms))
+                            .order(dsl::ts_ms.asc())
+                            .load::<(String, String, i32, i64)>(conn)
+                            .map_err(db_err)?,
+                    );
+                }
+                Ok(rows)
+            })
+            .await?;
+        let mut receipts: HashMap<String, Vec<ReceiptEntry>> = HashMap::new();
+        for (msg_id, user, status, ts) in rows {
+            receipts.entry(msg_id).or_default().push(ReceiptEntry {
+                user_jid: parse_jid(&user),
+                status: MessageStatus::from_raw(status),
+                timestamp: ms_to_utc(ts).unwrap_or_default(),
+            });
+        }
+        Ok(receipts)
+    }
+
     /// Every durable avatar descriptor this account has, in one read.
     ///
     /// Read whole at startup rather than per chat: a page of a hundred chats
@@ -2177,13 +2231,14 @@ impl ChatStore {
                             dsl::full_name,
                             dsl::first_name,
                             dsl::business_name,
+                            dsl::username,
                         )),
                 )
                 .get_result(conn)
                 .optional()
                 .map_err(db_err)?;
                 let labels = match &row {
-                    Some((jid, _, _, _, _)) => {
+                    Some((jid, _, _, _, _, _)) => {
                         labels_for(conn, device_id, std::slice::from_ref(jid))?.remove(jid)
                     }
                     None => None,
@@ -2192,7 +2247,7 @@ impl ChatStore {
             })
             .await?;
         Ok(row.map(
-            |((jid, push_name, full_name, first_name, business_name), labels)| {
+            |((jid, push_name, full_name, first_name, business_name, username), labels)| {
                 let (alias, tags) = labels.unwrap_or((None, Vec::new()));
                 ContactEntry {
                     jid: parse_jid(&jid),
@@ -2200,6 +2255,7 @@ impl ChatStore {
                     full_name,
                     first_name,
                     business_name,
+                    username,
                     alias,
                     tags,
                 }
@@ -2222,7 +2278,9 @@ impl ChatStore {
                         dsl::jid
                             .like(pattern.clone())
                             .or(dsl::full_name.like(pattern.clone()))
+                            .or(dsl::first_name.like(pattern.clone()))
                             .or(dsl::push_name.like(pattern.clone()))
+                            .or(dsl::username.like(pattern.clone()))
                             .or(dsl::business_name.like(pattern)),
                     );
                 }
@@ -2233,11 +2291,15 @@ impl ChatStore {
                         dsl::full_name,
                         dsl::first_name,
                         dsl::business_name,
+                        dsl::username,
                     ))
                     .limit(limit)
                     .load(conn)
                     .map_err(db_err)?;
-                let keys: Vec<String> = rows.iter().map(|(jid, _, _, _, _)| jid.clone()).collect();
+                let keys: Vec<String> = rows
+                    .iter()
+                    .map(|(jid, _, _, _, _, _)| jid.clone())
+                    .collect();
                 let labels = labels_for(conn, device_id, &keys)?;
                 Ok((rows, labels))
             })
@@ -2245,18 +2307,21 @@ impl ChatStore {
         let (rows, labels) = rows;
         Ok(rows
             .into_iter()
-            .map(|(jid, push_name, full_name, first_name, business_name)| {
-                let (alias, tags) = labels.get(&jid).cloned().unwrap_or((None, Vec::new()));
-                ContactEntry {
-                    jid: parse_jid(&jid),
-                    push_name,
-                    full_name,
-                    first_name,
-                    business_name,
-                    alias,
-                    tags,
-                }
-            })
+            .map(
+                |(jid, push_name, full_name, first_name, business_name, username)| {
+                    let (alias, tags) = labels.get(&jid).cloned().unwrap_or((None, Vec::new()));
+                    ContactEntry {
+                        jid: parse_jid(&jid),
+                        push_name,
+                        full_name,
+                        first_name,
+                        business_name,
+                        username,
+                        alias,
+                        tags,
+                    }
+                },
+            )
             .collect())
     }
 

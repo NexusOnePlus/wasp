@@ -1,6 +1,6 @@
 //! What installing and removing actually do to the machine.
 //!
-//! Everything here is per user: files under `%LOCALAPPDATA%\Programs\Velo`,
+//! Everything here is per user: files under `%LOCALAPPDATA%\Programs\Wasp`,
 //! shortcuts in the user's Start menu and desktop, and values under
 //! `HKEY_CURRENT_USER`. Nothing asks for an administrator.
 
@@ -13,21 +13,28 @@ use windows_registry::CURRENT_USER;
 use crate::payload;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-const PUBLISHER: &str = "Ruchin Audichya";
-const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Velo";
+const PUBLISHER: &str = "NexusOnePlus";
+const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Wasp";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-/// The Run value Velo's own "Start at sign-in" switch reads and writes.
-const RUN_NAME: &str = "Velo";
-/// Velo's taskbar and notification identity; the window sets the same one.
-const APP_ID: &str = "io.github.RuchinAudichya.Velo";
-const WINDOW_EXE: &str = "velo.exe";
-const DAEMON_EXE: &str = "velod.exe";
+/// The Run value Wasp's own "Start at sign-in" switch reads and writes.
+const RUN_NAME: &str = "Wasp";
+/// Wasp's taskbar and notification identity; the window sets the same one.
+const APP_ID: &str = "io.github.NexusOnePlus.Wasp";
+const WINDOW_EXE: &str = "wasp.exe";
+const DAEMON_EXE: &str = "waspd.exe";
 const UNINSTALLER: &str = "uninstall.exe";
-/// What 1.0 called the programs, before Velo used its own names. An update
+/// What 1.0 called the programs, before Wasp used its own names. An update
 /// stops and deletes them and repoints any shortcut still aimed at one; the
 /// folders and registry values they used are moved by
-/// `velo_platform::legacy_names`, which every Velo program also runs.
-const LEGACY_EXES: [&str; 3] = ["oxidezap.exe", "oxidezapd.exe", "oxidezap-cli.exe"];
+/// `velo_platform::legacy_names`, which every Wasp program also runs.
+const LEGACY_EXES: [&str; 6] = [
+    "oxidezap.exe",
+    "oxidezapd.exe",
+    "oxidezap-cli.exe",
+    "velo.exe",
+    "velod.exe",
+    "velo-cli.exe",
+];
 /// No console window flashing up for the helpers this runs.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -58,19 +65,19 @@ fn local_app_data() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Whether Velo is already installed here — the button says "Update" then.
+/// Whether Wasp is already installed here — the button says "Update" then.
 pub fn installed_version() -> Option<String> {
     let key = CURRENT_USER.open(UNINSTALL_KEY).ok()?;
     install_dir().join(WINDOW_EXE).is_file().then_some(())?;
     key.get_string("DisplayVersion").ok()
 }
 
-/// Whether this PC already holds a Velo sign-in, kept from an earlier
+/// Whether this PC already holds a Wasp sign-in, kept from an earlier
 /// install — the finish screen then says so instead of asking for a QR scan.
 pub fn has_existing_sign_in() -> bool {
     // 1.0 kept it under its old name; the update moves it before the new
     // version starts.
-    ["velo", "oxidezap"]
+    ["wasp", "velo", "oxidezap"]
         .iter()
         .any(|name| local_app_data().join(name).join("whatsapp.db").is_file())
 }
@@ -92,15 +99,23 @@ fn same_path(a: &Path, b: &Path) -> bool {
 pub fn install(options: Options, progress: &dyn Fn(Step)) -> Result<(), String> {
     let entries = payload::entries()?;
     if entries.is_empty() {
-        return Err("This copy of Velo Setup was built without Velo inside it.".into());
+        return Err("This copy of Wasp Setup was built without Wasp inside it.".into());
     }
     progress(Step::Stopping);
-    stop_velo();
+    stop_wasp();
     // With nothing of 1.0 running to hold a file open: its data folder (the
-    // sign-in and chats), downloads folder and registry values take Velo's
+    // sign-in and chats), downloads folder and registry values take Wasp's
     // names now, so the new version starts signed in. What it did is not
     // shown; a folder it could not move is moved by the program on start.
     let _ = velo_platform::legacy_names::migrate();
+
+    // The previous product's install directory and uninstall entry. The data
+    // folder is migrated above; the programs are replaced, not carried over.
+    let old_dir = local_app_data().join("Programs").join("Velo");
+    if old_dir != install_dir() {
+        let _ = std::fs::remove_dir_all(old_dir);
+    }
+    let _ = CURRENT_USER.remove_tree(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Velo");
 
     let dir = install_dir();
     std::fs::create_dir_all(&dir)
@@ -142,7 +157,7 @@ pub fn install(options: Options, progress: &dyn Fn(Step)) -> Result<(), String> 
     progress(Step::Registering);
     set_start_at_sign_in(options.start_at_sign_in, &dir.join(DAEMON_EXE))?;
     register_uninstaller(&dir, &entries)?;
-    // Before the first toast: Settings lists Velo by name and logo, and the
+    // Before the first toast: Settings lists Wasp by name and logo, and the
     // first notification is not a blank square.
     let _ = velo_platform::windows_desktop::register_identity();
     refresh_shell();
@@ -151,7 +166,7 @@ pub fn install(options: Options, progress: &dyn Fn(Step)) -> Result<(), String> 
 
 pub fn uninstall(remove_data: bool, progress: &dyn Fn(Step)) -> Result<(), String> {
     progress(Step::Stopping);
-    stop_velo();
+    stop_wasp();
     progress(Step::Removing);
     let dir = install_dir();
     remove_link_into(&start_menu_link(), &dir);
@@ -186,17 +201,17 @@ pub fn uninstall(remove_data: bool, progress: &dyn Fn(Step)) -> Result<(), Strin
     }
     if remove_data {
         // The store, the media, the sign-in: one directory, deleted whole
-        // so nothing is left orphaned behind a new device. Then Velo's own
+        // so nothing is left orphaned behind a new device. Then Wasp's own
         // preferences and its notification registration.
         // Under 1.0's name as well, for an install never started since the
         // update.
-        for name in ["velo", "oxidezap"] {
+        for name in ["wasp", "velo", "oxidezap"] {
             let _ = std::fs::remove_dir_all(local_app_data().join(name));
             if let Some(roaming) = std::env::var_os("APPDATA") {
                 let _ = std::fs::remove_dir_all(PathBuf::from(roaming).join(name));
             }
         }
-        let _ = CURRENT_USER.remove_tree(r"Software\Velo");
+        let _ = CURRENT_USER.remove_tree(r"Software\Wasp");
         let _ = CURRENT_USER.remove_tree(format!(r"Software\Classes\AppUserModelId\{APP_ID}"));
     }
     refresh_shell();
@@ -223,15 +238,15 @@ pub fn launch() {
         .spawn();
 }
 
-/// Ask a running Velo to stop, the way its own tray does, and close the
+/// Ask a running Wasp to stop, the way its own tray does, and close the
 /// window. Only if it does not answer is it ended outright: the store is
 /// SQLite in WAL mode, which survives that, but a clean stop is kinder.
-fn stop_velo() {
+fn stop_wasp() {
     use velo_wire::request::ClientRequest;
     if let Ok(mut client) = velo_ipc::IpcClient::connect() {
         let hello = ClientRequest::Hello {
             protocol: velo_wire::envelope::CURRENT_PROTOCOL_VERSION,
-            client_name: "velo-setup".into(),
+            client_name: "wasp-setup".into(),
             local_account: None,
             account_selection: false,
             read_only: false,
@@ -250,7 +265,10 @@ fn stop_velo() {
     }
     // 1.0's programs listen on a pipe of their old name, which the request
     // above cannot reach; they are ended outright, once.
-    for image in [WINDOW_EXE, DAEMON_EXE, LEGACY_EXES[0], LEGACY_EXES[1]] {
+    for image in std::iter::once(WINDOW_EXE)
+        .chain(std::iter::once(DAEMON_EXE))
+        .chain(LEGACY_EXES.iter().copied())
+    {
         let _ = std::process::Command::new("taskkill")
             .args(["/F", "/T", "/IM", image])
             .creation_flags(CREATE_NO_WINDOW)
@@ -265,7 +283,7 @@ fn set_start_at_sign_in(enabled: bool, daemon: &Path) -> Result<(), String> {
         .map_err(|e| format!("Could not open the sign-in list: {e}"))?;
     if enabled {
         key.set_string(RUN_NAME, format!("\"{}\"", daemon.display()))
-            .map_err(|e| format!("Could not start Velo at sign-in: {e}"))
+            .map_err(|e| format!("Could not start Wasp at sign-in: {e}"))
     } else {
         let _ = key.remove_value(RUN_NAME);
         Ok(())
@@ -275,14 +293,14 @@ fn set_start_at_sign_in(enabled: bool, daemon: &Path) -> Result<(), String> {
 fn register_uninstaller(dir: &Path, entries: &[payload::Entry]) -> Result<(), String> {
     let key = CURRENT_USER
         .create(UNINSTALL_KEY)
-        .map_err(|e| format!("Could not register Velo with Windows: {e}"))?;
+        .map_err(|e| format!("Could not register Wasp with Windows: {e}"))?;
     let uninstaller = dir.join(UNINSTALLER).display().to_string();
     let size_kb = entries.iter().map(|e| e.size).sum::<u64>() / 1024;
     let set = |name: &str, value: String| {
         key.set_string(name, value)
-            .map_err(|e| format!("Could not register Velo with Windows: {e}"))
+            .map_err(|e| format!("Could not register Wasp with Windows: {e}"))
     };
-    set("DisplayName", "Velo".into())?;
+    set("DisplayName", "Wasp".into())?;
     set("DisplayVersion", VERSION.into())?;
     set("Publisher", PUBLISHER.into())?;
     set(
@@ -297,7 +315,7 @@ fn register_uninstaller(dir: &Path, entries: &[payload::Entry]) -> Result<(), St
     )?;
     set(
         "URLInfoAbout",
-        "https://github.com/Ruchin-Audichya/velo".into(),
+        "https://github.com/NexusOnePlus/wasp".into(),
     )?;
     let _ = key.set_u32("EstimatedSize", u32::try_from(size_kb).unwrap_or(u32::MAX));
     let _ = key.set_u32("NoModify", 1);
@@ -307,13 +325,13 @@ fn register_uninstaller(dir: &Path, entries: &[payload::Entry]) -> Result<(), St
 
 fn start_menu_link() -> PathBuf {
     PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default())
-        .join(r"Microsoft\Windows\Start Menu\Programs\Velo.lnk")
+        .join(r"Microsoft\Windows\Start Menu\Programs\Wasp.lnk")
 }
 
 fn desktop_link() -> PathBuf {
     PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_default())
         .join("Desktop")
-        .join("Velo.lnk")
+        .join("Wasp.lnk")
 }
 
 /// A taskbar pin made from 1.0's running window is named after that program
@@ -338,7 +356,7 @@ fn repoint_pins(dir: &Path, window: &Path) {
     }
 }
 
-/// Remove a shortcut only if it is ours: a "Velo.lnk" the user made to
+/// Remove a shortcut only if it is ours: a "Wasp.lnk" the user made to
 /// something else is left alone.
 fn remove_link_into(link: &Path, dir: &Path) {
     if link.is_file() && link_target(link).is_some_and(|target| target.starts_with(dir)) {
@@ -369,7 +387,7 @@ fn link_target(link: &Path) -> Option<PathBuf> {
     }
 }
 
-/// A shortcut to `target`, carrying Velo's app ID so the taskbar groups the
+/// A shortcut to `target`, carrying Wasp's app ID so the taskbar groups the
 /// pinned icon with the running window instead of showing two.
 fn shortcut(link: &Path, target: &Path) -> Result<(), String> {
     use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
@@ -402,7 +420,7 @@ fn shortcut(link: &Path, target: &Path) -> Result<(), String> {
                 .map_err(fail)?;
         }
         link_object
-            .SetDescription(&HSTRING::from("Velo — WhatsApp for Windows"))
+            .SetDescription(&HSTRING::from("Wasp — WhatsApp for Windows"))
             .map_err(fail)?;
         link_object
             .SetIconLocation(&HSTRING::from(target.as_os_str()), 0)

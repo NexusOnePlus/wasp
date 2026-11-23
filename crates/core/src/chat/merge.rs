@@ -202,6 +202,20 @@ impl Chat {
                     new_media.preview_downloadable = old_media.preview_downloadable.clone();
                 }
             }
+            // The cache pointer is live-only state the store may not repeat.
+            // A hydrated row that forgot it made a downloaded picture show
+            // the download offer again after a chat switch, which is exactly
+            // the round trip this graft is for.
+            if let Some(new_media) = message.media.as_mut()
+                && let Some(old_media) = existing.media.as_ref()
+            {
+                if new_media.cache_key.is_none() {
+                    new_media.cache_key = old_media.cache_key.clone();
+                }
+                if new_media.preview_cache_key.is_none() {
+                    new_media.preview_cache_key = old_media.preview_cache_key.clone();
+                }
+            }
             // Live-only state the store doesn't carry must also survive the
             // replace: a delivery state the hydrated row has not caught up
             // with, and the push name on group bubbles. `advance` is what
@@ -209,6 +223,16 @@ impl Chat {
             // along wins, so a reload can neither un-fail a send nor pull a
             // read bubble back to delivered.
             message.status.advance(existing.status);
+            // Per-person receipts are live-only state too: a hydrated row
+            // carries none, and replacing the row must not turn a read-by
+            // list back into an empty one.
+            for (jid, status) in &existing.receipts {
+                message
+                    .receipts
+                    .entry(jid.clone())
+                    .and_modify(|current| current.advance(*status))
+                    .or_insert(*status);
+            }
             // An accepted edit cannot become unedited. A history read begun
             // before that commit can finish after the live edit acknowledgement;
             // its stale row must not briefly remove the label while the next

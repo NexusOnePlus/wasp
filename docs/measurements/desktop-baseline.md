@@ -18,10 +18,9 @@ machine, with nothing else heavy running, and compare labels.
 Frame time is not measured yet: there is no frame instrumentation to read it
 from. Phase 2 adds it.
 
-## Baseline, 19 Nov 2026 (Velo 1.0.0 + Phase 0)
+## Baseline, 19 Nov 2026 (Wasp 1.0.0 + Phase 0)
 
-Machine: Intel Core i5-11300H (8 threads), 16 GB RAM, Iris Xe + GeForce RTX
-3050 Laptop, Windows 11 Home build 26300.
+Machine: a mid-range Windows 11 laptop (8 threads, 16 GB RAM, integrated and discrete GPUs). The exact model is deliberately left out.
 
 | | Run 1 | Run 2 | Run 3 |
 | --- | --- | --- | --- |

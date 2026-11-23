@@ -13,9 +13,9 @@
 
 /// The publisher and product as they appear in Windows. One place, so the
 /// product's final name is a one-line change.
-const PUBLISHER: &str = "Ruchin Audichya";
-const PRODUCT_NAME: &str = "Velo";
-const COPYRIGHT: &str = "\u{a9} 2026 Ruchin Audichya";
+const PUBLISHER: &str = "NexusOnePlus";
+const PRODUCT_NAME: &str = "Wasp";
+const COPYRIGHT: &str = "\u{a9} 2026 NexusOnePlus; based on Velo by Ruchin Audichya";
 
 /// Embed the icon and version block for one executable.
 ///

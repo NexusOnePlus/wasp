@@ -80,6 +80,10 @@ pub(super) fn connect_control() -> std::io::Result<(Session, Events)> {
 /// The alternative is asserting that `Drop` was called, which is the one
 /// thing that was never in doubt.
 #[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "the legacy single-account entry point is kept beside its account-scoped replacement"
+)]
 fn connect_over(endpoint: Endpoint) -> std::io::Result<(Session, Events)> {
     connect_over_account(endpoint, velo_core::AccountId::LEGACY)
 }
@@ -265,7 +269,7 @@ const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// How long to leave a daemon we started to take its lock and bind.
 const START_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Connect, starting `velod` for as long as nothing is listening.
+/// Connect, starting `waspd` for as long as nothing is listening.
 ///
 /// The front end no longer owns a session, so there has to be one: a first run
 /// on a fresh machine would otherwise show an error where it should show a QR
@@ -390,10 +394,10 @@ fn reap(child: Option<std::process::Child>) {
 /// `None` rather than a bare name, which `PATH` would resolve — the same
 /// reason the daemon's `front_end_program` gives for the other direction: a
 /// window started from an arranged environment would start whatever that
-/// environment calls `velod`, and there is no session more sensitive
+/// environment calls `waspd`, and there is no session more sensitive
 /// than the one that holds the account.
 fn daemon_program() -> Option<std::path::PathBuf> {
-    const NAME: &str = if cfg!(windows) { "velod.exe" } else { "velod" };
+    const NAME: &str = if cfg!(windows) { "waspd.exe" } else { "waspd" };
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))

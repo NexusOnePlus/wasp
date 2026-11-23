@@ -6,8 +6,8 @@ No production dependencies, fuel limits, test deadlines or assertions change.
 
 ## Web compilation failure
 
-The [#288 web job](https://github.com/Ruchin-Audichya/velo/actions/runs/40998832174/job/123878204949)
-and [#289 web job](https://github.com/Ruchin-Audichya/velo/actions/runs/41000719222/job/123884222100)
+The [#288 web job](https://github.com/NexusOnePlus/wasp/actions/runs/40998832174/job/123878204949)
+and [#289 web job](https://github.com/NexusOnePlus/wasp/actions/runs/41000719222/job/123884222100)
 fail before launching a browser. Both report the same errors:
 
 ```text
@@ -40,7 +40,7 @@ removed or stubbed, and the daemon gains no GUI dependency.
 
 ## Native fuel test flake
 
-The [#288 Check job](https://github.com/Ruchin-Audichya/velo/actions/runs/40998832174/job/123878205132)
+The [#288 Check job](https://github.com/NexusOnePlus/wasp/actions/runs/40998832174/job/123878205132)
 passed workspace Clippy and then failed at:
 
 ```text

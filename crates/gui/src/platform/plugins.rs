@@ -1,7 +1,7 @@
 //! Where this front end's plugins live, and how one is added.
 //!
 //! A plugin belongs to the daemon that runs it, and so does the folder it
-//! comes out of: a directory beside `velod`, or a page's own origin
+//! comes out of: a directory beside `waspd`, or a page's own origin
 //! storage. That is the whole of what this file still answers — *where*, for
 //! the sentence somebody reads — because adding one is no longer this side's
 //! business at all. It is [`ClientRequest::InstallPlugin`], the module travels
@@ -144,7 +144,7 @@ fn one_module(chosen: crate::platform::picker::Chosen) -> Result<Option<Module>,
 mod imp {
     use super::Home;
 
-    /// A desktop front end reaches `velod`, whose plugins are files.
+    /// A desktop front end reaches `waspd`, whose plugins are files.
     pub(super) fn home() -> Home {
         Home::Folder
     }

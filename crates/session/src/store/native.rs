@@ -89,7 +89,7 @@ fn database_dir() -> Option<std::path::PathBuf> {
     // directory. Unset means the default profile and the historic path.
     // Validated with the one shared rule, so the database can never read a
     // profile name differently from the socket beside it.
-    let dir = match std::env::var_os("VELO_ACCOUNT")
+    let dir = match std::env::var_os("WASP_ACCOUNT")
         .and_then(|v| velo_wire::validate_account_id(&v.to_string_lossy()))
     {
         None => data_root.map(|root| root.join(DATA_DIR))?,

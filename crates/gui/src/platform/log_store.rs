@@ -6,7 +6,7 @@
 //!
 //! *Which store* — a page keeps its own answer in the origin's
 //! `localStorage`, and a desktop window does not keep one at all: the level
-//! it would write goes in the config file `velod` writes, and the daemon
+//! it would write goes in the config file `waspd` writes, and the daemon
 //! is the process that reads it first, holds the session, and is told every
 //! change. Two processes writing one file is a race with a benign outcome
 //! and no upside — the next start would be at whichever of two nearly

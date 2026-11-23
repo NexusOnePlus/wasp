@@ -141,7 +141,7 @@ const EMOJI: &str = "NotoEmoji-Regular.ttf";
 /// The family the interface is set in: the operating system's own.
 ///
 /// The way the Mac and Windows messengers do it — San Francisco on macOS,
-/// Segoe UI on Windows — so Velo's text renders, hints and scales exactly
+/// Segoe UI on Windows — so Wasp's text renders, hints and scales exactly
 /// like the rest of the desktop, and nothing is bundled. On Windows 11 the
 /// variable Segoe UI is named outright, because `.SystemUIFont` resolves to
 /// the older static Segoe UI; elsewhere the system font is asked for by its
@@ -163,6 +163,29 @@ pub fn ui_family(cx: &gpui::App) -> gpui::SharedString {
         return SEGOE_VARIABLE.into();
     }
     ".SystemUIFont".into()
+}
+
+/// The colour emoji face this platform has, when it has one.
+///
+/// An emoji is drawn by whichever face in the database answers for it, and on
+/// Windows that can be the monochrome `Segoe UI Symbol` rather than
+/// `Segoe UI Emoji` — the same flat shapes Windows 10 drew. Naming the colour
+/// face for a message that is only emoji is what keeps it from falling
+/// through to the symbol font. The generic emoji family answers on macOS and
+/// Linux, and the web's fetched `Noto Emoji` is still a fallback there.
+pub fn emoji_family(cx: &gpui::App) -> gpui::SharedString {
+    const PREFERRED: &[&str] = &[
+        "Segoe UI Emoji",
+        "Apple Color Emoji",
+        "Noto Color Emoji",
+        "Noto Emoji",
+    ];
+    let names = cx.text_system().all_font_names();
+    PREFERRED
+        .iter()
+        .find(|candidate| names.iter().any(|name| name == *candidate))
+        .map(|face| (*face).into())
+        .unwrap_or_else(|| ui_family(cx))
 }
 
 #[cfg(not(target_family = "wasm"))]

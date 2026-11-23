@@ -25,13 +25,13 @@ impl WhatsAppApp {
     /// A quote is a snapshot, so the original may not be loaded — it can be
     /// older than the window, or deleted. Saying nothing is the honest
     /// outcome there; the quote still shows what was said.
-    pub fn jump_to_message(&mut self, message_id: &str, cx: &mut Context<Self>) {
+    pub fn jump_to_message(&mut self, message_id: &str, cx: &mut Context<Self>) -> bool {
         let Some(chat) = self.selected_chat_data() else {
-            return;
+            return false;
         };
         let Some(position) = chat.messages.iter().position(|m| m.id == message_id) else {
             debug!("quoted message {message_id} is outside the loaded window");
-            return;
+            return false;
         };
         // Timeline coordinates, not message coordinates: dividers and the
         // typing row are items too, so the two indices diverge.
@@ -45,7 +45,14 @@ impl WhatsAppApp {
 
         if let Some(item_ix) = item_ix {
             self.message_list.scroll_to_reveal_item(item_ix);
+            // A jump is only useful if the reader can see where it landed.
+            // The highlight lasts until another jump or a chat change; the
+            // quote itself no longer has to be guessed at.
+            self.highlighted_message = Some(message_id.to_string());
             cx.notify();
+            true
+        } else {
+            false
         }
     }
 
@@ -154,7 +161,9 @@ impl WhatsAppApp {
         let _ = window;
 
         match again {
-            Retry::Text(content) => self.send_quoted(&content, quoted, cx),
+            Retry::Text(content) => {
+                self.send_quoted(&content, &content, Vec::new(), quoted, None, cx)
+            }
             Retry::VoiceNote(media) => {
                 self.send_voice_note(
                     cx,

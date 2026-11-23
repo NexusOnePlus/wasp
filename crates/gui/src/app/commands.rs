@@ -24,6 +24,22 @@ impl WhatsAppApp {
         cx.notify();
     }
 
+    /// Open or close the composer's emoji panel from the window-level
+    /// shortcut. The panel lives inside the composer, so the composer does
+    /// the toggling; the window only knows which composer is on screen.
+    pub fn toggle_emoji_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self.input_area.as_ref() {
+            input.update(cx, |view, cx| view.toggle_emoji(window, cx));
+        }
+    }
+
+    /// Open the GIF half of the composer's picker.
+    pub fn open_gif_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self.input_area.as_ref() {
+            input.update(cx, |view, cx| view.open_gif_picker(window, cx));
+        }
+    }
+
     /// Move focus to the conversation search field.
     pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Only where there is a list to search. Every case below reaches the
@@ -282,6 +298,22 @@ impl WhatsAppApp {
         cx.notify();
     }
 
+    /// Close the message receipt panel.
+    pub fn close_message_info(&mut self, cx: &mut Context<Self>) {
+        if self.message_info.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Leave Calls or Files and return to the destination underneath.
+    pub fn close_full_screen(&mut self, cx: &mut Context<Self>) {
+        if self.calls_open || self.files_open {
+            self.calls_open = false;
+            self.files_open = false;
+            cx.notify();
+        }
+    }
+
     /// Open Settings over the conversation view.
     pub fn open_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         // Only over a window that has one. Settings is drawn in place of the
@@ -299,6 +331,7 @@ impl WhatsAppApp {
         // Settings replaces the conversation surface. A media fetch may keep
         // running, but its autoplay intent belongs to the conversation that
         // was just hidden and must not start behind Settings.
+        self.close_command_palette(cx);
         self.cancel_hidden_media_autoplay();
         if self.showing_settings(cx) {
             return;
@@ -378,7 +411,17 @@ impl WhatsAppApp {
         {
             return;
         }
+        if self.message_info.take().is_some() {
+            cx.notify();
+            return;
+        }
+        if self.collapse_pending_file(cx) {
+            return;
+        }
         if self.cancel_paste_preview(cx) {
+            return;
+        }
+        if self.close_command_palette(cx) {
             return;
         }
         if self.close_media_viewer(cx) {

@@ -347,8 +347,15 @@ pub(super) fn media_of(msg: &wa::Message, fetched: Option<Vec<u8>>) -> Option<Me
         // A video's `data` is never the video: these are the JPEG bytes of its
         // poster frame, which is why the constructor takes it under that name
         // and settles the mime type and the preview flag itself.
-        return Some(
+        let is_gif =
+            video.gif_playback == Some(true) || video.mimetype.as_deref() == Some("image/gif");
+        let media = if is_gif {
+            MediaContent::gif(Arc::new(thumbnail), video.seconds)
+        } else {
             MediaContent::video(Arc::new(thumbnail), video.seconds)
+        };
+        return Some(
+            media
                 .with_size(video.width, video.height)
                 .with_caption(video.caption.clone())
                 .with_download(downloadable),
