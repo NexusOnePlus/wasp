@@ -22,6 +22,13 @@ const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 /// oEmbed answers are a few hundred bytes; anything larger is not one.
 const MAX_OEMBED_BYTES: usize = 64 * 1024;
+/// The largest thumbnail the message takes.
+///
+/// `jpegThumbnail` is a preview, not the picture. A phone given one much past
+/// this either refuses it or truncates it, and a card with half an image
+/// looks worse than one with a smaller, whole image. Encoding steps down in
+/// quality and size until it fits rather than sending an oversized one.
+const MAX_THUMBNAIL_BYTES: usize = 64 * 1024;
 /// The longest edge of the JPEG the card draws.
 ///
 /// A card is as wide as a bubble — a few hundred points — and the image has
@@ -66,6 +73,15 @@ pub fn fetch(cx: &App, url: String) -> Task<Result<LinkPreview, String>> {
         // derivable from the video id, so the page is not needed at all.
         if let Some(id) = youtube_id(&url) {
             return Ok(youtube_preview(&client, &url, id).await);
+        }
+        // Reddit answers a plain read with an interstitial and TikTok renders
+        // the video entirely in script, so neither page carries metadata a
+        // request can see. Both publish an oEmbed answer, which is where the
+        // title, author and thumbnail come from instead.
+        if let Some(site) = oembed_site(&url)
+            && let Some(preview) = oembed_preview(&client, &url, site).await
+        {
+            return Ok(preview);
         }
         let html = match get(&client, &url, MAX_HTML_BYTES).await {
             Ok(html) => html,
@@ -188,6 +204,89 @@ async fn youtube_preview(client: &Arc<dyn HttpClient>, url: &str, id: &str) -> L
         site_name: Some("YouTube".to_string()),
         thumbnail,
     }
+}
+
+/// A site whose page cannot be read by an ordinary request, but which
+/// publishes an oEmbed answer naming the same fields.
+#[derive(Clone, Copy)]
+enum OEmbedSite {
+    Reddit,
+    TikTok,
+}
+
+impl OEmbedSite {
+    fn endpoint(self) -> &'static str {
+        match self {
+            OEmbedSite::Reddit => "https://www.reddit.com/oembed",
+            OEmbedSite::TikTok => "https://www.tiktok.com/oembed",
+        }
+    }
+
+    fn site_name(self) -> &'static str {
+        match self {
+            OEmbedSite::Reddit => "Reddit",
+            OEmbedSite::TikTok => "TikTok",
+        }
+    }
+}
+
+/// The site an address belongs to, if it has an oEmbed endpoint worth asking.
+///
+/// Subdomains are included on purpose: `old.reddit.com` and `vm.tiktok.com`
+/// are ordinary ways people copy a link. The path is not inspected — a
+/// subreddit or a profile has no answer, and the caller then falls back to
+/// reading the page, which is the right result for those addresses.
+fn oembed_site(url: &str) -> Option<OEmbedSite> {
+    let host = normalized_host(url);
+    if host == "reddit.com" || host.ends_with(".reddit.com") || host == "redd.it" {
+        Some(OEmbedSite::Reddit)
+    } else if host == "tiktok.com" || host.ends_with(".tiktok.com") {
+        Some(OEmbedSite::TikTok)
+    } else {
+        None
+    }
+}
+
+/// A card built from the site's oEmbed answer.
+///
+/// `None` means the answer was missing or unusable, and the caller should try
+/// the page instead. The title is what makes a card worth drawing: without
+/// one there is nothing the fallback would not say as well.
+async fn oembed_preview(
+    client: &Arc<dyn HttpClient>,
+    url: &str,
+    site: OEmbedSite,
+) -> Option<LinkPreview> {
+    #[derive(serde::Deserialize)]
+    struct OEmbed {
+        title: Option<String>,
+        author_name: Option<String>,
+        thumbnail_url: Option<String>,
+    }
+    let request_url = format!(
+        "{}?format=json&url={}",
+        site.endpoint(),
+        percent_encode(url)
+    );
+    let bytes = get(client, &request_url, MAX_OEMBED_BYTES).await.ok()?;
+    let answer: OEmbed = serde_json::from_slice(&bytes).ok()?;
+    let title = answer.title.filter(|value| !value.trim().is_empty())?;
+    let mut thumbnail = Vec::new();
+    // A text post answers `self` here, and `is_public_http` is what keeps
+    // that word from becoming a request.
+    if let Some(image) = answer.thumbnail_url
+        && is_public_http(&image)
+        && let Some(bytes) = fetch_image(client, &image).await
+    {
+        thumbnail = jpeg_thumbnail(&bytes).unwrap_or_default();
+    }
+    Some(LinkPreview {
+        url: url.to_string(),
+        title: Some(title),
+        description: answer.author_name.filter(|value| !value.trim().is_empty()),
+        site_name: Some(site.site_name().to_string()),
+        thumbnail,
+    })
 }
 
 /// Try an image and the well-known smaller copies when it is missing.
@@ -483,7 +582,7 @@ async fn get(client: &Arc<dyn HttpClient>, url: &str, limit: usize) -> Result<Ve
             "User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Wasp/1.2",
         )
-        .header("Accept", "text/html,image/*,*/*;q=0.8")
+        .header("Accept", "text/html,application/json,image/*,*/*;q=0.8")
         .header("Accept-Language", "en-US,en;q=0.9")
         // Plain bytes: the page parsers read strings, and an encoded body
         // that the HTTP client does not decode is a page with no metadata.
@@ -520,13 +619,28 @@ fn jpeg_thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
         .ok()?;
     // Lanczos rather than the nearest-neighbour `thumbnail`: the card draws
     // this at several hundred points, and the cheap filter was what made a
-    // sharp page image look like a screenshot of a screenshot.
-    let small = image.resize(MAX_THUMBNAIL_EDGE, MAX_THUMBNAIL_EDGE, FilterType::Lanczos3);
-    let mut out = Vec::new();
-    JpegEncoder::new_with_quality(&mut Cursor::new(&mut out), 82)
-        .encode_image(&small)
-        .ok()?;
-    Some(out)
+    // sharp page image look like a screenshot of a screenshot. The first
+    // attempt is the size worth drawing; the rest exist only to get under the
+    // protocol's byte budget with a picture, not half of one.
+    let mut last = None;
+    for (edge, quality) in [
+        (MAX_THUMBNAIL_EDGE, 82),
+        (MAX_THUMBNAIL_EDGE, 70),
+        (480, 72),
+        (320, 70),
+        (240, 60),
+    ] {
+        let small = image.resize(edge, edge, FilterType::Lanczos3);
+        let mut out = Vec::new();
+        JpegEncoder::new_with_quality(&mut Cursor::new(&mut out), quality)
+            .encode_image(&small)
+            .ok()?;
+        if out.len() <= MAX_THUMBNAIL_BYTES {
+            return Some(out);
+        }
+        last = Some(out);
+    }
+    last
 }
 
 #[cfg(test)]
@@ -576,6 +690,71 @@ mod tests {
         assert_eq!(
             absolute("https://example.com/a", "/x.png"),
             "https://example.com/x.png"
+        );
+    }
+
+    #[test]
+    fn the_sites_with_an_oembed_answer_are_recognised() {
+        use super::{OEmbedSite, oembed_site};
+
+        for url in [
+            "https://www.reddit.com/r/rust/comments/abc/a_post/",
+            "https://old.reddit.com/r/rust/comments/abc/a_post/",
+            "https://redd.it/abc",
+        ] {
+            assert!(
+                matches!(oembed_site(url), Some(OEmbedSite::Reddit)),
+                "{url}"
+            );
+        }
+        for url in [
+            "https://www.tiktok.com/@user/video/123",
+            "https://vm.tiktok.com/ZMabc/",
+            "https://m.tiktok.com/v/123.html",
+        ] {
+            assert!(
+                matches!(oembed_site(url), Some(OEmbedSite::TikTok)),
+                "{url}"
+            );
+        }
+        // A host that merely contains the name is not the site.
+        for url in [
+            "https://reddit.com.example.org/r/rust",
+            "https://example.com/tiktok.com",
+            "https://notreddit.com/r/rust",
+        ] {
+            assert!(oembed_site(url).is_none(), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_large_thumbnail_is_encoded_under_the_protocol_budget() {
+        use image::codecs::jpeg::JpegEncoder;
+        use image::{DynamicImage, RgbImage};
+        use std::io::Cursor;
+
+        // Noise is the worst case for JPEG: no smooth area to spend few
+        // bytes on, so passing this is passing every photograph.
+        let mut picture = RgbImage::new(800, 800);
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for pixel in picture.pixels_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *pixel = image::Rgb([(state >> 8) as u8, (state >> 24) as u8, (state >> 40) as u8]);
+        }
+        let mut source = Vec::new();
+        JpegEncoder::new_with_quality(&mut Cursor::new(&mut source), 100)
+            .encode_image(&DynamicImage::ImageRgb8(picture))
+            .expect("a noise picture encodes");
+        assert!(source.len() > super::MAX_THUMBNAIL_BYTES);
+
+        let thumbnail = super::jpeg_thumbnail(&source).expect("a JPEG decodes");
+        assert_eq!(&thumbnail[..2], &[0xFF, 0xD8], "still a JPEG");
+        assert!(
+            thumbnail.len() <= super::MAX_THUMBNAIL_BYTES,
+            "{} bytes",
+            thumbnail.len()
         );
     }
 
