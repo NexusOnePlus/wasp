@@ -10,8 +10,6 @@
 
 use velo_core::OutgoingMedia;
 
-use gpui_component::input::{InputEvent, InputState};
-
 use crate::components::PreviewFile;
 
 use super::*;
@@ -178,46 +176,45 @@ impl WhatsAppApp {
         for refusal in chosen.refused {
             self.notify_user(refusal, notices::Tone::Problem, cx);
         }
-        if chosen.files.is_empty() || self.paste_preview.is_some() {
+        if chosen.files.is_empty() {
             return false;
         }
-        // The preview image is decoded only where it is drawn — a sole
-        // file. A batch near the selection ceiling would otherwise retain a
-        // second copy of every image in it until confirmation, which on a
-        // page comes out of the bounded linear memory.
-        let sole = chosen.files.len() == 1;
+        // More files for a tray that is already waiting append to it. A
+        // second chooser used to be refused as "busy", which made the Add
+        // button impossible and turned a batch into one trip per file.
+        if let Some(preview) = self.paste_preview.as_mut() {
+            if preview.jid != jid {
+                self.warn_preview_busy(cx);
+                return false;
+            }
+            preview.files.extend(
+                chosen
+                    .files
+                    .into_iter()
+                    .map(|file| PreviewFile::with_preview(file, true)),
+            );
+            cx.notify();
+            return true;
+        }
+        // Every waiting picture gets its own thumbnail: the tray is how the
+        // sender checks what is about to go out, and a row of filenames is not
+        // that check.
         let files = chosen
             .files
             .into_iter()
-            .map(|file| PreviewFile::with_preview(file, sole))
+            .map(|file| PreviewFile::with_preview(file, true))
             .collect::<Vec<_>>();
-        // Built against the retained window: the modal opens from event
-        // continuations that hold the app but no window. Where none is left
-        // — tests that never set one, a window that closed mid-read — the
-        // modal still confirms, it just sends without a caption.
-        let caption = self.modal_window.and_then(|window| {
-            window
-                .update(cx, |_, window, cx| {
-                    cx.new(|cx| InputState::new(window, cx).placeholder(crate::tr!(AddACaption)))
-                })
-                .ok()
-        });
-        if let Some(caption) = &caption {
-            cx.subscribe(caption, |app, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    app.confirm_paste_preview(cx);
-                }
-            })
-            .detach();
-        }
+        // Focus belongs to the composer while files wait: that is where the
+        // caption is typed now, and where the next thing the reader wants to
+        // write would go.
         let chat_was_visible = self.visible_chat.as_deref() == Some(jid.as_str());
         self.paste_preview = Some(PendingPastePreview {
             jid,
             reply,
             files,
-            caption,
             list_scroll: gpui::ScrollHandle::new(),
             chat_was_visible,
+            expanded: None,
         });
         cx.notify();
         true
@@ -227,10 +224,50 @@ impl WhatsAppApp {
     /// composer emits the request but does not touch clipboard paths itself:
     /// GPUI delivers entity events asynchronously, so its attempt to read
     /// immediately after emitting would race this reservation.
-    pub(super) fn paste_media(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn paste_media(&mut self, cx: &mut Context<Self>) {
         // Web's document paste listener owns file pastes; the composer's
         // action has no clipboard media to read there.
         if !crate::platform::clipboard::reads_composer_paste() {
+            return;
+        }
+        // A tray that is already open is a destination too. The second paste
+        // used to be refused as "busy" and, because focus had moved to the
+        // caption field, the text representation of the clipboard landed
+        // there instead: a file name or a stray string where another picture
+        // should have been. Read it and append instead.
+        if let Some(jid) = self
+            .paste_preview
+            .as_ref()
+            .map(|preview| preview.jid.clone())
+        {
+            if self.incoming_file_reading {
+                return;
+            }
+            self.incoming_file_reading = true;
+            let epoch = self.incoming_file_epoch;
+            let task = crate::platform::clipboard::read(cx);
+            cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+                let chosen = task.await;
+                let _ = entity.update(cx, |app, cx| {
+                    if !app.finish_incoming_file_read(epoch) {
+                        return;
+                    }
+                    if !app
+                        .paste_preview
+                        .as_ref()
+                        .is_some_and(|preview| preview.jid == jid)
+                    {
+                        return;
+                    }
+                    match chosen {
+                        Ok(chosen) => {
+                            app.open_confirmation(jid, None, chosen, cx);
+                        }
+                        Err(error) => app.notify_user(error, notices::Tone::Problem, cx),
+                    }
+                });
+            })
+            .detach();
             return;
         }
         let Some((jid, reply, epoch)) = self.prepare_incoming_files(cx) else {
@@ -333,7 +370,77 @@ impl WhatsAppApp {
         cancelled
     }
 
+    /// Open one waiting picture above the tray, without leaving the send.
+    pub(crate) fn expand_pending_file(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(preview) = self.paste_preview.as_mut()
+            && preview
+                .files
+                .get(index)
+                .is_some_and(|file| file.image.is_some())
+        {
+            preview.expanded = Some(index);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn collapse_pending_file(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(preview) = self.paste_preview.as_mut() else {
+            return false;
+        };
+        let collapsed = preview.expanded.take().is_some();
+        if collapsed {
+            cx.notify();
+        }
+        collapsed
+    }
+
+    /// Drop one waiting file. An empty tray closes itself.
+    pub(crate) fn remove_pending_file(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(preview) = self.paste_preview.as_mut() else {
+            return;
+        };
+        if index < preview.files.len() {
+            preview.files.remove(index);
+            if preview.files.is_empty() {
+                self.paste_preview = None;
+            } else if preview.expanded == Some(index) {
+                preview.expanded = None;
+            } else if let Some(expanded) = preview.expanded.as_mut()
+                && *expanded > index
+            {
+                *expanded -= 1;
+            }
+            cx.notify();
+        }
+    }
+
+    /// Add more files to a tray that is already open.
+    pub(crate) fn add_to_pending_files(&mut self, cx: &mut Context<Self>) {
+        self.attach_category(
+            crate::platform::picker::AttachmentCategory::PhotosVideos,
+            cx,
+        );
+    }
+
     pub(crate) fn confirm_paste_preview(&mut self, cx: &mut Context<Self>) {
+        // The caption lives in the main composer now: the tray used to carry
+        // a second box for the same sentence, and the reader had to choose
+        // which one the message would use.
+        let caption = self
+            .input_area
+            .as_ref()
+            .map(|input| input.read(cx).text(cx))
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        self.confirm_paste_preview_with(caption, cx);
+    }
+
+    /// Send the waiting files with `caption`, if any.
+    pub(super) fn confirm_paste_preview_with(
+        &mut self,
+        caption: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         // The keyboard path bypasses the rendered Send button's disabled
         // state: leaving `Connected` with the modal open must keep the files
         // waiting, not send through a lingering session or discard them.
@@ -343,19 +450,13 @@ impl WhatsAppApp {
         let Some(preview) = self.paste_preview.take() else {
             return;
         };
-        let caption = preview
-            .caption
-            .as_ref()
-            .map(|caption| caption.read(cx).value().to_string())
-            .map(|text| text.trim().to_string())
-            .filter(|text| !text.is_empty());
         let super::PendingPastePreview {
             jid,
             reply,
             files,
-            caption: _,
             list_scroll: _,
             chat_was_visible,
+            expanded: _,
         } = preview;
         let quoted = self.take_reply_draft(reply, cx);
         // One caption for the trip, and it goes on the first file: quoting
@@ -363,9 +464,18 @@ impl WhatsAppApp {
         // on every file of four reads as four captions to the recipient.
         let mut quoted = quoted;
         let mut caption = caption;
+        let had_caption = caption.is_some();
         let mut drawn = false;
         for file in files {
             drawn |= self.send_attachment(&jid, file.file, quoted.take(), caption.take(), cx);
+        }
+        if had_caption
+            && let Some(window) = self.account_window
+            && let Some(input) = self.input_area.clone()
+        {
+            let _ = window.update(cx, |_, window, cx| {
+                input.update(cx, |view, cx| view.clear(window, cx));
+            });
         }
         let destination_still_open = self.destination.has_conversations()
             && self.selected_chat.as_deref() == Some(jid.as_str());
@@ -475,13 +585,31 @@ fn echo_of(file: &crate::platform::picker::Picked, kind: OutgoingMedia) -> velo_
             false,
             false,
         ),
-        OutgoingMedia::Video | OutgoingMedia::Gif => {
-            MediaContent::video(Arc::new(Vec::new()), None)
+        OutgoingMedia::Video => MediaContent::video(Arc::new(Vec::new()), None),
+        OutgoingMedia::Gif => {
+            MediaContent::gif(Arc::new(gif_poster(&file.bytes).unwrap_or_default()), None)
         }
         OutgoingMedia::Document => {
             MediaContent::document(file.mime_type.clone(), Some(file.file_name.clone()))
         }
     }
+}
+
+/// The first frame of a GIF, encoded as a JPEG for the bubble and the tray.
+fn gif_poster(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        return None;
+    }
+    use image::AnimationDecoder as _;
+    let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    let frame = decoder.into_frames().next()?.ok()?;
+    let image = image::DynamicImage::ImageRgba8(frame.into_buffer());
+    let thumb = image.thumbnail(720, 720);
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut std::io::Cursor::new(&mut out), 82)
+        .encode_image(&thumb)
+        .ok()?;
+    Some(out)
 }
 
 /// A picture's dimensions, from its header alone.
@@ -554,7 +682,7 @@ mod tests {
 
     #[test]
     fn a_photo_is_still_echoed_from_its_own_bytes() {
-        for photo in ["image/jpeg", "image/png", "image/gif", "image/webp"] {
+        for photo in ["image/jpeg", "image/png", "image/webp"] {
             let file = picked("praia", photo);
             let kind = kind_for(&file.mime_type);
             assert_eq!(kind, OutgoingMedia::Image, "{photo}");
@@ -563,6 +691,18 @@ mod tests {
             assert_eq!(echo.media_type, MediaType::Image, "{photo}");
             assert_eq!(echo.data.len(), file.bytes.len(), "{photo}");
         }
+    }
+
+    #[test]
+    fn a_gif_is_an_animation_not_a_still_photo() {
+        let file = picked("praia", "image/gif");
+        let kind = kind_for(&file.mime_type);
+        assert_eq!(kind, OutgoingMedia::Gif);
+        // The send path turns the frames into an MP4; the echo is a video
+        // bubble with no still of its own.
+        let echo = echo_of(&file, kind);
+        assert_eq!(echo.media_type, MediaType::Video);
+        assert!(echo.data.is_empty());
     }
 
     #[test]

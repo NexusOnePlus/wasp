@@ -3,14 +3,14 @@
 Windows decides whether to trust an `.exe` by its **Authenticode signature**,
 not by the publisher name written into the file. This page explains what that
 means for this project and what is needed to ship a build that Windows shows
-as coming from **Ruchin Audichya** instead of "Unknown publisher".
+as coming from **NexusOnePlus** instead of "Unknown publisher".
 
 ## What is already done
 
 - **Version metadata.** Every build embeds a version block
-  (`packaging/windows/version_resource.rs`): Company *Ruchin Audichya*,
-  description *Velo* (the service: *Velo background service*), copyright
-  *© 2026 Ruchin Audichya*, and the version from `Cargo.toml`. It shows in the
+  (`packaging/windows/version_resource.rs`): Company *NexusOnePlus*,
+  description *Wasp* (the service: *Wasp background service*), copyright
+  *© 2026 NexusOnePlus*, and the version from `Cargo.toml`. It shows in the
   file's Properties → Details and in Task Manager. **It is not a signature**:
   any file can claim any company name, so Windows never uses this field to
   decide trust, and the UAC/SmartScreen prompts keep saying "Unknown
@@ -44,15 +44,15 @@ EV certificates too.
 ## What you need to provide
 
 A **code-signing certificate issued to you** (individual validation, in the
-name *Ruchin Audichya*) by a public certificate authority. Options that exist
+name *NexusOnePlus*) by a public certificate authority. Options that exist
 today — check current eligibility and prices with each provider:
 
 | Route | Publisher shown | Notes |
 | --- | --- | --- |
-| **Individual OV code-signing certificate** from a public CA (e.g. Sectigo, DigiCert, SSL.com, Certum) | Ruchin Audichya | Identity check with government ID. Since June 2023 the key must live on a hardware token or the CA's cloud HSM, so you usually receive a USB token or a cloud-signing account rather than a `.pfx` file. Certum offers a lower-cost certificate aimed at open-source developers. |
+| **Individual OV code-signing certificate** from a public CA (e.g. Sectigo, DigiCert, SSL.com, Certum) | NexusOnePlus | Identity check with government ID. Since June 2023 the key must live on a hardware token or the CA's cloud HSM, so you usually receive a USB token or a cloud-signing account rather than a `.pfx` file. Certum offers a lower-cost certificate aimed at open-source developers. |
 | **Microsoft Artifact Signing** (formerly Trusted Signing) | Your validated identity | Cheapest and integrates with GitHub Actions, but **public-trust certificates for individuals are only available to developers located in the US or Canada** (organizations in more countries). Not open to an individual in India at the time of writing. |
 | **SignPath Foundation** (free for OSS) | SignPath Foundation | Free signing for qualifying open-source projects, but the publisher shown is the foundation, not you, and the source must be public and built on CI. |
-| **Microsoft Store (MSIX)** | Microsoft re-signs | Free for individuals, but Store policy 10.1.6 requires permission under the connected service's terms, and WhatsApp's terms do not allow third-party clients. Not a realistic route for Velo. |
+| **Microsoft Store (MSIX)** | Microsoft re-signs | Free for individuals, but Store policy 10.1.6 requires permission under the connected service's terms, and WhatsApp's terms do not allow third-party clients. Not a realistic route for Wasp. |
 
 **Recommended for an individual in India:** a standard individual code-signing
 certificate from Certum, using its SimplySign cloud signing so no hardware
@@ -94,14 +94,14 @@ Then sign and verify the release:
 
 ```powershell
 ./packaging/windows/sign.ps1 -Thumbprint <THUMBPRINT> -Files `
-  target\release\velo.exe, target\release\velod.exe, target\release\velo-cli.exe
+  target\release\wasp.exe, target\release\waspd.exe, target\release\wasp-cli.exe
 ```
 
 Check the result yourself:
 
 ```powershell
-& "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" verify /pa /v target\release\velo.exe
-Get-AuthenticodeSignature target\release\velo.exe | Format-List Status, SignerCertificate
+& "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" verify /pa /v target\release\wasp.exe
+Get-AuthenticodeSignature target\release\wasp.exe | Format-List Status, SignerCertificate
 ```
 
 ## Signing in GitHub Actions
@@ -128,7 +128,7 @@ project's homepage.
 ## After signing
 
 1. `signtool verify /pa` passes on all three binaries (the script checks).
-2. Properties → Digital Signatures shows *Ruchin Audichya*.
+2. Properties → Digital Signatures shows *NexusOnePlus*.
 3. On a machine with Smart App Control on, the signed build starts.
 4. SmartScreen may still warn on first downloads until reputation builds;
    that is expected and not something a build setting can change.

@@ -15,7 +15,7 @@ fn directory_from(
         xdg.and_then(nonempty)
             .or_else(|| home.and_then(nonempty).map(|p| p.join(".config")))
     }?;
-    Some(base.join("velo"))
+    Some(base.join("wasp"))
 }
 fn directory() -> Result<PathBuf, String> {
     directory_from(
@@ -156,15 +156,15 @@ mod tests {
                 Some("/persistent/config".into()),
                 Some("/home/test".into())
             ),
-            Some(PathBuf::from("/persistent/config/velo"))
+            Some(PathBuf::from("/persistent/config/wasp"))
         );
         assert_eq!(
             directory_from(false, None, None, Some("/home/test".into())),
-            Some(PathBuf::from("/home/test/.config/velo"))
+            Some(PathBuf::from("/home/test/.config/wasp"))
         );
         assert_eq!(
             directory_from(true, Some("C:/Users/test/AppData/Local".into()), None, None),
-            Some(PathBuf::from("C:/Users/test/AppData/Local/velo"))
+            Some(PathBuf::from("C:/Users/test/AppData/Local/wasp"))
         );
     }
     #[test]

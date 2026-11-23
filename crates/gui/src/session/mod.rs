@@ -295,6 +295,18 @@ impl From<&velo_ipc::ProtocolError> for Failure {
     }
 }
 
+/// A download's answer: the bytes, and the key the daemon cached them under.
+///
+/// The key is not bookkeeping. A dialog that fetched a picture into memory
+/// used to keep no pointer to the disk entry the daemon had just written, so
+/// the next chat switch released the bytes and the bubble offered a download
+/// for something already on disk. Carrying the key back is what lets the row
+/// remain a cached row.
+pub struct Downloaded {
+    pub bytes: std::sync::Arc<Vec<u8>>,
+    pub key: String,
+}
+
 /// What to do when a request comes back, by the id it was sent under.
 ///
 /// The daemon answers everything under the id it was asked with, so this is
@@ -305,7 +317,7 @@ enum Awaiting {
     Account(oneshot::Sender<Result<velo_core::AccountId, String>>),
     /// A message mutation whose result must reach the action that opened it.
     Mutation(oneshot::Sender<Result<(), Failure>>),
-    Download(oneshot::Sender<Result<std::sync::Arc<Vec<u8>>, Failure>>),
+    Download(oneshot::Sender<Result<Downloaded, Failure>>),
     /// What this account occupies on disk, for the Storage pane.
     Storage(oneshot::Sender<StorageUsage>),
     CallHistory(oneshot::Sender<Result<Vec<velo_core::CallHistoryEntry>, String>>),
@@ -784,7 +796,7 @@ struct Conn {
     events: UiSink,
 }
 
-/// A connection to `velod`, and the one value that ends it.
+/// A connection to `waspd`, and the one value that ends it.
 ///
 /// The requests all live on [`SessionHandle`], which this derefs to, so a
 /// caller that only sends can be handed a handle and never learn that the
@@ -1130,6 +1142,8 @@ impl SessionHandle {
         text: &str,
         local_id: String,
         quoted: Option<QuotedMessage>,
+        preview: Option<velo_core::LinkPreview>,
+        mentions: Vec<String>,
     ) {
         self.ask(
             ClientRequest::SendText(Box::new(SendText {
@@ -1137,6 +1151,8 @@ impl SessionHandle {
                 text: text.to_string(),
                 local_id: Some(local_id.clone()),
                 quoted,
+                preview,
+                mentions,
             })),
             Awaiting::Send {
                 chat_jid: jid.to_string(),
@@ -1944,7 +1960,7 @@ impl SessionHandle {
     pub fn download_downloadable_media(
         &self,
         media: DownloadableMedia,
-    ) -> oneshot::Receiver<Result<std::sync::Arc<Vec<u8>>, Failure>> {
+    ) -> oneshot::Receiver<Result<Downloaded, Failure>> {
         let (tx, rx) = oneshot::channel();
         self.ask(
             ClientRequest::Download(Download {

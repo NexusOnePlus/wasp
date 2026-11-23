@@ -1,4 +1,4 @@
-//! The wire protocol between `velod` and its front ends.
+//! The wire protocol between `waspd` and its front ends.
 //!
 //! Types only: no sockets, no runtime. Both sides depend on this crate so a
 //! protocol change breaks compilation rather than a running client.

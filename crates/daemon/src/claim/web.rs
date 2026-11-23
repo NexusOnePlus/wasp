@@ -32,7 +32,7 @@ use wasm_bindgen_futures::JsFuture;
 ///
 /// One per origin, which is one per account: everything this protects — the
 /// database, the media, the Signal state — is origin-scoped too.
-const LOCK: &str = "velo-session";
+const LOCK: &str = "wasp-session";
 
 thread_local! {
     /// The lock this tab was handed after waiting for it.

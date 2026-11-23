@@ -437,6 +437,7 @@ async fn a_server_ack_publishes_a_live_sent_receipt() {
             chat_jid: TEST_PEER.to_string(),
             message_ids: vec!["ACKED-1".to_string()],
             receipt_type: velo_core::ReceiptType::Sent,
+            sender: None,
         })
     );
 }
@@ -2053,6 +2054,8 @@ fn alias_history_unread_deduplicates_only_matching_messages() {
         system: None,
         poll: None,
         business: None,
+        link_preview: None,
+        receipts: std::collections::HashMap::new(),
     };
     let mut chat = Chat::new("111222333444555@lid".to_string());
     chat.messages = vec![message("MSG-A"), message("MSG-B")];
@@ -2098,6 +2101,8 @@ fn watched_updates_come_back_watched() {
         system: None,
         poll: None,
         business: None,
+        link_preview: None,
+        receipts: std::collections::HashMap::new(),
     };
     let mut broadcast = Chat::new(velo_core::STATUS_BROADCAST_JID.to_string());
     broadcast.messages = vec![
@@ -2829,7 +2834,14 @@ async fn a_send_before_the_session_is_up_still_fails_its_bubble() {
     let mut events = client.take_events().expect("the event stream");
 
     client
-        .send_message(TEST_PEER, "oi", "local-1".to_string(), None)
+        .send_message(
+            TEST_PEER,
+            "oi",
+            "local-1".to_string(),
+            None,
+            None,
+            Vec::new(),
+        )
         .await
         .expect("the send task runs");
 

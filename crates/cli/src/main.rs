@@ -1,4 +1,4 @@
-//! Velo CLI: A lightweight, scriptable command-line interface for WhatsApp.
+//! Wasp CLI: A lightweight, scriptable command-line interface for WhatsApp.
 //!
 //! One contract for every command: a result crosses [`output`], a failure
 //! exits nonzero, and `--json` never carries a human sentence. The daemon
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use args::{Commands, VeloCli};
+use args::{Commands, WaspCli};
 use output::{OutputMode, print_action, print_error, print_event, print_result};
 use velo_ipc::IpcClient;
 use velo_wire::envelope::CURRENT_PROTOCOL_VERSION;
@@ -34,7 +34,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(10);
 const START_ATTEMPT: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
-    let cli = VeloCli::parse();
+    let cli = WaspCli::parse();
 
     let output_mode = if cli.json {
         OutputMode::Json
@@ -47,7 +47,7 @@ fn main() -> ExitCode {
     let command = match cli.command {
         Some(cmd) => cmd,
         None => {
-            eprintln!("No command specified. Run `velo-cli --help` for available commands.");
+            eprintln!("No command specified. Run `wasp-cli --help` for available commands.");
             return ExitCode::from(1);
         }
     };
@@ -69,14 +69,14 @@ fn main() -> ExitCode {
                 "zsh" => usage_rs::complete::Shell::Zsh,
                 _ => usage_rs::complete::Shell::Fish,
             };
-            print!("{}", VeloCli::completion_script(shell));
+            print!("{}", WaspCli::completion_script(shell));
             return ExitCode::SUCCESS;
         }
         Commands::Mcp(_mcp) => {
             if !machine_output_allowed(output_mode, "mcp", "a usage spec") {
                 return ExitCode::from(1);
             }
-            print!("{}", VeloCli::to_kdl());
+            print!("{}", WaspCli::to_kdl());
             return ExitCode::SUCCESS;
         }
         Commands::Accounts(ref accounts)
@@ -87,8 +87,8 @@ fn main() -> ExitCode {
             }
             if let Some(args::AccountsSubcommand::Use(u)) = &accounts.command {
                 match resolve_account_arg(&u.id, output_mode) {
-                    Ok(Some(id)) => println!("export VELO_ACCOUNT={id}"),
-                    Ok(None) => println!("unset VELO_ACCOUNT"),
+                    Ok(Some(id)) => println!("export WASP_ACCOUNT={id}"),
+                    Ok(None) => println!("unset WASP_ACCOUNT"),
                     Err(code) => return code,
                 }
             }
@@ -125,17 +125,17 @@ fn main() -> ExitCode {
         // Single-threaded startup, before any thread exists: no thread can
         // observe the environment changing under it.
         unsafe {
-            std::env::set_var("VELO_ACCOUNT", id);
+            std::env::set_var("WASP_ACCOUNT", id);
         }
     }
-    if let Some(raw) = std::env::var_os("VELO_ACCOUNT")
+    if let Some(raw) = std::env::var_os("WASP_ACCOUNT")
         && velo_wire::validate_account_id(&raw.to_string_lossy()).is_none()
     {
         print_error(
             output_mode,
             "invalid_account_id",
             &format!(
-                "VELO_ACCOUNT must match [A-Za-z0-9][A-Za-z0-9_-]*, got {:?}",
+                "WASP_ACCOUNT must match [A-Za-z0-9][A-Za-z0-9_-]*, got {:?}",
                 raw.to_string_lossy()
             ),
         );
@@ -226,7 +226,7 @@ fn main() -> ExitCode {
                 print_error(
                     output_mode,
                     "daemon_not_running",
-                    &format!("could not reach or start velod: {e}"),
+                    &format!("could not reach or start waspd: {e}"),
                 );
                 return ExitCode::from(2);
             }
@@ -244,7 +244,7 @@ fn main() -> ExitCode {
     // Perform handshake
     let handshake_req = ClientRequest::Hello {
         protocol: CURRENT_PROTOCOL_VERSION,
-        client_name: "velo-cli".into(),
+        client_name: "wasp-cli".into(),
         local_account,
         account_selection: true,
         read_only: cli.read_only,
@@ -388,7 +388,7 @@ fn connect_or_start() -> std::io::Result<IpcClient> {
 /// Where to find the daemon, beside this binary and nowhere else: the two ship
 /// together and a release directory is not on anybody's `PATH`.
 fn daemon_program() -> Option<PathBuf> {
-    const NAME: &str = if cfg!(windows) { "velod.exe" } else { "velod" };
+    const NAME: &str = if cfg!(windows) { "waspd.exe" } else { "waspd" };
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))
@@ -407,7 +407,7 @@ fn spawn_daemon(program: &Path) -> std::io::Result<std::process::Child> {
         use std::os::windows::process::CommandExt as _;
         command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
-    if let Ok(account) = std::env::var("VELO_ACCOUNT")
+    if let Ok(account) = std::env::var("WASP_ACCOUNT")
         && !account.is_empty()
     {
         command.arg("--account").arg(account);
@@ -449,7 +449,7 @@ fn account_add(id: &str, output_mode: OutputMode) -> Result<(), velo_wire::ApiEr
         return Ok(());
     }
     unsafe {
-        std::env::set_var("VELO_ACCOUNT", &clean);
+        std::env::set_var("WASP_ACCOUNT", &clean);
     }
     let Some(program) = daemon_program() else {
         return Err(velo_wire::ApiError::not_connected(
@@ -521,7 +521,7 @@ fn account_remove(id: &str, output_mode: OutputMode) -> Result<(), velo_wire::Ap
     }
     // The media cache is per-profile and lives beside the socket.
     unsafe {
-        std::env::set_var("VELO_ACCOUNT", &clean);
+        std::env::set_var("WASP_ACCOUNT", &clean);
     }
     if let Some(media) = velo_ipc::media_dir()
         && let Err(e) = std::fs::remove_dir_all(&media)

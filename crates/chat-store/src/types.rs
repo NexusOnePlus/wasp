@@ -481,6 +481,10 @@ pub struct ContactEntry {
     pub full_name: Option<String>,
     pub first_name: Option<String>,
     pub business_name: Option<String>,
+    /// The handle WhatsApp assigned them, without the `@`. It is what a
+    /// stranger has instead of a push name, and the only address a reader
+    /// can quote when no phone number is known.
+    pub username: Option<String>,
     /// Device-local alias; never synced.
     pub alias: Option<String>,
     /// Device-local tags; never synced.
@@ -496,6 +500,39 @@ impl ContactEntry {
             .or(self.first_name.as_deref())
             .or(self.push_name.as_deref())
             .or(self.business_name.as_deref())
+    }
+
+    /// [`display_name`](Self::display_name), with a handle drawn as one.
+    ///
+    /// A username is shown with the `@` the person would be searched by, and
+    /// only when nothing they chose for themselves is known. It sits after
+    /// the push name because somebody who set a profile name expects to be
+    /// called that, not by their handle.
+    pub fn display_label(&self) -> Option<std::borrow::Cow<'_, str>> {
+        if let Some(name) = self
+            .full_name
+            .as_deref()
+            .or(self.first_name.as_deref())
+            .or(self.push_name.as_deref())
+            .filter(|name| !name.trim().is_empty())
+        {
+            return Some(std::borrow::Cow::Borrowed(name));
+        }
+        if let Some(username) = self
+            .username
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            return Some(std::borrow::Cow::Owned(format!(
+                "@{}",
+                username.trim_start_matches('@')
+            )));
+        }
+        self.business_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .map(std::borrow::Cow::Borrowed)
     }
 }
 
@@ -654,3 +691,45 @@ pub enum StoreChange {
 /// Per-channel monotonic mute revision captured before a metadata request.
 /// Missing rows have revision zero, until their first observed mute decision.
 pub type ChannelMuteSnapshot = std::collections::BTreeMap<String, i64>;
+
+#[cfg(test)]
+mod contact_label_tests {
+    use super::ContactEntry;
+
+    fn entry(username: Option<&str>) -> ContactEntry {
+        ContactEntry {
+            jid: "5511990000001@s.whatsapp.net".parse().expect("synthetic"),
+            push_name: None,
+            full_name: None,
+            first_name: None,
+            business_name: None,
+            username: username.map(str::to_string),
+            alias: None,
+            tags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_handle_is_drawn_with_one_at_sign() {
+        assert_eq!(entry(Some("ana")).display_label().as_deref(), Some("@ana"));
+        assert_eq!(entry(Some("@ana")).display_label().as_deref(), Some("@ana"));
+        assert_eq!(
+            entry(Some("  ")).display_label(),
+            None,
+            "a blank handle is not a name"
+        );
+    }
+
+    #[test]
+    fn a_saved_name_still_beats_the_handle() {
+        let mut named = entry(Some("ana"));
+        named.full_name = Some("Ana Souza".to_string());
+        assert_eq!(named.display_label().as_deref(), Some("Ana Souza"));
+        named.push_name = Some("Ana S.".to_string());
+        assert_eq!(
+            named.display_label().as_deref(),
+            Some("Ana Souza"),
+            "the address book wins over the name they chose"
+        );
+    }
+}

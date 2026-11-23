@@ -60,6 +60,7 @@ pub(super) fn stored_to_chat_message(stored: velo_chat_store::StoredMessage) -> 
     let business = base_message.and_then(velo_chat_store::business_content);
     let contacts = base_message.and_then(velo_chat_store::shared_contacts_text);
     let pack = base_message.and_then(velo_chat_store::sticker_pack_text);
+    let link_preview = base_message.and_then(link_preview_of);
     let content = match (&stored.text, stored.revoked) {
         (_, true) => "[Message deleted]".to_string(),
         (_, _) if business.is_some() => business
@@ -130,7 +131,42 @@ pub(super) fn stored_to_chat_message(stored: velo_chat_store::StoredMessage) -> 
         system,
         poll,
         business,
+        link_preview,
+        receipts: std::collections::HashMap::new(),
     }
+}
+
+/// The link card carried by an `extended_text_message`, if it has one.
+///
+/// The sender's client already did the fetching; all this side has to do is
+/// keep the four fields it sends. A card without a URL is not a card, and a
+/// thumbnail is capped for the same reason inline media is: it travels in a
+/// frame, and a sender who pastes a huge JPEG should not decide how large the
+/// next one is.
+pub(super) fn link_preview_of(message: &wa::Message) -> Option<velo_core::LinkPreview> {
+    let extended = message.extended_text_message.as_option()?;
+    let url = extended.matched_text.clone()?.trim().to_string();
+    if url.is_empty() {
+        return None;
+    }
+    let text = |value: &Option<String>| {
+        value
+            .as_ref()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+    };
+    let thumbnail = extended.jpeg_thumbnail.clone().unwrap_or_default();
+    Some(velo_core::LinkPreview {
+        url,
+        title: text(&extended.title),
+        description: text(&extended.description),
+        site_name: None,
+        thumbnail: if thumbnail.len() <= 256 * 1024 {
+            thumbnail
+        } else {
+            Vec::new()
+        },
+    })
 }
 
 /// A stored poll creation as the bubble's votable content.
@@ -174,7 +210,7 @@ pub(super) fn poll_creation_of(message: &wa::Message) -> Option<&wa::message::Po
 }
 
 /// Map the store's durable delivery state onto the one the UI draws.
-fn store_status(status: velo_chat_store::MessageStatus) -> MessageStatus {
+pub(super) fn store_status(status: velo_chat_store::MessageStatus) -> MessageStatus {
     use velo_chat_store::MessageStatus as Stored;
     match status {
         // Error is terminal for from_me rows (a nack or a local send failure),
@@ -298,6 +334,33 @@ mod tests {
         let revoked = stored_to_chat_message(row);
         assert_eq!(revoked.content, "[Message deleted]");
         assert!(revoked.quoted.is_none());
+    }
+
+    #[test]
+    fn a_link_card_keeps_the_url_title_description_and_thumbnail() {
+        let mut extended = wa::message::ExtendedTextMessage::default();
+        extended.text = Some("look https://example.com".into());
+        extended.matched_text = Some("https://example.com".into());
+        extended.title = Some("Example".into());
+        extended.description = Some("A page".into());
+        extended.jpeg_thumbnail = Some(vec![0xFF, 0xD8, 0xFF]);
+        let mut message = wa::Message::default();
+        message.extended_text_message = MessageField::some(extended);
+
+        let preview = link_preview_of(&message).expect("a card");
+        assert_eq!(preview.url, "https://example.com");
+        assert_eq!(preview.title.as_deref(), Some("Example"));
+        assert_eq!(preview.description.as_deref(), Some("A page"));
+        assert_eq!(preview.thumbnail, vec![0xFF, 0xD8, 0xFF]);
+    }
+
+    #[test]
+    fn text_without_a_matched_url_draws_no_card() {
+        let mut extended = wa::message::ExtendedTextMessage::default();
+        extended.text = Some("there is no link here".into());
+        let mut message = wa::Message::default();
+        message.extended_text_message = MessageField::some(extended);
+        assert!(link_preview_of(&message).is_none());
     }
 
     #[test]

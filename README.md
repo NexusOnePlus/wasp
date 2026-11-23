@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/velo-logo-256.png" width="112" alt="Velo logo: a white speech bubble with a V, on a green tile">
+  <img src="assets/wasp-logo-256.png" width="112" alt="Wasp logo: folded black and white panels on a lime tile">
 </p>
 
-<h1 align="center">Velo</h1>
+<h1 align="center">Wasp</h1>
 
 <p align="center">
   <b>WhatsApp, at home on Windows.</b><br>
@@ -10,9 +10,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Ruchin-Audichya/velo/releases/latest/download/Velo-Setup-1.2.0-x64.exe"><b>⬇ Download Velo 1.2 for Windows</b></a>
+  <a href="https://github.com/NexusOnePlus/wasp/releases/latest/download/Wasp-Setup-1.2.0-x64.exe"><b>⬇ Download Wasp 1.2 for Windows</b></a>
   &nbsp;·&nbsp; Windows 10 &amp; 11, 64-bit &nbsp;·&nbsp; free
-  <br><sub><a href="https://github.com/Ruchin-Audichya/velo/releases/latest">All downloads, portable zip and checksums</a></sub>
+  <br><sub><a href="https://github.com/NexusOnePlus/wasp/releases/latest">All downloads, portable zip and checksums</a></sub>
 </p>
 
 ---
@@ -27,17 +27,19 @@ Let's be honest about WhatsApp on a PC.
 
 Meanwhile your PC has a perfectly good processor that would love to draw some chat bubbles, quickly, if anybody asked.
 
-## Why Velo exists
+## Why Wasp exists
 
 Someone asked.
 
-Velo is a **real Windows app**: written in Rust, drawn on your GPU, no embedded browser anywhere. It links to your phone the same way WhatsApp Web does, by scanning a QR code, and then it just… works. Quickly. Quietly. In about **118 MB for the window plus ~18 MB for the background service** on the machine it was built on, against roughly 1 GB for the official app. (Your mileage may vary. Your RAM will thank you either way.)
+Wasp is a **real Windows app**: written in Rust, drawn on your GPU, no embedded browser anywhere. It links to your phone the same way WhatsApp Web does, by scanning a QR code, and then it just… works. Quickly. Quietly. In about **118 MB for the window plus ~18 MB for the background service** on the machine it was built on, against roughly 1 GB for the official app. (Your mileage may vary. Your RAM will thank you either way.)
+
+Wasp is a fork of [Velo](https://github.com/Ruchin-Audichya/velo), which is itself built on [oxidezap/client](https://github.com/oxidezap/client). The MIT licence and the original authors' credits travel with it; see [`LICENSE`](LICENSE).
 
 It also keeps running in the tray when you close the window, so messages and calls still reach you. Like a messenger is supposed to.
 
-## Velo vs the official app
+## Wasp vs the official app
 
-| | Official WhatsApp app | **Velo** |
+| | Official WhatsApp app | **Wasp** |
 |-|-|-|
 | What it is | WhatsApp Web inside a browser engine (WebView2) | A native app: Rust, drawn on your GPU |
 | Memory, idle | ~1,053 MB across 8 processes | **~136 MB across 2 processes** |
@@ -46,7 +48,7 @@ It also keeps running in the tray when you close the window, so messages and cal
 
 **What you get on top:** an unread count on the taskbar, notifications that arrive with the window closed, a preview of photos and videos before you download them, search across every chat plus a search for any file by name, one-click HD camera presets, and 16 wallpapers, 8 themes and your own accent colour.
 
-<sub>Memory is private bytes from Task Manager, measured on the same laptop with the same account and both apps idle on the chat list (Intel i5-11300H, Windows 11). Your numbers will vary.</sub>
+<sub>Memory is private bytes from Task Manager, measured on the same mid-range Windows 11 laptop with the same account and both apps idle on the chat list. Your numbers will vary.</sub>
 
 ## New in 1.2
 
@@ -59,13 +61,13 @@ It also keeps running in the tray when you close the window, so messages and cal
 ## New in 1.1
 
 - **An unread count on the taskbar icon**, so a glance at the taskbar tells you if anything's new
-- **The Velo logo on every notification**, instead of a blank square
+- **The Wasp logo on every notification**, instead of a blank square
 - **A new ringtone**: a bright marimba (Classic) or a soft kalimba (Gentle), loud enough to hear across the room, with no clicks
 - **HD video calls in one click**: pick *Data saver*, *Standard* or *HD* instead of scrolling a list of 40 camera modes. Webcams like the Logitech C920 and C922 get 720p.
 - **Find any file you've ever been sent**: a fast search across file names in every chat, even ones you haven't opened
-- **Start a chat from your contacts**, or add a new contact right from Velo
+- **Start a chat from your contacts**, or add a new contact right from Wasp
 - A redesigned Calls and Files screen, photos on Status, and a "jump to latest" button in long chats
-- Velo now uses its own name everywhere on your PC. Updating from 1.0 moves your chats across automatically, and you stay signed in.
+- Wasp now uses its own name everywhere on your PC. Updating from 1.0 moves your chats across automatically, and you stay signed in.
 
 ## What it does
 
@@ -81,76 +83,77 @@ It also keeps running in the tray when you close the window, so messages and cal
 - **Preview photos and videos before downloading them**, so you know if that 40 MB video is worth it
 - **Search across every chat at once**, and **find any file by name** across all your chats in a blink
 - **HD video calls** with one-click quality presets for your webcam
-- Native **notifications with soft chimes and the Velo logo**, an **unread badge on the taskbar**, a tray icon, and **start at sign-in**
+- Native **notifications with soft chimes and the Wasp logo**, an **unread badge on the taskbar**, a tray icon, and **start at sign-in**
 - Keyboard-first: Ctrl+K search, Alt+↑↓ to move between chats, Alt+Shift+↓ for the next unread, Ctrl+N for a new chat
-- **Themes, accent colours and chat wallpapers**: Classic dark & light, plus Velo violet, Ultramarine and Coral accents
+- **Themes, accent colours and chat wallpapers**: Classic dark & light, plus Wasp violet, Ultramarine and Coral accents
 - Snappy, native animations: things fade and settle, nothing bounces at you
 
 ## Install
 
-1. Download the **`Velo-Setup-…-x64.exe`** installer from the [latest release](https://github.com/Ruchin-Audichya/velo/releases/latest).
+1. Download the **`Wasp-Setup-…-x64.exe`** installer from the [latest release](https://github.com/NexusOnePlus/wasp/releases/latest).
 2. Run it and press **Install**. It installs just for you, with no administrator prompt.
-3. Open Velo, then on your phone go to **WhatsApp → Settings → Linked devices → Link a device** and scan the QR code.
+3. Open Wasp, then on your phone go to **WhatsApp → Settings → Linked devices → Link a device** and scan the QR code.
 
 That's it. Your chats show up and you're in.
 
-Prefer no installer? Grab the **portable zip**, unzip it anywhere, and run `velo.exe`.
+Prefer no installer? Grab the **portable zip**, unzip it anywhere, and run `wasp.exe`.
 
 **Already on 1.0?** Just run the new installer. It updates in place, keeps your chats and your taskbar pin, and you stay signed in.
 
-**To remove Velo:** Windows Settings → Apps → Installed apps → Velo → Uninstall. You choose whether to keep your chats on this PC for next time.
+**To remove Wasp:** Windows Settings → Apps → Installed apps → Wasp → Uninstall. You choose whether to keep your chats on this PC for next time.
 
-> **A note on Windows warnings.** Velo isn't code-signed yet (signing certificates cost money, and this is a free app). Until it is, Windows SmartScreen may show a notice the first time you run the installer, and PCs with **Smart App Control** switched on won't run it at all. Signing is on the roadmap. Every release lists SHA-256 checksums so you can check the file you downloaded is the one published here.
+> **A note on Windows warnings.** Wasp isn't code-signed yet (signing certificates cost money, and this is a free app). Until it is, Windows SmartScreen may show a notice the first time you run the installer, and PCs with **Smart App Control** switched on won't run it at all. Signing is on the roadmap. Every release lists SHA-256 checksums so you can check the file you downloaded is the one published here.
 
 ## Is it safe?
 
-- **Your messages stay end-to-end encrypted.** Velo is a *linked device*, exactly like WhatsApp Web. Your phone stays the boss.
-- **Your data stays on your PC**, in `%LOCALAPPDATA%\velo`. Nothing is sent anywhere except to WhatsApp itself.
-- **The honest part:** Velo is *unofficial*. WhatsApp's terms don't love third-party clients, so there's a small but real chance WhatsApp restricts an account that uses one. Plenty of people use unofficial clients without trouble, but you should know it's a possibility. Use it at your own risk.
+- **Your messages stay end-to-end encrypted.** Wasp is a *linked device*, exactly like WhatsApp Web. Your phone stays the boss.
+- **Your data stays on your PC**, in `%LOCALAPPDATA%\wasp`. Nothing is sent anywhere except to WhatsApp itself.
+- **The honest part:** Wasp is *unofficial*. WhatsApp's terms don't love third-party clients, so there's a small but real chance WhatsApp restricts an account that uses one. Plenty of people use unofficial clients without trouble, but you should know it's a possibility. Use it at your own risk.
 
 ## What it's built on
 
-Velo stands on the shoulders of some excellent open-source work:
+Wasp stands on the shoulders of some excellent open-source work:
 
-- **[oxidezap/client](https://github.com/oxidezap/client)**, the Rust WhatsApp desktop client Velo is built from, by João Lucas de Oliveira Lopes and contributors
+- **[Velo](https://github.com/Ruchin-Audichya/velo)**, the MIT-licensed fork Wasp started from, by Ruchin Audichya
+- **[oxidezap/client](https://github.com/oxidezap/client)**, the Rust WhatsApp desktop client Wasp is built from, by João Lucas de Oliveira Lopes and contributors
 - **[whatsapp-rust](https://github.com/oxidezap/whatsapp-rust)**, the library that actually speaks WhatsApp
 - **[GPUI](https://github.com/zed-industries/zed)**, the GPU-accelerated UI framework behind the Zed editor, and **[gpui-kit](https://github.com/longbridge/gpui-kit)** by Longbridge for the components
 
-Velo adds the redesign, the logo, the animations, the chat actions, the installer and a lot of polish. All of it is released under the MIT License, the same as the projects above. Full credits and the licences of all 700-odd libraries inside are in [`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt).
+Wasp adds the redesign, the logo, the animations, the chat actions, the installer and a lot of polish. All of it is released under the MIT License, the same as the projects above. Full credits and the licences of all 700-odd libraries inside are in [`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt).
 
 ## Build it yourself
 
-Velo is open source: everything that goes into the installer is in this repository.
+Wasp is open source: everything that goes into the installer is in this repository.
 
 You need Rust (the version is pinned in `rust-toolchain.toml`, so `rustup` picks it up) and, on Windows, the MSVC build tools.
 
 ```bash
-git clone https://github.com/Ruchin-Audichya/velo
-cd velo
+git clone https://github.com/NexusOnePlus/wasp
+cd wasp
 cargo build --release
-./target/release/velo
+./target/release/wasp
 ```
 
-That builds the window (`velo`), the background service that holds your WhatsApp session (`velod`) and a command-line client (`velo-cli`). To build the Windows installer exactly as releases are made, run `packaging/windows/build-release.ps1`.
+That builds the window (`wasp`), the background service that holds your WhatsApp session (`waspd`) and a command-line client (`wasp-cli`). To build the Windows installer exactly as releases are made, run `packaging/windows/build-release.ps1`.
 
 How the pieces fit together, and the reasoning behind the less obvious decisions, is in [docs/development.md](docs/development.md), [docs/architecture.md](docs/architecture.md) and [docs/gotchas.md](docs/gotchas.md). Contributions are welcome: open an issue first for anything big.
 
 ## FAQ
 
 **Is this made by WhatsApp or Meta?**
-No. Velo is an independent project and isn't affiliated with, endorsed by or sponsored by WhatsApp LLC or Meta Platforms, Inc. "WhatsApp" is their trademark; we only use it to say what Velo connects to.
+No. Wasp is an independent project and isn't affiliated with, endorsed by or sponsored by WhatsApp LLC or Meta Platforms, Inc. "WhatsApp" is their trademark; we only use it to say what Wasp connects to.
 
 **Does my phone need to stay online?**
-No. Like WhatsApp Web, Velo keeps working when your phone is off, for up to about two weeks.
+No. Like WhatsApp Web, Wasp keeps working when your phone is off, for up to about two weeks.
 
 **Mac or Linux?**
-Velo is Windows-first. The code underneath runs elsewhere too, so maybe one day.
+Wasp is Windows-first. The code underneath runs elsewhere too, so maybe one day.
 
-**Why "Velo"?**
-It's short for *velocity*. Also all the good names were taken by companies with lawyers.
+**Why "Wasp"?**
+It is short, and the mark's folded panels read like wings. Also, all the good names were taken by companies with lawyers.
 
 **I found a bug.**
-Of course you did. Please [open an issue](https://github.com/Ruchin-Audichya/velo/issues) and say what you did, what you expected and what happened. Screenshots help, as long as there are no private chats in them.
+Of course you did. Please [open an issue](https://github.com/NexusOnePlus/wasp/issues) and say what you did, what you expected and what happened. Screenshots help, as long as there are no private chats in them.
 
 ---
 

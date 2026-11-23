@@ -149,8 +149,8 @@ switch ($Action) {
         @{ scrolled = $Delta } | ConvertTo-Json -Compress
     }
     'status' {
-        $daemon = Get-Process velod -ErrorAction SilentlyContinue | Select-Object -First 1
-        $cli = Join-Path (Split-Path $w.Process.Path) 'velo-cli.exe'
+        $daemon = Get-Process waspd -ErrorAction SilentlyContinue | Select-Object -First 1
+        $cli = Join-Path (Split-Path $w.Process.Path) 'wasp-cli.exe'
         $state = try { (& $cli --read-only --json status 2>$null | ConvertFrom-Json).data } catch { $null }
         [ordered]@{
             title = $w.Process.MainWindowTitle; width = $width; height = $height

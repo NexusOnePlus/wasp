@@ -2037,6 +2037,7 @@ impl WhatsAppClient {
                     chat_jid,
                     message_ids: vec![ack.id.clone()],
                     receipt_type: ReceiptType::Sent,
+                    sender: None,
                 });
             }
             Event::Receipt(receipt) => {
@@ -2077,6 +2078,7 @@ impl WhatsAppClient {
                         .map(ToString::to_string)
                         .collect(),
                     receipt_type: dominated_type,
+                    sender: Some(receipt.source.sender.to_string()),
                 });
             }
             Event::ChatPresence(update) => {
@@ -2415,6 +2417,8 @@ impl WhatsAppClient {
             system: None,
             poll,
             business,
+            link_preview: convert::link_preview_of(base_msg),
+            receipts: std::collections::HashMap::new(),
         };
 
         if let Some(media) = media_result {
@@ -2647,11 +2651,14 @@ impl WhatsAppClient {
         content: &str,
         local_id: String,
         quoted: Option<velo_core::QuotedMessage>,
+        preview: Option<velo_core::LinkPreview>,
+        mentions: Vec<String>,
     ) -> Task<()> {
         let session = self.session.clone();
         let ui_sender = self.ui_sender.clone();
         let jid_str = jid_str.to_string();
         let content = content.to_string();
+        let mentions: Vec<String> = mentions.into_iter().filter(|jid| !jid.is_empty()).collect();
 
         self.exec.spawn(async move {
             let jid: Jid = match jid_str.parse() {
@@ -2672,28 +2679,40 @@ impl WhatsAppClient {
             let live = session.lock().await.clone();
             if let Some(live) = live {
                 let client = &live.client;
-                // A reply is the same send with a quote attached, which the
-                // wire carries as an extended text message: a bare
-                // `conversation` has nowhere to put the context.
-                let message = match &quoted {
-                    Some(quoted) => {
-                        let mut constructed: wa::Message = Default::default();
-                        constructed.extended_text_message =
-                            whatsapp_rust::buffa::MessageField::some({
-                                let mut constructed: wa::message::ExtendedTextMessage =
-                                    Default::default();
-                                constructed.text = Some(content.clone());
-                                constructed.context_info =
-                                    whatsapp_rust::buffa::MessageField::some(quote_context(quoted));
-                                constructed
-                            });
-                        constructed
-                    }
-                    None => {
-                        let mut constructed: wa::Message = Default::default();
-                        constructed.conversation = Some(content.clone());
-                        constructed
-                    }
+                // A reply is the same send with a quote attached, a link is
+                // the same send with a card attached, and a mention is the
+                // same send with a name list attached. All live inside
+                // `extended_text_message` (or its context); a bare
+                // `conversation` has nowhere to put any of them, and choosing
+                // it there would silently drop what the front end composed.
+                let message = if quoted.is_some() || preview.is_some() || !mentions.is_empty() {
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.extended_text_message = whatsapp_rust::buffa::MessageField::some({
+                        let mut extended: wa::message::ExtendedTextMessage = Default::default();
+                        extended.text = Some(content.clone());
+                        let mut context = quoted.as_ref().map(quote_context).unwrap_or_default();
+                        if !mentions.is_empty() {
+                            context.mentioned_jid = mentions.clone();
+                        }
+                        if quoted.is_some() || !mentions.is_empty() {
+                            extended.context_info =
+                                whatsapp_rust::buffa::MessageField::some(context);
+                        }
+                        if let Some(preview) = &preview {
+                            extended.matched_text = Some(preview.url.clone());
+                            extended.title = preview.title.clone();
+                            extended.description = preview.description.clone();
+                            if !preview.thumbnail.is_empty() {
+                                extended.jpeg_thumbnail = Some(preview.thumbnail.clone());
+                            }
+                        }
+                        extended
+                    });
+                    constructed
+                } else {
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.conversation = Some(content.clone());
+                    constructed
                 };
 
                 // Record BEFORE sending: the server ack event fires during

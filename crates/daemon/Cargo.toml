@@ -9,7 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "velod"
+name = "waspd"
 path = "src/main.rs"
 
 [features]

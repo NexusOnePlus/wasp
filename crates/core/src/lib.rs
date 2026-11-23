@@ -54,8 +54,8 @@ pub use call_devices::*;
 pub use calls::{ActiveCall, Admission, CallState, Ending, Stage, WaitingCall};
 pub use chat::STATUS_BROADCAST_JID;
 pub use chat::{
-    Chat, ChatMessage, DownloadableMedia, GroupHierarchy, MediaContent, MediaType, OutgoingMedia,
-    PollContent, ReleasedMedia, Resend, SubgroupKind,
+    Chat, ChatMessage, DownloadableMedia, GroupHierarchy, LinkPreview, MediaContent, MediaType,
+    OutgoingMedia, PollContent, ReleasedMedia, Resend, SubgroupKind,
 };
 pub use chat::{fallback_chat_name, fallback_sender_name};
 pub use events::{AvatarOutcome, AvatarResolution, ReceiptType, UiEvent};

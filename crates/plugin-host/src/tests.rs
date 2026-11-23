@@ -1826,6 +1826,7 @@ fn every_converted_event_is_one_the_filter_admits() {
             chat_jid: "a@s.whatsapp.net".into(),
             message_ids: vec!["MSG1".into()],
             receipt_type: velo_core::ReceiptType::Read,
+            sender: Some("a@s.whatsapp.net".into()),
         },
         UiEvent::ReactionReceived {
             chat_jid: "a@s.whatsapp.net".into(),
@@ -1862,6 +1863,7 @@ fn a_server_ack_is_not_reported_to_plugins_as_peer_delivery() {
         chat_jid: "a@s.whatsapp.net".into(),
         message_ids: vec!["MSG-SENT".into()],
         receipt_type: velo_core::ReceiptType::Sent,
+        sender: None,
     };
 
     assert_eq!(crate::event::kind_of(&sent), None);

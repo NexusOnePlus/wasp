@@ -1,7 +1,7 @@
 //! Lightweight, decoupled wire protocol DTOs for Velo IPC and CLI.
 //!
 //! Deliberately free from heavy dependencies like `wacore`, `whatsapp-rust`,
-//! SQLite, GPUI, or media codecs, allowing thin client binaries (`velo-cli`)
+//! SQLite, GPUI, or media codecs, allowing thin client binaries (`wasp-cli`)
 //! to stay minimal in size (< 2 MiB) and fast to compile.
 
 pub mod accounts;

@@ -49,7 +49,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          (cd artifacts && sha256sum velo-* > checksums.sha256)
+          (cd artifacts && sha256sum wasp-* > checksums.sha256)
           cat > notes.md <<'NOTES'
           Unsigned development build of `main`. Expect breakage.
 
@@ -57,21 +57,21 @@ jobs:
           binaries that belong together, and they must stay in the same
           directory:
 
-          - `velo` is the window.
-          - `velod` holds the WhatsApp session. The window starts it when
+          - `wasp` is the window.
+          - `waspd` holds the WhatsApp session. The window starts it when
             nothing is already running.
-          - `velo-cli` is the scriptable front end onto that same daemon,
+          - `wasp-cli` is the scriptable front end onto that same daemon,
             for use from a terminal or a script.
 
           The tarballs carry the execute bit. On macOS, clear the quarantine
           flag before the first run:
 
-              xattr -dr com.apple.quarantine velo velod velo-cli
+              xattr -dr com.apple.quarantine wasp waspd wasp-cli
 
           On Windows, SmartScreen will object. All of this follows from the
           binaries being unsigned.
 
-          `velo-nightly-web.zip` is the same client as a web page: the
+          `wasp-nightly-web.zip` is the same client as a web page: the
           bundle published to GitHub Pages, built to be served from anywhere
           rather than from one directory. Unpack it and serve the files with
           any static web server — over HTTPS or from `localhost`, and with

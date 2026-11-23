@@ -7,7 +7,7 @@ A implementação usa **um `whatsapp.db` compartilhado**; `AccountId` é o `devi
 positivo desse banco. Não reintroduzir `accounts.json`, UUIDs, um DB por conta ou
 migração de arquivo.
 
-**PR aberto (draft):** `https://github.com/Ruchin-Audichya/velo/pull/172` (branch
+**PR aberto (draft):** `https://github.com/NexusOnePlus/wasp/pull/172` (branch
 `feat/multi-account`). CI estava vermelho por um conflito de ordenação de
 migrations com o PR #171 (mergeado em `main` depois que esta branch foi
 criada); corrigido e re-empurrado — ver a entrada "CI do PR #172 corrigido"

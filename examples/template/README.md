@@ -1,6 +1,6 @@
 # template
 
-A starting point for a Velo plugin. Copy the directory, change the name
+A starting point for a Wasp plugin. Copy the directory, change the name
 in `Cargo.toml` — that name is the plugin's id — and delete what you do not
 need.
 
@@ -17,7 +17,7 @@ mkdir -p ~/.local/share/velo/plugins
 cp "$module" ~/.local/share/velo/plugins/
 ```
 
-Restart `velod`. Set `VELO_PLUGIN_DIR` to load from somewhere else,
+Restart `waspd`. Set `WASP_PLUGIN_DIR` to load from somewhere else,
 which is what you want while writing one.
 
 ## What it does

@@ -1,6 +1,6 @@
 //! The window: a GPUI front end for the account the daemon holds.
 //!
-//! It owns no session. `velo` reaches `velod` and starts one if
+//! It owns no session. `velo` reaches `waspd` and starts one if
 //! nobody answers, because there is exactly one WhatsApp session per user and
 //! it lives in that process. So what this crate has is the protocol, the
 //! drawing, and video decode, which writes straight into `gpui::RenderImage`
@@ -12,7 +12,7 @@
 //! `platform/`, so no component above it learns that browsers exist.
 
 // No console window beside the GUI on Windows release builds: opening
-// `velo.exe` used to pop a terminal with the daemon in it. Debug keeps
+// `wasp.exe` used to pop a terminal with the daemon in it. Debug keeps
 // its console so `cargo run` still shows logs where they can be read.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
@@ -68,7 +68,7 @@ fn open_the_window() {
         // Before anything asks for one: a page's text system starts empty and
         // resolving a font it has not been given is a panic, not a fallback.
         crate::platform::fonts(cx);
-        cx.set_app_identity(crate::platform::window_identity::APP_ID, "Velo");
+        cx.set_app_identity(crate::platform::window_identity::APP_ID, "Wasp");
         gpui_component::init(cx);
         // Reads ~/.config/velo/theme.json over a preset. Cannot fail: a
         // missing or malformed file resolves to the product default and
@@ -85,7 +85,7 @@ fn open_the_window() {
             // the system caption is hidden, and the window's own title is
             // kept for the taskbar and Alt-Tab.
             titlebar: Some(gpui::TitlebarOptions {
-                title: Some(SharedString::from("Velo")),
+                title: Some(SharedString::from("Wasp")),
                 ..gpui_component::TitleBar::title_bar_options()
             }),
             app_owns_titlebar_drag: true,

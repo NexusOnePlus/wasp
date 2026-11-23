@@ -230,7 +230,7 @@ impl WhatsAppApp {
             return;
         };
         let Some(client) = self.client.as_ref() else {
-            form.error = Some("Velo is not connected yet. Try again in a moment.".into());
+            form.error = Some("Wasp is not connected yet. Try again in a moment.".into());
             cx.notify();
             return;
         };
@@ -258,7 +258,7 @@ impl WhatsAppApp {
                     form.saving = false;
                     form.error = Some(match &result {
                         Ok(Err(failure)) => format!("Couldn't save this contact. {failure}"),
-                        _ => "Velo lost its connection before the contact was saved.".into(),
+                        _ => "Wasp lost its connection before the contact was saved.".into(),
                     });
                 }
                 cx.notify();
@@ -382,7 +382,7 @@ impl WhatsAppApp {
         cx.notify();
         let Some(client) = self.client.as_ref() else {
             self.notify_user(
-                "Velo is not connected yet. Try again in a moment.",
+                "Wasp is not connected yet. Try again in a moment.",
                 notices::Tone::Problem,
                 cx,
             );
@@ -406,7 +406,7 @@ impl WhatsAppApp {
                     cx,
                 ),
                 Err(_) => app.notify_user(
-                    "Velo lost its connection before the message was forwarded.",
+                    "Wasp lost its connection before the message was forwarded.",
                     notices::Tone::Problem,
                     cx,
                 ),

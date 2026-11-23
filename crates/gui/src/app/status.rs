@@ -186,6 +186,7 @@ impl WhatsAppApp {
         window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
+        log::info!("destination: {:?} -> {:?}", self.destination, destination);
         // Choosing a destination leaves Calls and Files, including the one
         // already underneath them: clicking Status from Calls opened over
         // Status used to do nothing at all.
@@ -224,6 +225,9 @@ impl WhatsAppApp {
             self.ensure_timeline_page(STATUS_BROADCAST_JID, cx);
             // The rings show people's photos; ask for the ones not yet here.
             self.demand_status_avatars();
+            // And the cards want the newest update's picture. One per author,
+            // so six people do not all draw the same talkative contact.
+            self.auto_download_status_previews(cx);
         }
         self.search
             .update(cx, |search, cx| search.clear_list_query(window, cx));
@@ -694,7 +698,14 @@ impl WhatsAppApp {
             // decoding either way, and the frames it produces are what the
             // pane draws. Skipping it once the bytes were here left a watched
             // video reopening on its poster frame with nothing to start it.
-            MediaType::Video => self.toggle_video(message_id, downloadable, cx),
+            MediaType::Video => {
+                let is_gif = self
+                    .find_chat(STATUS_BROADCAST_JID)
+                    .and_then(|chat| chat.messages.iter().find(|m| m.id == message_id))
+                    .and_then(|m| m.media.as_ref())
+                    .is_some_and(|media| media.is_gif);
+                self.toggle_video(message_id, downloadable, is_gif, cx)
+            }
             other => log::debug!("a status update of type {other:?} has nothing to show"),
         }
     }

@@ -236,7 +236,7 @@
   the call would be held by a tab that did not ask for it and heard there
   too. `calls_unavailable` refuses it and says which tab to use. It is the
   one place a follower differs from a desktop window talking to an
-  `velod`, and the contrast is what makes it right: there the devices are
+  `waspd`, and the contrast is what makes it right: there the devices are
   the daemon's by design and nobody expects the window to hold them, while
   here both tabs are windows and the wrong one would. Fixing it properly
   means the follower opening the devices and handing them across, which is a
@@ -485,7 +485,7 @@
   reads an owner and a mode, which Windows does not have — it answers `true`
   there, and what stands in for it is where the directory *is*: plugins and
   their state live under `%LOCALAPPDATA%`, whose ACL is the profile's. That
-  covers the default and not an override, so a `VELO_PLUGIN_DIR` pointing
+  covers the default and not an override, so a `WASP_PLUGIN_DIR` pointing
   at a share is trusted on Windows and checked on unix. It is the user's own
   environment variable naming their own directory, which is the weakest half
   of the threat this guards against — but it is a gap, and closing it means

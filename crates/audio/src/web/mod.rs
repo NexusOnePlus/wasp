@@ -21,7 +21,7 @@
 //! - **Call devices**, which used to be the exception here and are not any
 //!   more. The sentence was that the process owning the session owns the
 //!   microphone and that process is the daemon — true of a page attached to
-//!   an `velod`, and not of a page holding the session itself, which is
+//!   an `waspd`, and not of a page holding the session itself, which is
 //!   the arrangement this build now has. See [`call_device`].
 //!
 //! What still does not survive is libopus, and nothing here needs it: a

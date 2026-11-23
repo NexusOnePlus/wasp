@@ -96,7 +96,7 @@ impl WhatsAppApp {
         cx.notify();
     }
 
-    fn global_hit(&self, chat_jid: String, message: ChatMessage) -> GlobalHit {
+    pub(crate) fn global_hit(&self, chat_jid: String, message: ChatMessage) -> GlobalHit {
         let chat = self.find_chat(&chat_jid);
         let chat_name = chat
             .map(|chat| chat.name.clone())
@@ -151,7 +151,7 @@ impl WhatsAppApp {
             .find_chat(chat_jid)
             .is_some_and(|chat| chat.messages.iter().any(|m| m.id == message_id));
         if loaded {
-            self.jump_to_message(message_id, cx);
+            let _ = self.jump_to_message(message_id, cx);
         }
         loaded
     }

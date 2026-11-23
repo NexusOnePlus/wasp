@@ -2,10 +2,10 @@
 
 use usage_rs::{Args, Cli, Subcommands};
 
-/// Lightweight, scriptable WhatsApp CLI for Velo
+/// Lightweight, scriptable WhatsApp CLI for Wasp
 #[derive(Cli)]
-#[usage(bin = "velo-cli", version = "0.1.0", completion)]
-pub struct VeloCli {
+#[usage(bin = "wasp-cli", version = "0.1.0", completion)]
+pub struct WaspCli {
     /// Format output as JSON
     #[usage(long, global)]
     pub json: bool,
@@ -15,19 +15,19 @@ pub struct VeloCli {
     pub events: bool,
 
     /// Refuse any mutating actions (read-only mode)
-    #[usage(long, global, env = "VELO_READONLY")]
+    #[usage(long, global, env = "WASP_READONLY")]
     pub read_only: bool,
 
     /// Specify named account profile
-    #[usage(long, global, env = "VELO_ACCOUNT")]
+    #[usage(long, global, env = "WASP_ACCOUNT")]
     pub account: Option<String>,
 
     /// Select a local account inside the daemon, independently of --account
-    #[usage(long, global, env = "VELO_LOCAL_ACCOUNT")]
+    #[usage(long, global, env = "WASP_LOCAL_ACCOUNT")]
     pub local_account: Option<String>,
 
     /// Override daemon socket path
-    #[usage(long, global, env = "VELO_SOCKET")]
+    #[usage(long, global, env = "WASP_SOCKET")]
     pub socket: Option<String>,
 
     #[usage(subcommand)]

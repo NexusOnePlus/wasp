@@ -21,7 +21,7 @@ use crate::app::{
     WhatsAppApp,
 };
 use crate::components::parts;
-use crate::components::{EmptyState, render_chat_item};
+use crate::components::{EmptyState, ProductIcon, render_chat_item};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::Metrics;
 
@@ -173,7 +173,9 @@ fn render_title_bar(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    let settings_entity = entity;
+    let settings_entity = entity.clone();
+    let calls_entity = entity.clone();
+    let files_entity = entity;
 
     div()
         .flex_shrink_0()
@@ -203,6 +205,35 @@ fn render_title_bar(
                         .cursor_pointer()
                         .on_click(|_, window, cx| {
                             window.dispatch_action(Box::new(crate::app::forward::NewChat), cx);
+                        }),
+                )
+                .child(
+                    Button::new("open-calls")
+                        .icon(ProductIcon::Phone)
+                        .ghost()
+                        .small()
+                        .tooltip("Calls")
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            calls_entity.update(cx, |app, cx| app.open_call_history(cx));
+                        }),
+                )
+                .child(
+                    Button::new("open-files")
+                        .icon(ProductIcon::FileText)
+                        .ghost()
+                        .small()
+                        .tooltip("Files & downloads")
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            files_entity.update(cx, |app, cx| {
+                                app.calls_open = false;
+                                app.files_open = true;
+                                if let Some(view) = &app.files_view {
+                                    view.update(cx, |view, cx| view.refresh(cx));
+                                }
+                                cx.notify();
+                            });
                         }),
                 )
                 .child(

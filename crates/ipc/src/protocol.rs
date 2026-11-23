@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 use velo_core::{
     AccountId, CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, GroupHierarchy,
-    GroupRoster, LogLevel, OutgoingMedia, PluginAction, PluginSurface, QuotedMessage, UiEvent,
+    GroupRoster, LinkPreview, LogLevel, OutgoingMedia, PluginAction, PluginSurface, QuotedMessage,
+    UiEvent,
 };
 
 fn is_false(value: &bool) -> bool {
@@ -737,6 +738,17 @@ pub struct SendText {
     /// wrote it, and the line to show in the quote bar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quoted: Option<QuotedMessage>,
+    /// The link card the front end fetched before sending. Absent when the
+    /// text has no URL, or when the fetch failed and plain text is the honest
+    /// fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<LinkPreview>,
+    /// The people the text `@`-mentions, as full addresses.
+    ///
+    /// The text carries `@` plus each address's user part; this list is what
+    /// tells WhatsApp which tokens are mentions rather than plain words.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<String>,
 }
 
 /// Delete one sent message locally or request deletion for everyone.
@@ -1249,7 +1261,7 @@ pub enum ClientRequest {
     ///
     /// It is remembered as well as applied, in the daemon's own config file
     /// rather than in the asking front end's: a page keeps its choice in a
-    /// browser store the daemon cannot read, and the next `velod` would
+    /// browser store the daemon cannot read, and the next `waspd` would
     /// otherwise start back at `info`.
     ///
     /// Answered with [`DaemonMessage::Accepted`], which here means the level
@@ -1317,7 +1329,7 @@ pub enum ClientRequest {
     /// Put a module in the daemon's plugin folder.
     ///
     /// The folder belongs to the daemon that runs it — a directory beside
-    /// `velod`, or a page's own origin storage — so a front end that
+    /// `waspd`, or a page's own origin storage — so a front end that
     /// wanted to add one had nothing to write into and, on one target, wrote
     /// into it anyway by calling the daemon crate directly. That second
     /// control channel is what this replaces: installing is a request like
@@ -2091,6 +2103,8 @@ mod tests {
                     text: "oi".into(),
                     local_id: Some("local-1".into()),
                     quoted: Some(quoted.clone()),
+                    preview: None,
+                    mentions: Vec::new(),
                 })),
                 r#"{"request":"send_text","jid":"559900000001@s.whatsapp.net","text":"oi","local_id":"local-1","quoted":{"message_id":"3EB0A","sender":"559900000001@s.whatsapp.net","sender_name":"quem quer que seja","preview":"a linha citada","kind":null}}"#.to_string(),
             ),
@@ -2100,6 +2114,8 @@ mod tests {
                     text: "oi".into(),
                     local_id: None,
                     quoted: None,
+                    preview: None,
+                    mentions: Vec::new(),
                 })),
                 r#"{"request":"send_text","jid":"559900000001@s.whatsapp.net","text":"oi","local_id":null}"#.to_string(),
             ),

@@ -223,7 +223,7 @@ pub fn reload_in_background(plugins: &Arc<Plugins>, account_id: AccountId) {
 /// Put a module in this daemon's plugin folder, and answer the id it claimed.
 ///
 /// The folder belongs to whatever runs the plugins, which is this process on
-/// either platform — a directory beside `velod`, or the page's own origin
+/// either platform — a directory beside `waspd`, or the page's own origin
 /// storage. So a front end asks for this rather than writing the folder: it
 /// may share no filesystem with the daemon, and on the one target where it
 /// did share an address space it reached past the protocol to do it.
@@ -340,6 +340,7 @@ impl Commands for Bridge {
             // The daemon invents one. A plugin has no bubble to rename, so a
             // local id would be a token nobody holds.
             local_id: None,
+            preview: None,
             // A plugin knows the id and nothing else, which is all the ABI
             // gives it. The session does *not* re-read the original —
             // `quote_context` serializes these fields straight onto the wire —
@@ -354,6 +355,7 @@ impl Commands for Bridge {
                 preview: String::new(),
                 kind: None,
             }),
+            mentions: Vec::new(),
         }))
     }
 

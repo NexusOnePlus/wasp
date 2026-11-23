@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.28.0.schema.json
+
+PackageIdentifier: NexusOnePlus.Wasp
+PackageVersion: 1.0.0
+PackageLocale: en-US
+Publisher: NexusOnePlus
+PublisherUrl: https://github.com/NexusOnePlus
+PublisherSupportUrl: https://github.com/NexusOnePlus/wasp/issues
+Author: NexusOnePlus
+PackageName: Wasp
+PackageUrl: https://github.com/NexusOnePlus/wasp
+License: MIT
+LicenseUrl: https://github.com/NexusOnePlus/wasp/blob/main/LICENSE
+Copyright: Copyright (c) 2026 NexusOnePlus
+ShortDescription: A fast, native, unofficial WhatsApp desktop client for Windows.
+Description: |-
+  Wasp is a native Windows app for WhatsApp, written in Rust and drawn on the GPU, with no embedded browser.
+  It links to your phone as a linked device, the same way WhatsApp Web does, and keeps running in the tray so messages and calls still reach you.
+  Wasp is unofficial and is not affiliated with WhatsApp LLC or Meta Platforms, Inc.
+Moniker: wasp
+Tags:
+- chat
+- desktop-client
+- messaging
+- messenger
+- rust
+- whatsapp
+ReleaseNotesUrl: https://github.com/NexusOnePlus/wasp/releases/tag/v1.0.0
+ManifestType: defaultLocale
+ManifestVersion: 1.28.0

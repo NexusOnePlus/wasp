@@ -275,7 +275,7 @@ fn read_module(path: &Path) -> anyhow::Result<Vec<u8>> {
 /// it would take to allow the link is a verdict on the target's directory,
 /// and on that directory's directory — a walk to the root, with a race at
 /// every step — where the rule that a module is a file is one line and
-/// checkable. Loading from somewhere else is what `VELO_PLUGIN_DIR` is
+/// checkable. Loading from somewhere else is what `WASP_PLUGIN_DIR` is
 /// for, and it is checked the same way.
 ///
 /// Nothing to check off unix: a Windows plugin directory sits under
@@ -526,11 +526,11 @@ pub fn plugin_id(path: &Path) -> Option<String> {
 
 /// Where plugins are looked for, unless the daemon is told otherwise.
 ///
-/// `VELO_PLUGIN_DIR` wins, which is what a developer building one uses
+/// `WASP_PLUGIN_DIR` wins, which is what a developer building one uses
 /// and what keeps a test from needing a home directory at all.
 #[must_use]
 pub fn default_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("VELO_PLUGIN_DIR") {
+    if let Some(dir) = std::env::var_os("WASP_PLUGIN_DIR") {
         return Some(PathBuf::from(dir));
     }
     data_dir().map(|d| d.join("velo").join("plugins"))

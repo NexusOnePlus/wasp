@@ -149,7 +149,7 @@ catalog! {
     PauseWhenAudioIsReady => ("Pause when audio is ready", "Pausar quando o áudio estiver pronto");
     PlayWhenAudioIsReady => ("Play when audio is ready", "Reproduzir quando o áudio estiver pronto");
     AudioUnavailable => ("Audio unavailable", "Áudio indisponível");
-    PlaybackSpeed => ("Playback speed", "Velocidade de reprodução");
+    PlaybackSpeed => ("Playback speed", "Waspcidade de reprodução");
     NotSentRetry => ("Not sent · retry", "Não enviada · tentar novamente");
     SendThisMessageAgain => ("Send this message again", "Enviar esta mensagem novamente");
     Edit => ("Edit", "Editar");
@@ -322,6 +322,8 @@ catalog! {
     ThatFileIsNoLongerInDownloadsSaveItAgainToOpenIt => ("That file is no longer in Downloads. Save it again to open it.", "O arquivo não está mais em Downloads. Salve novamente para abri-lo.");
     ThatFileIsNoLongerInDownloadsSaveItAgainToShowIt => ("That file is no longer in Downloads. Save it again to show it.", "O arquivo não está mais em Downloads. Salve novamente para mostrá-lo.");
     CouldNotDownloadThatVideo => ("Could not download that video", "Não foi possível baixar o vídeo");
+    CouldNotUpdateThatLinkPreview => ("Could not update that link preview", "Não foi possível atualizar a prévia do link");
+    ReadingLinkPreview => ("Reading link preview…", "Leyendo la vista previa del enlace…");
     FinishEditingTheMessageBeforeAddingAFile => ("Finish editing the message before adding a file.", "Termine de editar a mensagem antes de adicionar um arquivo.");
     FinishOrCancelThePendingFileFirstThenDropAgain => ("Finish or cancel the pending file first, then drop again.", "Envie ou cancele o arquivo pendente antes de soltar outro.");
     FilesCannotBeSentRightNowNotConnected => ("Files cannot be sent right now: not connected.", "Não é possível enviar arquivos agora: sem conexão.");
@@ -383,7 +385,7 @@ catalog! {
     FaultOversizedTitle => ("This window cannot read what the background service sent", "Esta janela não conseguiu ler os dados do serviço");
     FaultOversizedBody => ("One frame was larger than this window will accept, and attaching again would meet the same one. Your messages are safe on this device.", "O serviço enviou mais dados de uma vez do que esta janela aceita. Reconectar repetiria o problema. Suas mensagens estão seguras neste dispositivo.");
     FaultMismatchedTitle => ("This window and the background service disagree", "Esta janela e o serviço são incompatíveis");
-    FaultMismatchedBody => ("They are different versions. Quit Velo completely and start it again; reconnecting will not help.", "As versões são diferentes. Feche o Velo completamente e abra novamente. Reconectar não resolverá.");
+    FaultMismatchedBody => ("They are different versions. Quit Wasp completely and start it again; reconnecting will not help.", "As versões são diferentes. Feche o Wasp completamente e abra novamente. Reconectar não resolverá.");
     LogOffNote => ("Nothing is logged at all.", "Nenhum log será registrado.");
     LogErrorNote => ("Only failures.", "Apenas falhas.");
     LogWarnNote => ("Failures and anything suspicious.", "Falhas e ocorrências suspeitas.");

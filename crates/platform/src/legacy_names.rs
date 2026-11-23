@@ -1,21 +1,22 @@
-//! The one-time move from the names Velo shipped under before 1.1.
+//! The one-time move from the names this project shipped under before Wasp.
 //!
-//! Velo began as a fork of a client called *oxidezap*, and 1.0 still kept that
-//! name everywhere a user could not see it: the data folder, the downloads
-//! folder, the registry, the sign-in entry and the notification identity.
-//! 1.1 uses Velo's own names. This module is the bridge, and the one place in
-//! the tree that still has to spell the old ones.
+//! Wasp is a fork of Velo, which began as a fork of a client called *oxidezap*.
+//! Velo 1.0 kept the oxidezap name everywhere a user could not see it: the data
+//! folder, the downloads folder, the registry, the sign-in entry and the
+//! notification identity. 1.1 used Velo's own names, and Wasp now uses its own.
+//! This module is the bridge, and the one place in the tree that still has to
+//! spell the old ones.
 //!
-//! Every Velo program calls [`migrate`] first thing, before it opens a file,
+//! Every Wasp program calls [`migrate`] first thing, before it opens a file,
 //! so whichever starts first does the move and the others find it done. Each
-//! step only renames into a name that does not exist yet — nothing is ever
-//! overwritten or merged — and is idempotent, so a second call, a second
+//! step only renames into a name that does not exist yet - nothing is ever
+//! overwritten or merged - and is idempotent, so a second call, a second
 //! program, or a crash halfway through all leave a consistent state. A folder
 //! that cannot be moved (another program holding a file in it) is left where
-//! it is and logged; the installer stops every Velo process before it runs
+//! it is and logged; the installer stops every Wasp process before it runs
 //! the new version, so in practice nothing holds them.
 
-/// Move anything still under the pre-1.1 names to Velo's. Cheap when there is
+/// Move anything still under an old name to Wasp's. Cheap when there is
 /// nothing to do: a directory listing per base folder, a registry probe.
 ///
 /// Returns what it did, one line per move, for the caller to log: it runs
@@ -40,17 +41,29 @@ fn note(line: String) {
 }
 
 /// The data folder's new name, and the prefix per-account folders share.
-pub const NEW: &str = "velo";
-const OLD: &str = "oxidezap";
+pub const NEW: &str = "wasp";
+/// Names this product used before Wasp, newest first.
+const OLD_NAMES: [&str; 2] = ["velo", "oxidezap"];
 
 /// What an entry in a base folder is called after the move, if it is one of
 /// ours: the folder itself, or a per-account `<name>-<account>` beside it.
 fn renamed(name: &str) -> Option<String> {
-    if name == OLD {
-        return Some(NEW.to_owned());
+    if name == NEW || name.starts_with("wasp-") {
+        return None;
     }
-    let account = name.strip_prefix(OLD)?.strip_prefix('-')?;
-    (!account.is_empty()).then(|| format!("{NEW}-{account}"))
+    for old in OLD_NAMES {
+        if name == old {
+            return Some(NEW.to_owned());
+        }
+        if let Some(account) = name
+            .strip_prefix(old)
+            .and_then(|rest| rest.strip_prefix('-'))
+            && !account.is_empty()
+        {
+            return Some(format!("{NEW}-{account}"));
+        }
+    }
+    None
 }
 
 #[cfg(target_family = "wasm")]
@@ -152,16 +165,19 @@ mod imp {
         }
     }
 
-    /// Saved files: `Downloads\OxideZap` becomes `Downloads\Velo`.
+    /// Saved files: `Downloads\OxideZap` and `Downloads\Velo` become
+    /// `Downloads\Wasp`.
     #[cfg(windows)]
     fn downloads() {
         let Some(profile) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) else {
             return;
         };
         let downloads = PathBuf::from(profile).join("Downloads");
-        let old = downloads.join("OxideZap");
-        if old.is_dir() {
-            move_into_place(&old, &downloads.join("Velo"));
+        for old in ["OxideZap", "Velo"] {
+            let old = downloads.join(old);
+            if old.is_dir() {
+                move_into_place(&old, &downloads.join("Wasp"));
+            }
         }
     }
 
@@ -169,42 +185,51 @@ mod imp {
     mod windows {
         use windows_registry::CURRENT_USER;
 
-        const OLD_PREFS: &str = r"Software\OxideZap";
-        const NEW_PREFS: &str = r"Software\Velo";
+        const OLD_PREFS: [&str; 2] = [r"Software\OxideZap", r"Software\Velo"];
+        const NEW_PREFS: &str = r"Software\Wasp";
         const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-        const OLD_RUN: &str = "OxideZap";
-        const NEW_RUN: &str = "Velo";
-        const OLD_APP_ID: &str = r"Software\Classes\AppUserModelId\org.oxidezap.client.local";
+        const OLD_RUN: [&str; 2] = ["OxideZap", "Velo"];
+        const NEW_RUN: &str = "Wasp";
+        const OLD_APP_IDS: [&str; 2] = [
+            r"Software\Classes\AppUserModelId\org.oxidezap.client.local",
+            r"Software\Classes\AppUserModelId\io.github.RuchinAudichya.Velo",
+        ];
 
         pub(super) fn registry() {
             preferences();
             sign_in_entry();
-            // The old notification identity: Windows keeps showing its name
-            // in Settings until the key is gone.
-            let _ = CURRENT_USER.remove_tree(OLD_APP_ID);
+            // The old notification identities: Windows keeps showing their
+            // names in Settings until the keys are gone.
+            for app_id in OLD_APP_IDS {
+                let _ = CURRENT_USER.remove_tree(app_id);
+            }
         }
 
         /// Copy each saved preference the new key does not have yet, then
-        /// drop the old key.
+        /// drop the old keys.
         fn preferences() {
-            let Ok(old) = CURRENT_USER.open(OLD_PREFS) else {
-                return;
-            };
             let Ok(new) = CURRENT_USER.create(NEW_PREFS) else {
                 return;
             };
-            if let Ok(values) = old.values() {
-                for (name, value) in values {
-                    if new.get_value(&name).is_err() {
-                        let _ = new.set_value(&name, &value);
+            for old in OLD_PREFS {
+                let Ok(old) = CURRENT_USER.open(old) else {
+                    continue;
+                };
+                if let Ok(values) = old.values() {
+                    for (name, value) in values {
+                        if new.get_value(&name).is_err() {
+                            let _ = new.set_value(&name, &value);
+                        }
                     }
                 }
+                drop(old);
             }
-            drop(old);
-            let _ = CURRENT_USER.remove_tree(OLD_PREFS);
+            for old in OLD_PREFS {
+                let _ = CURRENT_USER.remove_tree(old);
+            }
         }
 
-        /// "Start Velo when you sign in" was stored under the old name and
+        /// "Start Velo when you sign in" was stored under an old name and
         /// pointed at the old program. Carry the choice over to the new name
         /// and program; the installer writes the same, this covers a portable
         /// copy that never ran it.
@@ -212,16 +237,19 @@ mod imp {
             let Ok(run) = CURRENT_USER.create(RUN) else {
                 return;
             };
-            if run.get_string(OLD_RUN).is_err() {
-                return;
+            let mut wanted = false;
+            for old in OLD_RUN {
+                if run.get_string(old).is_ok() {
+                    wanted = true;
+                    let _ = run.remove_value(old);
+                }
             }
-            let _ = run.remove_value(OLD_RUN);
-            if run.get_string(NEW_RUN).is_ok() {
+            if !wanted || run.get_string(NEW_RUN).is_ok() {
                 return;
             }
             let service = std::env::current_exe()
                 .ok()
-                .and_then(|exe| exe.parent().map(|dir| dir.join("velod.exe")))
+                .and_then(|exe| exe.parent().map(|dir| dir.join("waspd.exe")))
                 .filter(|path| path.is_file());
             if let Some(service) = service {
                 let _ = run.set_string(NEW_RUN, format!("\"{}\"", service.display()));
@@ -236,40 +264,46 @@ mod tests {
 
     #[test]
     fn the_data_folder_and_account_folders_take_the_new_name() {
-        assert_eq!(renamed("oxidezap").as_deref(), Some("velo"));
-        assert_eq!(renamed("oxidezap-work").as_deref(), Some("velo-work"));
+        assert_eq!(renamed("oxidezap").as_deref(), Some("wasp"));
+        assert_eq!(renamed("velo").as_deref(), Some("wasp"));
+        assert_eq!(renamed("oxidezap-work").as_deref(), Some("wasp-work"));
+        assert_eq!(renamed("velo-work").as_deref(), Some("wasp-work"));
         assert_eq!(renamed("oxidezap-"), None);
         assert_eq!(renamed("oxidezapper"), None);
-        assert_eq!(renamed("velo"), None);
+        assert_eq!(renamed("wasp"), None);
+        assert_eq!(renamed("wasp-work"), None);
         assert_eq!(renamed("Something else"), None);
     }
 
     #[test]
     fn folders_move_once_and_never_over_an_existing_one() {
-        let base = std::env::temp_dir().join(format!("velo-legacy-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("wasp-legacy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("oxidezap")).unwrap();
         std::fs::write(base.join("oxidezap").join("whatsapp.db"), b"store").unwrap();
         std::fs::create_dir_all(base.join("oxidezap-work")).unwrap();
+        std::fs::create_dir_all(base.join("velo-work")).unwrap();
         std::fs::create_dir_all(base.join("velo-home")).unwrap();
-        std::fs::create_dir_all(base.join("oxidezap-home")).unwrap();
+        std::fs::create_dir_all(base.join("wasp-home")).unwrap();
+        std::fs::write(base.join("wasp-home").join("keep"), b"new").unwrap();
 
         imp::rename_children(&base);
 
         // Moved, contents intact.
         assert_eq!(
-            std::fs::read(base.join("velo").join("whatsapp.db")).unwrap(),
+            std::fs::read(base.join("wasp").join("whatsapp.db")).unwrap(),
             b"store"
         );
         assert!(!base.join("oxidezap").exists());
-        assert!(base.join("velo-work").is_dir());
+        assert!(base.join("wasp-work").is_dir());
+        assert!(base.join("wasp-home").join("keep").is_file());
         // A new-named folder already there is never replaced: the old one is
         // left for a person to look at rather than merged or lost.
-        assert!(base.join("oxidezap-home").is_dir());
+        assert!(base.join("velo-home").is_dir());
 
         // Running again changes nothing.
         imp::rename_children(&base);
-        assert!(base.join("velo").join("whatsapp.db").is_file());
+        assert!(base.join("wasp").join("whatsapp.db").is_file());
         let _ = std::fs::remove_dir_all(&base);
     }
 }

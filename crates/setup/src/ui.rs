@@ -22,12 +22,12 @@ use gpui_component::{ActiveTheme as _, Icon, IconName, Root, Sizable as _, Title
 
 use crate::system::{self, Options, Step};
 
-/// Velo's green: the logo's, and the app's default accent.
+/// Wasp's green: the logo's, and the app's default accent.
 const GREEN: u32 = 0x21c063;
 const SURFACE: u32 = 0x161717;
 const CARD: u32 = 0x242626;
 
-static LOGO: &[u8] = include_bytes!("../../../packaging/branding/velo-logo-256.png");
+static LOGO: &[u8] = include_bytes!("../../../packaging/branding/wasp-logo-256.png");
 
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
@@ -60,9 +60,9 @@ pub fn run() {
                 is_resizable: false,
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some(SharedString::from(if uninstall {
-                        "Remove Velo"
+                        "Remove Wasp"
                     } else {
-                        "Velo Setup"
+                        "Wasp Setup"
                     })),
                     ..TitleBar::title_bar_options()
                 }),
@@ -79,7 +79,7 @@ pub fn run() {
         });
 }
 
-/// Dark, with Velo's green as the one accent — the app's first impression.
+/// Dark, with Wasp's green as the one accent — the app's first impression.
 fn style(cx: &mut App) {
     Theme::change(ThemeMode::Dark, None, cx);
     let theme = cx.global_mut::<Theme>();
@@ -239,11 +239,11 @@ impl Setup {
 
 fn describe(step: &Step, uninstall: bool) -> (SharedString, f32) {
     match step {
-        Step::Stopping => ("Closing Velo if it is running…".into(), 0.04),
-        Step::Copying(done) => ("Copying Velo…".into(), 0.08 + 0.80 * done),
-        Step::Shortcuts => ("Adding Velo to the Start menu…".into(), 0.92),
+        Step::Stopping => ("Closing Wasp if it is running…".into(), 0.04),
+        Step::Copying(done) => ("Copying Wasp…".into(), 0.08 + 0.80 * done),
+        Step::Shortcuts => ("Adding Wasp to the Start menu…".into(), 0.92),
         Step::Registering => ("Finishing up…".into(), 0.97),
-        Step::Removing if uninstall => ("Removing Velo…".into(), 0.6),
+        Step::Removing if uninstall => ("Removing Wasp…".into(), 0.6),
         Step::Removing => ("Tidying up…".into(), 0.6),
     }
 }
@@ -258,18 +258,18 @@ impl Render for Setup {
                 .flex_col()
                 .gap(px(14.0))
                 .child(heading(if self.uninstall {
-                    "Removing Velo"
+                    "Removing Wasp"
                 } else if self.existing.is_some() {
-                    "Updating Velo"
+                    "Updating Wasp"
                 } else {
-                    "Installing Velo"
+                    "Installing Wasp"
                 }))
                 .child(Progress::new("progress").value(fraction * 100.0))
                 .child(div().text_sm().text_color(muted).child(line.clone()))
                 .into_any_element(),
             Screen::Done => outcome(
                 IconName::CircleCheck,
-                "Velo is ready",
+                "Wasp is ready",
                 if self.signed_in {
                     "You're still signed in. Your chats are right where you left them."
                 } else {
@@ -281,7 +281,7 @@ impl Render for Setup {
                 Button::new("open")
                     .primary()
                     .large()
-                    .label("Open Velo")
+                    .label("Open Wasp")
                     .on_click(|_, _, cx| {
                         system::launch();
                         cx.quit();
@@ -311,7 +311,7 @@ impl Render for Setup {
             Screen::ConfirmRemove => self.confirm_remove(cx).into_any_element(),
             Screen::Removed => outcome(
                 IconName::CircleCheck,
-                "Velo has been removed",
+                "Wasp has been removed",
                 if self.remove_data {
                     "Its data on this PC is gone too. Your chats are still on your phone."
                 } else {
@@ -356,7 +356,7 @@ impl Render for Setup {
                                         div()
                                             .text_size(px(28.0))
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .child("Velo"),
+                                            .child("Wasp"),
                                     )
                                     .child(div().text_sm().text_color(muted).child(format!(
                                         "WhatsApp, at home on Windows · v{}",
@@ -389,13 +389,13 @@ impl Setup {
             .flex_col()
             .gap(px(18.0))
             .child(heading(if updating {
-                "Update Velo"
+                "Update Wasp"
             } else {
-                "Install Velo"
+                "Install Wasp"
             }))
             .child(
                 div().text_sm().text_color(muted).child(if updating {
-                    "Your chats and sign-in stay exactly where they are. Velo restarts on the new version."
+                    "Your chats and sign-in stay exactly where they are. Wasp restarts on the new version."
                 } else {
                     "A fast, native WhatsApp client for Windows. Installs for you only — no administrator needed."
                 }),
@@ -419,7 +419,7 @@ impl Setup {
                     )
                     .child(
                         Checkbox::new("signin")
-                            .label("Start Velo when I sign in, so messages and calls reach me")
+                            .label("Start Wasp when I sign in, so messages and calls reach me")
                             .checked(self.start_at_sign_in)
                             .on_click(cx.listener(|setup, checked: &bool, _, cx| {
                                 setup.start_at_sign_in = *checked;
@@ -428,7 +428,7 @@ impl Setup {
                     )
                     .child(
                         Checkbox::new("open")
-                            .label("Open Velo when setup finishes")
+                            .label("Open Wasp when setup finishes")
                             .checked(self.open_when_done)
                             .on_click(cx.listener(|setup, checked: &bool, _, cx| {
                                 setup.open_when_done = *checked;
@@ -470,14 +470,14 @@ impl Setup {
             .flex()
             .flex_col()
             .gap(px(18.0))
-            .child(heading("Remove Velo?"))
+            .child(heading("Remove Wasp?"))
             .child(div().text_sm().text_color(muted).child(
-                "Velo will be closed and taken off this PC. Your WhatsApp account and chats stay on your phone.",
+                "Wasp will be closed and taken off this PC. Your WhatsApp account and chats stay on your phone.",
             ))
             .child(
                 div().p(px(18.0)).rounded(px(14.0)).bg(card).child(
                     Checkbox::new("data")
-                        .label("Also delete Velo's data on this PC — the chat cache, media and sign-in")
+                        .label("Also delete Wasp's data on this PC — the chat cache, media and sign-in")
                         .checked(self.remove_data)
                         .on_click(cx.listener(|setup, checked: &bool, _, cx| {
                             setup.remove_data = *checked;
@@ -492,7 +492,7 @@ impl Setup {
                     .large()
                     .label("Remove")
                     .on_click(cx.listener(|setup, _, _, cx| setup.start(cx))),
-                Some(Button::new("keep").ghost().large().label("Keep Velo").on_click(
+                Some(Button::new("keep").ghost().large().label("Keep Wasp").on_click(
                     |_, _, cx| cx.quit(),
                 )),
             ))

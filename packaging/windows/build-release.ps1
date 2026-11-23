@@ -1,10 +1,10 @@
-# Build Velo's Windows release: the program, then the installer around it.
+# Build Wasp's Windows release: the program, then the installer around it.
 #
 #   pwsh packaging/windows/build-release.ps1
 #
 # Produces, in dist/:
-#   Velo-Setup-<version>-x64.exe   the installer (and uninstaller)
-#   Velo-<version>-x64-portable.zip the same program, unzip-and-run
+#   Wasp-Setup-<version>-x64.exe   the installer (and uninstaller)
+#   Wasp-<version>-x64-portable.zip the same program, unzip-and-run
 #   SHA256SUMS.txt                 checksums for both
 #
 # Signing is optional and happens when a certificate is named: by
@@ -37,39 +37,39 @@ $root = Resolve-Path (Join-Path $PSScriptRoot '..\..')
 Set-Location $root
 
 $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-Write-Host "Velo $version"
+Write-Host "Wasp $version"
 
-& $Cargo build --release @extra -p velo-gui -p velo-daemon -p velo-cli
-if ($LASTEXITCODE -ne 0) { throw 'building Velo failed' }
+& $Cargo build --release @extra -p velo-gui -p velo-daemon -p wasp-cli
+if ($LASTEXITCODE -ne 0) { throw 'building Wasp failed' }
 
-$payload = Join-Path $root 'target\velo-payload'
+$payload = Join-Path $root 'target\wasp-payload'
 Remove-Item -Recurse -Force $payload -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $payload | Out-Null
-foreach ($exe in 'velo.exe', 'velod.exe', 'velo-cli.exe') {
+foreach ($exe in 'wasp.exe', 'waspd.exe', 'wasp-cli.exe') {
     Copy-Item (Join-Path $root "target\release\$exe") $payload
 }
 Copy-Item (Join-Path $root 'packaging\release\LICENSE.txt') $payload
 Copy-Item (Join-Path $root 'packaging\release\THIRD-PARTY-NOTICES.txt') $payload
 Sign-Files @(
-    (Join-Path $payload 'velo.exe'),
-    (Join-Path $payload 'velod.exe'),
-    (Join-Path $payload 'velo-cli.exe')
+    (Join-Path $payload 'wasp.exe'),
+    (Join-Path $payload 'waspd.exe'),
+    (Join-Path $payload 'wasp-cli.exe')
 )
 
-$env:VELO_PAYLOAD_DIR = $payload
+$env:WASP_PAYLOAD_DIR = $payload
 try {
-    & $Cargo build --release @extra -p velo-setup
+    & $Cargo build --release @extra -p wasp-setup
     if ($LASTEXITCODE -ne 0) { throw 'building the installer failed' }
 } finally {
-    Remove-Item Env:\VELO_PAYLOAD_DIR
+    Remove-Item Env:\WASP_PAYLOAD_DIR
 }
 
 $dist = Join-Path $root 'dist'
 New-Item -ItemType Directory -Force $dist | Out-Null
-$setup = Join-Path $dist "Velo-Setup-$version-x64.exe"
-Copy-Item (Join-Path $root 'target\release\velo-setup.exe') $setup -Force
+$setup = Join-Path $dist "Wasp-Setup-$version-x64.exe"
+Copy-Item (Join-Path $root 'target\release\wasp-setup.exe') $setup -Force
 Sign-Files @($setup)
-$zip = Join-Path $dist "Velo-$version-x64-portable.zip"
+$zip = Join-Path $dist "Wasp-$version-x64-portable.zip"
 Remove-Item $zip -ErrorAction SilentlyContinue
 Compress-Archive -Path (Join-Path $payload '*') -DestinationPath $zip
 

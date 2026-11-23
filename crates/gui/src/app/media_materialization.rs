@@ -176,7 +176,6 @@ impl WhatsAppApp {
 
     fn materialization_owner(&self, cx: &App) -> Option<Owner> {
         if self.showing_settings(cx)
-            || self.paste_preview_showing()
             || !matches!(
                 self.app_state,
                 AppState::Connected | AppState::Offline | AppState::OfflineLoggedOut { .. }
@@ -333,11 +332,20 @@ impl WhatsAppApp {
                                 .as_mut()
                                 .expect("recipient checked immediately above");
                             if recipient.preview {
-                                media.preview_cache_key = None;
-                                media.data = Arc::clone(&bytes);
+                                // A thumbnail read back from the cache is
+                                // still a preview: keep its key so a later
+                                // release can hydrate it again, and keep the
+                                // metadata that says it is not the full file.
+                                media.adopt_server_preview(Arc::clone(&bytes));
+                                media.preview_cache_key = Some(target.key.clone());
                             } else {
-                                media.cache_key = None;
+                                // The full bytes arrived from the cache, so
+                                // this row can come back from it after the
+                                // sweep releases them. Dropping the key here
+                                // was what turned every re-opened conversation
+                                // into a row offering a download.
                                 media.adopt_full_bytes(Arc::clone(&bytes));
+                                media.cache_key = Some(target.key.clone());
                             }
                             app.decoded_images.borrow_mut().shift_remove(&recipient.id);
                             app.sticker_validation
@@ -550,7 +558,10 @@ mod tests {
                     assert!(media.data_is_preview);
                     assert_eq!(media.mime_type, "image/jpeg");
                     assert!(media.downloadable.is_none());
-                    assert!(media.preview_cache_key.is_none());
+                    assert!(
+                        media.preview_cache_key.is_some(),
+                        "a preview that came from the cache still has a key"
+                    );
                 } else {
                     assert!(media.data.is_empty());
                     assert!(media.preview_cache_key.is_some());
@@ -739,8 +750,18 @@ mod tests {
                 let media = app.chats[0].messages[0].media.as_ref().unwrap();
                 assert_eq!(media.mime_type, "image/webp");
                 assert!(!media.data_is_preview && !media.data_is_server_preview);
-                assert!(media.cache_key.is_none() && media.preview_cache_key.is_none());
-                assert_eq!(media.data.len(), if race { 1 } else { 1024 * 1024 });
+                assert!(media.preview_cache_key.is_none());
+                if race {
+                    // An explicit download replaced the row while the cache
+                    // read was in flight; the stale read may not overwrite it.
+                    assert!(media.cache_key.is_none());
+                    assert_eq!(media.data.as_slice(), &[9]);
+                } else {
+                    // Hydration keeps the key, so the sweep can release these
+                    // bytes and the row can come back without a tap.
+                    assert_eq!(media.cache_key.as_deref(), Some("full"));
+                    assert_eq!(media.data.len(), 1024 * 1024);
+                }
             });
         }
         assert_eq!(cache.reads.load(Ordering::Relaxed), 2);

@@ -233,6 +233,11 @@ pub struct MediaContent {
     /// Duration in seconds (for audio/video)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_secs: Option<u32>,
+    /// Whether a video is an animated GIF. WhatsApp sends these as MP4s with
+    /// `gif_playback`; the player loops them without sound or transport
+    /// chrome rather than treating them as a film.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_gif: bool,
     /// Whether `data` holds only a fallback thumbnail (eager download of the
     /// full media failed), so the renderer keeps offering the real download
     #[serde(default, skip_serializing_if = "is_false")]
@@ -314,6 +319,7 @@ impl MediaContent {
             file_name: None,
             downloadable: None,
             is_animated: false,
+            is_gif: false,
             duration_secs: None,
             data_is_preview: false,
             waveform: None,
@@ -362,6 +368,14 @@ impl MediaContent {
             duration_secs,
             data_is_preview,
             ..Self::of(MediaType::Video, poster, "image/jpeg".to_string())
+        }
+    }
+
+    /// A video that WhatsApp sent as an animated GIF.
+    pub fn gif(poster: Arc<Vec<u8>>, duration_secs: Option<u32>) -> Self {
+        Self {
+            is_gif: true,
+            ..Self::video(poster, duration_secs)
         }
     }
 
@@ -691,6 +705,14 @@ mod tests {
         assert!(poster.data_is_preview, "a poster frame is not the video");
         // No poster and no bytes: nothing is standing in for anything.
         assert!(!MediaContent::video(Arc::new(Vec::new()), None).data_is_preview);
+        assert!(!poster.is_gif, "an ordinary video is not an animation");
+        let gif = MediaContent::gif(Arc::new(vec![1]), Some(4));
+        assert!(gif.is_gif, "a GIF is the animation, not a film");
+        assert_eq!(gif.media_type, MediaType::Video);
+        assert!(
+            gif.data_is_preview,
+            "its first frame is what the card draws"
+        );
     }
 
     /// These types *are* the wire format — `ipc` adds framing and nothing else

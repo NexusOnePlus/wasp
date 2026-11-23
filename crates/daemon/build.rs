@@ -21,21 +21,21 @@ fn main() {
     // On Windows: the same icon and version block as the window, so the
     // background process is named in Task Manager rather than listed bare.
     embed_windows_resources(
-        "../../packaging/windows/velo.ico",
-        "Velo background service",
-        "velod.exe",
+        "../../packaging/windows/wasp.ico",
+        "Wasp background service",
+        "waspd.exe",
     );
-    println!("cargo:rerun-if-changed=velod.plist");
+    println!("cargo:rerun-if-changed=waspd.plist");
     // The *target* OS: a build script runs on the host, and cross-compiling
     // for macOS from anything else must still embed it.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
     let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") else {
-        println!("cargo:warning=no manifest directory; velod will ship without its Info.plist");
+        println!("cargo:warning=no manifest directory; waspd will ship without its Info.plist");
         return;
     };
-    let plist = std::path::Path::new(&manifest).join("velod.plist");
+    let plist = std::path::Path::new(&manifest).join("waspd.plist");
     println!(
         "cargo:rustc-link-arg-bins=-Wl,-sectcreate,__TEXT,__info_plist,{}",
         plist.display()

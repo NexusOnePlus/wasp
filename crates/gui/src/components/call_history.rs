@@ -341,9 +341,27 @@ impl Render for CallHistory {
                     .px(metrics.space_xl())
                     .child(
                         div()
-                            .text_size(metrics.text_title())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Calls"),
+                            .flex()
+                            .items_center()
+                            .gap(metrics.space_sm())
+                            .child({
+                                let back = self.owner.clone();
+                                Button::new("calls-back")
+                                    .icon(IconName::ArrowLeft)
+                                    .ghost()
+                                    .small()
+                                    .tooltip("Back to chats")
+                                    .on_click(move |_, _, cx| {
+                                        let _ =
+                                            back.update(cx, |app, cx| app.close_full_screen(cx));
+                                    })
+                            })
+                            .child(
+                                div()
+                                    .text_size(metrics.text_title())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Calls"),
+                            ),
                     )
                     .child(
                         Button::new("calls-sync")

@@ -1,7 +1,7 @@
-Velo — third-party notices
+Wasp — third-party notices
 ==========================
 
-Velo is built with the open-source libraries listed below. Each is used
+Wasp is built with the open-source libraries listed below. Each is used
 under its licence; the licence texts follow the list. Libraries under the
 Mozilla Public License 2.0 (MPL-2.0) are used unmodified; their source code
 is available from crates.io and from the repository listed beside each.

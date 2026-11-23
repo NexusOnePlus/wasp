@@ -1,7 +1,7 @@
 //! A host to test a plugin's handlers against, without a daemon.
 //!
 //! A plugin's imports resolve against the sandbox, so its handlers can only
-//! run inside `velod` — which means the only way to see whether one
+//! run inside `waspd` — which means the only way to see whether one
 //! answers the right message was to build for wasm32, copy a file and read a
 //! log. That is a long way to go to find out that a keyword match is
 //! case-sensitive.

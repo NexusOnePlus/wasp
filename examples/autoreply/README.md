@@ -1,6 +1,6 @@
 # autoreply
 
-An example Velo plugin. It answers messages containing a keyword, and puts
+An example Wasp plugin. It answers messages containing a keyword, and puts
 its own settings on the Settings screen.
 
 ```bash
@@ -16,10 +16,10 @@ mkdir -p ~/.local/share/velo/plugins
 cp "$module" ~/.local/share/velo/plugins/
 ```
 
-Restart `velod`. The file's name is the plugin's id, so the copy above
+Restart `waspd`. The file's name is the plugin's id, so the copy above
 loads as `autoreply`.
 
-Set `VELO_PLUGIN_DIR` to load from somewhere else, which is what you want
+Set `WASP_PLUGIN_DIR` to load from somewhere else, which is what you want
 while writing one.
 
 ## Testing it

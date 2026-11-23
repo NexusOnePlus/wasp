@@ -11,10 +11,10 @@ use windows_registry::CURRENT_USER;
 use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT, SND_SYNC};
 use windows_sys::Win32::UI::Shell::{QUNS_ACCEPTS_NOTIFICATIONS, SHQueryUserNotificationState};
 
-pub const APP_ID: &str = "io.github.RuchinAudichya.Velo";
-const PREFS: &str = r"Software\Velo";
+pub const APP_ID: &str = "io.github.NexusOnePlus.Wasp";
+const PREFS: &str = r"Software\Wasp";
 const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const STARTUP_NAME: &str = "Velo";
+const STARTUP_NAME: &str = "Wasp";
 const SOUND_NAME: &str = "MessageSound";
 const VOLUME_NAME: &str = "ChimeVolume";
 const DEFAULT_VOLUME: u32 = 80;
@@ -34,7 +34,7 @@ pub fn set_start_at_sign_in(enabled: bool, daemon: &Path) -> Result<(), String> 
         .map_err(|error| error.to_string())?;
     if enabled {
         if !daemon.is_file() {
-            return Err("The Velo background executable is missing.".into());
+            return Err("The Wasp background executable is missing.".into());
         }
         key.set_string(STARTUP_NAME, format!("\"{}\"", daemon.display()))
             .map_err(|error| error.to_string())
@@ -176,22 +176,22 @@ fn claim_chime_slot() -> bool {
     true
 }
 
-/// The logo a toast shows beside "Velo", and Settings beside the app's
+/// The logo a toast shows beside "Wasp", and Settings beside the app's
 /// notification switch.
-const LOGO: &[u8] = include_bytes!("../../../packaging/windows/velo.png");
+const LOGO: &[u8] = include_bytes!("../../../packaging/windows/wasp.png");
 
 pub fn notifier() -> windows::core::Result<ToastNotifier> {
     register_identity()?;
     ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))
 }
 
-/// Tell Windows what Velo's notifications are called and what they look
+/// Tell Windows what Wasp's notifications are called and what they look
 /// like. Done when a notifier is made, and up front by the daemon and the
 /// installer, so the very first toast — and Settings' notification list —
 /// already carry the name and logo.
 pub fn register_identity() -> windows::core::Result<()> {
     let key = CURRENT_USER.create(format!(r"Software\Classes\AppUserModelId\{APP_ID}"))?;
-    key.set_string("DisplayName", "Velo")?;
+    key.set_string("DisplayName", "Wasp")?;
     // An unpackaged app has no manifest to carry its logo, so Windows reads
     // it from this file path instead; without one, every toast shows a
     // blank square. A failure to write it costs the picture, not the toast.
@@ -204,7 +204,7 @@ pub fn register_identity() -> windows::core::Result<()> {
     Ok(())
 }
 
-/// The logo, written where Windows can read it: beside Velo's data, and
+/// The logo, written where Windows can read it: beside Wasp's data, and
 /// rewritten only when this build carries a different one.
 fn logo_file() -> Option<std::path::PathBuf> {
     let dir =
@@ -227,7 +227,7 @@ pub fn test_message_alert() -> Result<(), String> {
         return Err(reason.to_owned());
     }
 
-    let notice = toast("Velo", "Your Windows notification test is working.")
+    let notice = toast("Wasp", "Your Windows notification test is working.")
         .map_err(|error| error.to_string())?;
     notifier.Show(&notice).map_err(|error| error.to_string())?;
     chime_for(&notifier);
@@ -241,12 +241,12 @@ fn notification_block_reason(setting: NotificationSetting) -> Option<&'static st
             Some("Turn on Notifications in Windows Settings → System → Notifications.")
         }
         NotificationSetting::DisabledForApplication => {
-            Some("Turn on Velo in Windows Settings → System → Notifications.")
+            Some("Turn on Wasp in Windows Settings → System → Notifications.")
         }
         NotificationSetting::DisabledByGroupPolicy => {
             Some("A Windows administrator policy blocks notifications on this device.")
         }
-        _ => Some("Windows is blocking Velo notifications."),
+        _ => Some("Windows is blocking Wasp notifications."),
     }
 }
 
@@ -315,7 +315,7 @@ mod tests {
         let individual =
             notification_block_reason(NotificationSetting::DisabledForApplication).unwrap();
         assert!(global.contains("Turn on Notifications"));
-        assert!(individual.contains("Turn on Velo"));
+        assert!(individual.contains("Turn on Wasp"));
         assert!(notification_block_reason(NotificationSetting::DisabledByGroupPolicy).is_some());
         assert!(notification_block_reason(NotificationSetting(i32::MAX)).is_some());
     }

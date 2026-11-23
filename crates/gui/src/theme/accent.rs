@@ -18,7 +18,7 @@ pub enum Accent {
     /// The messenger green. The default, and what every chat looks like on
     /// the phone.
     Green,
-    /// Velo's own violet, from the logo.
+    /// Wasp's own violet, from the logo.
     Violet,
     /// The logo's ultramarine.
     Blue,
@@ -47,7 +47,7 @@ impl Accent {
     pub fn label(self) -> &'static str {
         match self {
             Self::Green => "Green",
-            Self::Violet => "Velo violet",
+            Self::Violet => "Wasp violet",
             Self::Blue => "Ultramarine",
             Self::Coral => "Coral",
         }

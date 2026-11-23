@@ -1309,17 +1309,19 @@ impl WhatsAppApp {
                 }
             }
             KeyboardOwner::PastePreview => {
-                // Put typing immediately into the caption after Ctrl-V. The
-                // modal's outer focus trap still owns Escape and Tab; the
-                // inner input is the focus target, not the scrim behind it.
-                if let Some(caption) = self
-                    .paste_preview
-                    .as_ref()
-                    .and_then(|preview| preview.caption.as_ref())
-                {
-                    window.focus(&caption.read(cx).focus_handle(cx), cx);
+                // The caption is the main composer now: typing continues
+                // where the reader already was, and Enter sends the files.
+                if let Some(input) = self.input_area.clone() {
+                    window.focus(&input.read(cx).focus_handle(cx), cx);
                 } else {
                     window.focus(&self.paste_preview_focus, cx);
+                }
+            }
+            KeyboardOwner::Palette => {
+                if let Some(input) = self.palette.input.as_ref() {
+                    window.focus(&input.read(cx).focus_handle(cx), cx);
+                } else {
+                    window.focus(&self.root_focus, cx);
                 }
             }
             KeyboardOwner::Viewer => {
@@ -1440,6 +1442,7 @@ fn keyboard_owner_for(
         None if surfaces.message_delete => KeyboardOwner::MessageDelete,
         None if surfaces.message_edit => KeyboardOwner::MessageEdit,
         None if surfaces.paste_preview => KeyboardOwner::PastePreview,
+        None if surfaces.palette => KeyboardOwner::Palette,
         None if surfaces.viewer => KeyboardOwner::Viewer,
         None if showing_settings => KeyboardOwner::Screen,
         // Where both are drawn, the gesture decides. A chat opened to be
@@ -1514,6 +1517,7 @@ mod keyboard_owner_tests {
         composer: false,
         viewer: false,
         paste_preview: false,
+        palette: false,
         message_edit: false,
         message_delete: false,
         call_card: false,
@@ -1538,6 +1542,7 @@ mod keyboard_owner_tests {
             composer: true,
             viewer: true,
             paste_preview: true,
+            palette: true,
             message_edit: false,
             message_delete: false,
             call_card: true,
@@ -1556,11 +1561,21 @@ mod keyboard_owner_tests {
                 paste_preview: false,
                 ..all
             }),
-            KeyboardOwner::Viewer,
-            "the media viewer is next when no paste preview is open"
+            KeyboardOwner::Palette,
+            "the command bar is next when no paste preview is open"
         );
         assert_eq!(
             owner(KeyboardSurfaces {
+                palette: false,
+                paste_preview: false,
+                ..all
+            }),
+            KeyboardOwner::Viewer,
+            "the media viewer is next when no palette is open"
+        );
+        assert_eq!(
+            owner(KeyboardSurfaces {
+                palette: false,
                 viewer: false,
                 paste_preview: false,
                 ..all

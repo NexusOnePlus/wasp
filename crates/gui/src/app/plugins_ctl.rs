@@ -674,7 +674,7 @@ impl WhatsAppApp {
     ///
     /// Every front end may ask, and that is not a loose end: the folder is
     /// the daemon's, so a desktop window asking is somebody who has just
-    /// dropped a `.wasm` beside `velod`, and a tab that holds no session
+    /// dropped a `.wasm` beside `waspd`, and a tab that holds no session
     /// asking is somebody who installed one into an origin whose host is
     /// another tab. Neither could do anything about it before but restart the
     /// thing holding the account.

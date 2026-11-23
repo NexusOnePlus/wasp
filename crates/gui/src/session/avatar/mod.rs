@@ -806,7 +806,7 @@ mod tests {
     #[cfg(not(target_family = "wasm"))]
     #[test]
     fn native_cache_recovers_after_remount_eviction_and_corruption() {
-        const ROOT: &str = "VELO_AVATAR_TEST_ROOT";
+        const ROOT: &str = "WASP_AVATAR_TEST_ROOT";
         let Some(root) = std::env::var_os(ROOT) else {
             let root =
                 std::env::temp_dir().join(format!("velo-avatar-lifecycle-{}", std::process::id()));
@@ -820,7 +820,7 @@ mod tests {
                 .env(ROOT, &root)
                 .env("XDG_RUNTIME_DIR", &root)
                 .env("LOCALAPPDATA", &root)
-                .env("VELO_ACCOUNT", "avatar-fixture")
+                .env("WASP_ACCOUNT", "avatar-fixture")
                 .status()
                 .unwrap();
             let _ = std::fs::remove_dir_all(root);

@@ -7,7 +7,7 @@
 //!
 //! Nothing about it is a stub any more. It used to be — a page held no
 //! session, so it opened no device — and the sentence that justified that is
-//! still true of a page attached to an `velod`. What changed is that a
+//! still true of a page attached to an `waspd`. What changed is that a
 //! page can hold the session itself, and the process that owns the session
 //! owns the microphone whichever process that is.
 //!

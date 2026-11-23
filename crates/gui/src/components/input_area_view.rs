@@ -3,13 +3,14 @@
 //! This component is designed for performance: when the user types,
 //! only this component re-renders, NOT the parent app.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use wacore::time::Instant;
 
 use gpui::{
-    App, Entity, EntityInputHandler as _, EventEmitter, Focusable as _, Task, WeakEntity, Window,
-    div, prelude::*,
+    App, Entity, EntityInputHandler as _, EventEmitter, Focusable as _, SharedString,
+    StyledImage as _, Subscription, Task, WeakEntity, Window, div, prelude::*,
 };
 use gpui_component::{
     ActiveTheme, Disableable as _, Icon, IconName, Sizable as _,
@@ -18,15 +19,27 @@ use gpui_component::{
     menu::{DropdownMenu as _, PopupMenuItem},
 };
 
-use crate::components::{ProductIcon, parts};
+use crate::components::{Avatar, ProductIcon, parts};
 use crate::platform::picker::AttachmentCategory;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 
 /// Events emitted by the input area to communicate with the parent app.
 #[derive(Clone, Debug)]
 pub enum InputAreaEvent {
-    /// User wants to send the current message
-    SendMessage(String),
+    /// User wants to send the current message.
+    ///
+    /// `text` is what the composer showed, for the local bubble; `wire_text`
+    /// has every `@name` turned back into the address WhatsApp marks, which
+    /// is what the recipient resolves against `mentions`.
+    SendMessage {
+        text: String,
+        wire_text: String,
+        mentions: Vec<String>,
+        /// The card the composer already read for the first address in the
+        /// text, when it finished in time. The send path reuses it instead of
+        /// reading the page twice.
+        link_preview: Option<velo_core::LinkPreview>,
+    },
     /// User picked an attachment category from the composer menu.
     ///
     /// Which conversation is the app's to know, and the files are chosen
@@ -48,6 +61,25 @@ pub enum InputAreaEvent {
     /// User dropped the reply they were composing.
     CancelReply,
     CancelEdit,
+    /// A GIF chosen in the picker, already downloaded as the MP4 WhatsApp
+    /// plays. The app puts it through the same confirmation as a pasted file.
+    SendGif {
+        bytes: Arc<Vec<u8>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PickerTab {
+    Emoji,
+    Gif,
+}
+
+/// One KLIPY result, with the animated preview once it has been fetched.
+#[derive(Clone)]
+struct GifPreview {
+    result: crate::platform::gif::GifResult,
+    image: Option<crate::retained_image::RetainedImage>,
+    animated: bool,
 }
 
 /// Typing indicator state with debouncing.
@@ -108,6 +140,141 @@ impl From<ReplyDraft> for velo_core::QuotedMessage {
     }
 }
 
+/// One person the composer may `@`-mention.
+///
+/// Built by the app from the group roster: it is the roster that knows who is
+/// in the group, and the app that knows what each of them is called and which
+/// picture to draw. The composer only filters and inserts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MentionMember {
+    /// The address as the group calls them, which is what goes on the wire.
+    pub jid: String,
+    /// What the picker draws: the saved name, their push name, an `@handle`,
+    /// or the number when nothing else is known.
+    pub label: String,
+    /// Cache key of the avatar, when one has arrived.
+    pub picture: Option<String>,
+    /// The row that mentions the whole group.
+    pub is_all: bool,
+}
+
+impl MentionMember {
+    /// What the reader sees after picking them.
+    fn display_token(&self) -> String {
+        if self.is_all {
+            "@all ".to_string()
+        } else {
+            format!("@{} ", self.label)
+        }
+    }
+
+    /// What the wire must carry in the text: `@` plus the user part, which is
+    /// how WhatsApp marks the token. `@all` has no user part and stays as it
+    /// is; the recipients are named in the mention list.
+    fn wire_token(&self) -> Option<String> {
+        if self.is_all {
+            return None;
+        }
+        let user = self
+            .jid
+            .split('@')
+            .next()
+            .unwrap_or(&self.jid)
+            .split(':')
+            .next()
+            .unwrap_or(&self.jid);
+        Some(format!("@{user}"))
+    }
+}
+
+/// The `@` token being typed, and where it starts.
+#[derive(Clone, Debug)]
+struct MentionQuery {
+    /// Byte offset of the `@` in the composer text.
+    start: usize,
+    /// What follows it up to the caret.
+    text: String,
+}
+
+/// Read the `@` token that ends at `cursor`, if the caret is inside one.
+///
+/// The `@` has to begin a word and the token has to be one unbroken run: a
+/// space or a second `@` ends it, which is what makes "mail me at a@b" not
+/// open a member picker. The length cap keeps a pasted wall of text from
+/// matching anything.
+fn mention_query_at(text: &str, cursor: usize) -> Option<MentionQuery> {
+    let cursor = cursor.min(text.len());
+    let head = text.get(..cursor)?;
+    let start = head.rfind('@')?;
+    let starts_a_word = start == 0
+        || head[..start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace);
+    if !starts_a_word {
+        return None;
+    }
+    let query = &head[start + 1..];
+    if query.contains(char::is_whitespace) || query.contains('@') || query.chars().count() > 24 {
+        return None;
+    }
+    Some(MentionQuery {
+        start,
+        text: query.to_string(),
+    })
+}
+
+/// Turn the labels the composer drew back into what the wire expects.
+///
+/// The reader sees `@Ana`; WhatsApp marks the token by the address's user
+/// part and resolves the display name on the other side. `@all` has no user
+/// part, so its text stays and the mention list names everyone instead. A
+/// label whose token the reader deleted is not mentioned.
+fn wire_mentions(
+    text: &str,
+    inserted: &[MentionMember],
+    everyone: &[String],
+) -> (String, Vec<String>) {
+    if inserted.is_empty() {
+        return (text.to_string(), Vec::new());
+    }
+    let mut wire = text.to_string();
+    let mut jids: Vec<String> = Vec::new();
+    let mut ordered: Vec<&MentionMember> = inserted.iter().collect();
+    // Longest label first: `@Ana Maria` must not be consumed as `@Ana`
+    // followed by the rest of her name.
+    ordered.sort_by_key(|member| std::cmp::Reverse(member.label.len()));
+    for member in ordered {
+        if member.is_all {
+            if wire.contains("@all") {
+                for jid in everyone {
+                    if !jids.contains(jid) {
+                        jids.push(jid.clone());
+                    }
+                }
+            }
+            continue;
+        }
+        let token = format!("@{}", member.label);
+        let Some(position) = wire.find(&token) else {
+            continue;
+        };
+        let after = wire[position + token.len()..].chars().next();
+        if after.is_some_and(|next| {
+            !(next.is_whitespace() || matches!(next, ',' | '.' | '!' | '?' | ';' | ':' | ')'))
+        }) {
+            continue;
+        }
+        if let Some(wire_token) = member.wire_token() {
+            wire.replace_range(position..position + token.len(), &wire_token);
+        }
+        if !jids.contains(&member.jid) {
+            jids.push(member.jid.clone());
+        }
+    }
+    (wire, jids)
+}
+
 /// How far the field grows before it starts scrolling instead.
 ///
 /// Five lines is the design's number, and it is about where a composer stops
@@ -123,7 +290,24 @@ pub struct InputAreaView {
     /// not always one, and the design asks it to grow with what is typed.
     input: Entity<TextareaState>,
     emoji_open: bool,
+    picker_tab: PickerTab,
     emoji_search: Entity<InputState>,
+    gif_search: Entity<InputState>,
+    gif_results: Vec<GifPreview>,
+    gif_loading: bool,
+    gif_error: Option<String>,
+    gif_task: Option<Task<()>>,
+    /// The first address in the composer and the card read for it.
+    ///
+    /// Prefetched while the person is still typing, so pressing send can use
+    /// a card that is already in hand instead of racing a second fetch.
+    draft_link_url: Option<String>,
+    draft_link_preview: Option<velo_core::LinkPreview>,
+    draft_link_pending: bool,
+    /// Debounce before the address is read.
+    link_probe_task: Option<Task<()>>,
+    /// The read itself, kept so a changed address cancels the old one.
+    link_fetch_task: Option<Task<()>>,
     language: crate::i18n::Language,
     /// Whether PTT recording is active
     is_recording: bool,
@@ -152,6 +336,27 @@ pub struct InputAreaView {
     /// configured and closed, real work, on every render of the composer,
     /// for a value that cannot change while the tab is open.
     can_record: bool,
+    /// Everyone the `@` picker can offer, from the open group's roster.
+    mention_members: Vec<MentionMember>,
+    /// The addresses `@all` stands for: the group, minus this account.
+    mention_everyone: Vec<String>,
+    /// The `@` token under the caret, when the picker is open.
+    mention_query: Option<MentionQuery>,
+    /// Which filtered row the keyboard is on.
+    mention_index: usize,
+    /// Members whose display token was inserted, so send can turn the label
+    /// back into the address WhatsApp marks and list them as mentioned.
+    inserted_mentions: Vec<MentionMember>,
+    /// Scroll position of the member list, so arrow navigation keeps the
+    /// highlighted row visible without moving the conversation behind it.
+    mention_scroll: gpui::ScrollHandle,
+    /// Intercepts the keys the picker owns while it is open.
+    ///
+    /// A textarea binds Up/Down/Enter to its own actions, and key listeners
+    /// run only after those bindings, so the picker has to see the stroke
+    /// earlier than a listener would. The subscription also ends with the
+    /// view, which a detached interceptor would not.
+    _mention_keys: Subscription,
 }
 
 impl EventEmitter<InputAreaEvent> for InputAreaView {}
@@ -189,9 +394,61 @@ impl InputAreaView {
         let emoji_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search emoji…"));
         cx.subscribe(&emoji_search, |_, _, _: &InputEvent, cx| cx.notify())
             .detach();
+        let gif_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search KLIPY"));
+        cx.subscribe(&gif_search, |view, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                view.queue_gif_search(cx);
+            }
+        })
+        .detach();
+        let mention_owner = cx.entity().downgrade();
+        let mention_keys = cx.intercept_keystrokes(move |event, window, cx| {
+            let key = event.keystroke.key.as_str();
+            if !matches!(key, "up" | "down" | "enter" | "tab" | "escape") {
+                return;
+            }
+            let Some(view) = mention_owner.upgrade() else {
+                return;
+            };
+            let handled = view.update(cx, |view, cx| {
+                if view.mention_query.is_none() || !view.focus_handle(cx).is_focused(window) {
+                    return false;
+                }
+                match key {
+                    "up" => {
+                        view.mention_index = view.mention_index.saturating_sub(1);
+                        view.scroll_mention_into_view();
+                    }
+                    "down" => {
+                        let last = view.mention_results().len().saturating_sub(1);
+                        view.mention_index = (view.mention_index + 1).min(last);
+                        view.scroll_mention_into_view();
+                    }
+                    "enter" | "tab" => view.accept_mention(window, cx),
+                    "escape" => view.close_mentions(cx),
+                    _ => return false,
+                }
+                cx.notify();
+                true
+            });
+            if handled {
+                cx.stop_propagation();
+            }
+        });
         Self {
             emoji_open: false,
+            picker_tab: PickerTab::Emoji,
             emoji_search,
+            gif_search,
+            gif_results: Vec::new(),
+            gif_loading: false,
+            gif_error: None,
+            gif_task: None,
+            draft_link_url: None,
+            draft_link_preview: None,
+            draft_link_pending: false,
+            link_probe_task: None,
+            link_fetch_task: None,
             input,
             language: crate::i18n::Language::current(),
             is_recording: false,
@@ -210,6 +467,13 @@ impl InputAreaView {
             // to send what it encodes: a daemon over the bridge, the tab
             // holding the account, or the page's own session.
             can_record: velo_audio::can_record(),
+            mention_members: Vec::new(),
+            mention_everyone: Vec::new(),
+            mention_query: None,
+            mention_index: 0,
+            inserted_mentions: Vec::new(),
+            mention_scroll: gpui::ScrollHandle::new(),
+            _mention_keys: mention_keys,
         }
     }
 
@@ -223,11 +487,17 @@ impl InputAreaView {
     ) {
         match event {
             InputEvent::PressEnter { shift: false, .. } => {
-                self.submit_input(window, cx);
+                if self.mention_query.is_some() {
+                    self.accept_mention(window, cx);
+                } else {
+                    self.submit_input(window, cx);
+                }
             }
             InputEvent::Change => {
                 // Handle typing indicator - minimal work, no notify
                 self.on_keystroke(cx);
+                self.refresh_mention_query(cx);
+                self.queue_draft_link_probe(cx);
             }
             _ => {}
         }
@@ -313,6 +583,161 @@ impl InputAreaView {
         self.typing_monitor_task = None;
     }
 
+    /// Install the open group's mention candidates, and the addresses `@all`
+    /// stands for. The roster can arrive after the chat opens, so this is
+    /// called again on every update; only a different conversation resets
+    /// what was already inserted.
+    pub fn set_mentions(
+        &mut self,
+        members: Vec<MentionMember>,
+        everyone: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.mention_members = members;
+        self.mention_everyone = everyone;
+        if self.mention_query.is_some() {
+            self.refresh_mention_query(cx);
+        }
+        cx.notify();
+    }
+
+    /// Forget the picker and its inserted tokens, for a different recipient.
+    pub fn reset_mentions(&mut self, cx: &mut Context<Self>) {
+        self.mention_members.clear();
+        self.mention_everyone.clear();
+        self.inserted_mentions.clear();
+        self.mention_query = None;
+        self.mention_index = 0;
+        self.mention_scroll
+            .set_offset(gpui::point(gpui::px(0.0), gpui::px(0.0)));
+        cx.notify();
+    }
+
+    /// Re-read the `@` token before the caret and open, update or close the
+    /// picker accordingly.
+    fn refresh_mention_query(&mut self, cx: &mut Context<Self>) {
+        if self.mention_members.is_empty() {
+            if self.mention_query.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        let (text, cursor) = {
+            let state = self.input.read(cx);
+            (state.text().to_string(), state.cursor())
+        };
+        let Some(query) = mention_query_at(&text, cursor) else {
+            self.close_mentions(cx);
+            return;
+        };
+        let unchanged = self
+            .mention_query
+            .as_ref()
+            .is_some_and(|open| open.start == query.start && open.text == query.text);
+        if unchanged {
+            return;
+        }
+        if self.mention_query.is_none() {
+            log::info!("mention picker opened (query {:?})", query.text);
+        }
+        self.mention_query = Some(query);
+        self.mention_index = 0;
+        self.mention_scroll
+            .set_offset(gpui::point(gpui::px(0.0), gpui::px(0.0)));
+        cx.notify();
+    }
+
+    fn close_mentions(&mut self, cx: &mut Context<Self>) {
+        if self.mention_query.take().is_some() {
+            self.mention_index = 0;
+            cx.notify();
+        }
+    }
+
+    /// The candidates left after the typed filter, in the order drawn.
+    fn mention_results(&self) -> Vec<MentionMember> {
+        let Some(query) = &self.mention_query else {
+            return Vec::new();
+        };
+        let needle = query.text.trim().to_lowercase();
+        if needle.is_empty() {
+            return self.mention_members.clone();
+        }
+        self.mention_members
+            .iter()
+            .filter(|member| {
+                member.label.to_lowercase().contains(&needle)
+                    || member
+                        .jid
+                        .split('@')
+                        .next()
+                        .unwrap_or_default()
+                        .contains(&needle)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Keep the highlighted row inside the picker's viewport.
+    fn scroll_mention_into_view(&self) {
+        let count = self.mention_results().len();
+        if count == 0 {
+            return;
+        }
+        self.mention_scroll
+            .scroll_to_item(self.mention_index.min(count - 1));
+    }
+
+    /// Replace the typed `@token` with the highlighted member's name.
+    fn accept_mention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(query) = self.mention_query.clone() else {
+            return;
+        };
+        let results = self.mention_results();
+        if results.is_empty() {
+            return;
+        }
+        let candidate = results[self.mention_index.min(results.len() - 1)].clone();
+        let range = {
+            let text = self.input.read(cx).text().to_string();
+            let cursor = self.input.read(cx).cursor().min(text.len());
+            let start = text[..query.start].encode_utf16().count();
+            let end = text[..cursor].encode_utf16().count();
+            start..end.max(start)
+        };
+        let token = candidate.display_token();
+        self.input.update(cx, |state, cx| {
+            state.replace_text_in_range(Some(range), &token, window, cx);
+        });
+        self.inserted_mentions.push(candidate);
+        self.mention_query = None;
+        self.mention_index = 0;
+        window.focus(&self.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// What to send: the text as typed for the local bubble, and the wire's
+    /// `@userpart` text plus the addresses it marks.
+    fn mentions_for_send(&self, text: &str) -> (String, Vec<String>) {
+        wire_mentions(text, &self.inserted_mentions, &self.mention_everyone)
+    }
+
+    /// What the composer currently holds, for the attachment caption.
+    pub fn text(&self, cx: &App) -> String {
+        self.input.read(cx).text().to_string()
+    }
+
+    /// Empty the composer after its text has been attached as a caption.
+    pub fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        self.inserted_mentions.clear();
+        self.mention_query = None;
+        self.forget_draft_link_preview();
+        self.mention_index = 0;
+    }
+
     /// Swap the composed text on chat switch: install the target chat's draft
     /// and hand the outgoing chat's draft back to the parent, so unsent text
     /// never rides along to a different recipient.
@@ -326,6 +751,10 @@ impl InputAreaView {
         self.input.update(cx, |state, cx| {
             state.set_value(new_text, window, cx);
         });
+        self.inserted_mentions.clear();
+        self.mention_query = None;
+        self.mention_index = 0;
+        self.forget_draft_link_preview();
         old
     }
 
@@ -339,11 +768,25 @@ impl InputAreaView {
         if text.trim().is_empty() {
             return;
         }
+        let (wire_text, mentions) = self.mentions_for_send(&text);
+        let link_preview = self
+            .draft_link_preview
+            .clone()
+            .filter(|preview| self.draft_link_url.as_deref() == Some(preview.url.as_str()));
         self.input.update(cx, |state, cx| {
             state.set_value("", window, cx);
         });
+        self.inserted_mentions.clear();
+        self.mention_query = None;
+        self.mention_index = 0;
+        self.forget_draft_link_preview();
         self.stop_typing_internal(cx);
-        cx.emit(InputAreaEvent::SendMessage(text));
+        cx.emit(InputAreaEvent::SendMessage {
+            text,
+            wire_text,
+            mentions,
+            link_preview,
+        });
     }
 
     /// Toggle PTT recording
@@ -444,6 +887,7 @@ impl Render for InputAreaView {
             // composer occupies, and the field grows the strip from there.
             .min_h(height)
             .flex_shrink_0()
+            .relative()
             .flex()
             .flex_col()
             .justify_center()
@@ -452,6 +896,13 @@ impl Render for InputAreaView {
             .bg(cx.theme().background)
             .border_t_1()
             .border_color(cx.theme().border)
+            // The picker floats over the conversation instead of pushing it
+            // up: the composer is anchored, and a list appearing above it
+            // must not move the text the reader is looking at.
+            .children(
+                (!is_recording && self.mention_query.is_some())
+                    .then(|| self.render_mentions(metrics, cx)),
+            )
             .children(self.editing.then(|| {
                 let entity = entity.clone();
                 div()
@@ -479,9 +930,7 @@ impl Render for InputAreaView {
                     .filter(|_| !self.editing)
                     .map(|reply| render_reply_bar(reply, entity.clone(), metrics, cx)),
             )
-            .children(
-                (self.emoji_open && !is_recording).then(|| self.render_emoji_picker(metrics, cx)),
-            )
+            .children((self.emoji_open && !is_recording).then(|| self.render_picker(metrics, cx)))
             .child(if is_recording {
                 self.render_recording(control, metrics, cx)
                     .into_any_element()
@@ -493,7 +942,161 @@ impl Render for InputAreaView {
 }
 
 impl InputAreaView {
-    fn render_emoji_picker(
+    /// The `@` list: the group's people, filtered by what has been typed
+    /// after the `@`. It floats above the composer, the way WhatsApp's does.
+    fn render_mentions(
+        &self,
+        metrics: Metrics,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let results = self.mention_results();
+        let selected = self.mention_index.min(results.len().saturating_sub(1));
+        // Shorter than a chat row: a picker is a menu, not a second sidebar.
+        // Four rows and a scroll keep it from climbing the conversation; the
+        // wheel still reaches everyone.
+        let row_height = metrics.chat_row_height() * 0.62;
+        div()
+            .id("mention-picker")
+            .debug_selector(|| "mention-picker".into())
+            .absolute()
+            .left(metrics.space_xl())
+            .bottom(gpui::relative(1.0))
+            .w(metrics.space_xxxl() * 10.0)
+            .max_h(row_height * 4.2)
+            .overflow_y_scroll()
+            .track_scroll(&self.mention_scroll)
+            // The picker owns the pixels it covers: a wheel or click over it
+            // must not reach the conversation behind.
+            .occlude()
+            .rounded(metrics.radius_lg())
+            .bg(cx.theme().popover)
+            .border_1()
+            .border_color(cx.theme().border)
+            .shadow_lg()
+            .py(metrics.space_xs())
+            .children(
+                results
+                    .into_iter()
+                    .take(64)
+                    .enumerate()
+                    .map(|(index, member)| {
+                        let selected_here = index == selected;
+                        let jid = member.jid.clone();
+                        let label = member.label.clone();
+                        let picture = member.picture.clone();
+                        let is_all = member.is_all;
+                        let avatar = metrics.avatar_inline() * 0.9;
+                        let ink = if selected_here {
+                            cx.theme().primary_foreground
+                        } else {
+                            cx.theme().foreground
+                        };
+                        div()
+                            .id(SharedString::from(format!("mention-{jid}")))
+                            .flex()
+                            .items_center()
+                            .gap(metrics.space_xs())
+                            .h(row_height)
+                            .mx(metrics.space_xxs())
+                            .px(metrics.space_xs())
+                            .rounded(metrics.radius_md())
+                            .when(selected_here, |el| el.bg(cx.theme().primary))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.mention_index = index;
+                                view.accept_mention(window, cx);
+                            }))
+                            .child(
+                                Avatar::new(
+                                    if is_all {
+                                        "mention-all".to_string()
+                                    } else {
+                                        jid.clone()
+                                    },
+                                    if is_all { "@all" } else { label.as_str() },
+                                    avatar,
+                                )
+                                .group(is_all)
+                                .picture(picture, None)
+                                .on(if selected_here {
+                                    cx.theme().primary
+                                } else {
+                                    cx.theme().secondary
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(metrics.text_body())
+                                    .text_color(ink)
+                                    .child(if is_all { "@all".to_string() } else { label }),
+                            )
+                    }),
+            )
+    }
+
+    fn render_picker(&self, metrics: Metrics, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let tab = self.picker_tab;
+        let search = match tab {
+            PickerTab::Emoji => &self.emoji_search,
+            PickerTab::Gif => &self.gif_search,
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.space_sm())
+            .pb(metrics.space_md())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.space_sm())
+                    .child(div().flex_1().child(Input::new(search)))
+                    .child(
+                        Button::new("picker-close")
+                            .icon(IconName::Close)
+                            .ghost()
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.emoji_open = false;
+                                window.focus(&view.focus_handle(cx), cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.space_xs())
+                    .child(
+                        Button::new("picker-tab-emoji")
+                            .label("Emoji")
+                            .small()
+                            .when(tab == PickerTab::Emoji, |button| button.primary())
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.picker_tab = PickerTab::Emoji;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("picker-tab-gif")
+                            .label("GIFs")
+                            .small()
+                            .when(tab == PickerTab::Gif, |button| button.primary())
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.picker_tab = PickerTab::Gif;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(match tab {
+                PickerTab::Emoji => self.render_emoji_grid(metrics, cx).into_any_element(),
+                PickerTab::Gif => self.render_gif_grid(metrics, cx).into_any_element(),
+            })
+    }
+
+    fn render_emoji_grid(
         &self,
         metrics: Metrics,
         cx: &mut Context<Self>,
@@ -522,24 +1125,6 @@ impl InputAreaView {
             .flex()
             .flex_col()
             .gap(metrics.space_sm())
-            .pb(metrics.space_md())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(metrics.space_sm())
-                    .child(div().flex_1().child(Input::new(&self.emoji_search)))
-                    .child(
-                        Button::new("emoji-close")
-                            .icon(IconName::Close)
-                            .ghost()
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.emoji_open = false;
-                                window.focus(&view.focus_handle(cx), cx);
-                                cx.notify();
-                            })),
-                    ),
-            )
             .child(
                 div()
                     .id("emoji-grid")
@@ -570,6 +1155,315 @@ impl InputAreaView {
                     .text_color(cx.theme().muted_foreground)
                     .child("Search to find more emoji, including skin tones and flags."),
             )
+    }
+
+    fn render_gif_grid(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if crate::platform::gif::api_key().is_none() {
+            return div()
+                .flex()
+                .flex_col()
+                .gap(metrics.space_sm())
+                .child(
+                    div()
+                        .text_size(metrics.text_small())
+                        .child("GIF search needs a KLIPY API key."),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.text_micro())
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Set WASP_KLIPY_KEY to the key from klipy.com/developers."),
+                )
+                .child(
+                    Button::new("gif-get-key")
+                        .label("Get a key")
+                        .small()
+                        .on_click(|_, _, cx| cx.open_url("https://klipy.com/developers")),
+                )
+                .into_any_element();
+        }
+
+        let tile = metrics.touch_target() * 2.4;
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.space_sm())
+            .children(self.gif_error.as_ref().map(|error| {
+                div()
+                    .text_size(metrics.text_small())
+                    .text_color(cx.theme().danger)
+                    .child(error.clone())
+            }))
+            .when(self.gif_loading, |el| {
+                el.child(
+                    div()
+                        .text_size(metrics.text_small())
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Searching KLIPY…"),
+                )
+            })
+            .child(
+                div()
+                    .id("gif-grid")
+                    .h(metrics.touch_target() * 4.0)
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_wrap()
+                    .gap(metrics.space_xs())
+                    .children(self.gif_results.iter().take(24).enumerate().map(
+                        |(index, preview)| {
+                            let source = preview
+                                .image
+                                .clone()
+                                .map(|image| image.source(preview.animated));
+                            div()
+                                .id(("gif-pick", index))
+                                .w(tile)
+                                .h(tile)
+                                .flex_shrink_0()
+                                .overflow_hidden()
+                                .rounded(metrics.radius_sm())
+                                .bg(cx.theme().secondary)
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.choose_gif(index, cx);
+                                }))
+                                .map(|el| match source {
+                                    Some(source) => el.child(
+                                        gpui::img(source)
+                                            .size_full()
+                                            .object_fit(gpui::ObjectFit::Contain),
+                                    ),
+                                    None => el.child(
+                                        div()
+                                            .size_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_size(metrics.text_micro())
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(preview.result.title.clone()),
+                                    ),
+                                })
+                        },
+                    )),
+            )
+            .when(
+                !self.gif_loading && self.gif_results.is_empty() && self.gif_error.is_none(),
+                |el| {
+                    el.child(
+                        div()
+                            .text_size(metrics.text_small())
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Search KLIPY for a GIF."),
+                    )
+                },
+            )
+            .child(
+                div()
+                    .text_size(metrics.text_micro())
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Powered by KLIPY"),
+            )
+            .into_any_element()
+    }
+
+    /// Open or close the emoji panel, for the window-wide shortcut.
+    pub fn toggle_emoji(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_recording {
+            return;
+        }
+        self.emoji_open = !self.emoji_open;
+        self.picker_tab = PickerTab::Emoji;
+        if self.emoji_open {
+            self.emoji_search
+                .update(cx, |state, cx| state.focus(window, cx));
+        } else {
+            window.focus(&self.focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
+    /// Open the GIF half of the picker, for `Ctrl+Shift+G`.
+    pub fn open_gif_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_recording {
+            return;
+        }
+        self.emoji_open = true;
+        self.picker_tab = PickerTab::Gif;
+        self.gif_search
+            .update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Wait for a pause before reading the address, so the document is copied
+    /// once per pause rather than once per keystroke.
+    fn queue_draft_link_probe(&mut self, cx: &mut Context<Self>) {
+        let entity = cx.entity().downgrade();
+        self.link_probe_task = Some(cx.spawn(async move |_, cx| {
+            crate::platform::sleep(Duration::from_millis(500)).await;
+            let _ = entity.update(cx, |view, cx| view.refresh_draft_link_preview(cx));
+        }));
+    }
+
+    /// Read the first address in the text and replace the composer's card.
+    fn refresh_draft_link_preview(&mut self, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).text().to_string();
+        let url = crate::platform::link_preview::first_url(&text);
+        if url == self.draft_link_url {
+            return;
+        }
+        self.forget_draft_link_preview();
+        self.draft_link_url = url.clone();
+        self.draft_link_pending = url.is_some();
+        let Some(url) = url else {
+            cx.notify();
+            return;
+        };
+        self.fetch_draft_link_preview(url, cx);
+        cx.notify();
+    }
+
+    fn fetch_draft_link_preview(&mut self, url: String, cx: &mut Context<Self>) {
+        let task = crate::platform::link_preview::fetch(cx, url.clone());
+        let entity = cx.entity().downgrade();
+        self.link_fetch_task = Some(cx.spawn(async move |_, cx| {
+            let result = crate::platform::with_timeout(task, Duration::from_secs(8)).await;
+            let _ = entity.update(cx, |view, cx| {
+                if view.draft_link_url.as_deref() != Some(url.as_str()) {
+                    return;
+                }
+                view.draft_link_pending = false;
+                view.draft_link_preview = match result {
+                    Some(Ok(preview)) => Some(preview),
+                    Some(Err(error)) => {
+                        log::debug!("composer link preview: {url} failed: {error}");
+                        None
+                    }
+                    None => {
+                        log::debug!("composer link preview: {url} timed out");
+                        None
+                    }
+                };
+                cx.notify();
+            });
+        }));
+    }
+
+    fn forget_draft_link_preview(&mut self) {
+        self.draft_link_url = None;
+        self.draft_link_preview = None;
+        self.draft_link_pending = false;
+        self.link_probe_task = None;
+        self.link_fetch_task = None;
+    }
+
+    fn queue_gif_search(&mut self, cx: &mut Context<Self>) {
+        let entity = cx.entity().downgrade();
+        self.gif_task = Some(cx.spawn(async move |_, cx| {
+            crate::platform::sleep(Duration::from_millis(220)).await;
+            let _ = entity.update(cx, |view, cx| view.search_gifs(cx));
+        }));
+    }
+
+    fn search_gifs(&mut self, cx: &mut Context<Self>) {
+        let query = self.gif_search.read(cx).value().trim().to_string();
+        if query.is_empty() {
+            self.gif_results.clear();
+            self.gif_loading = false;
+            self.gif_error = None;
+            cx.notify();
+            return;
+        }
+        self.gif_loading = true;
+        self.gif_error = None;
+        let task = crate::platform::gif::search(cx, query, "velo".to_string());
+        self.gif_task = Some(cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                view.gif_loading = false;
+                match result {
+                    Ok(results) => {
+                        view.gif_results = results
+                            .into_iter()
+                            .map(|result| GifPreview {
+                                result,
+                                image: None,
+                                animated: false,
+                            })
+                            .collect();
+                        view.fetch_gif_previews(cx);
+                    }
+                    Err(error) => {
+                        view.gif_results.clear();
+                        view.gif_error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Fetch the small animated previews, newest query first and only the
+    /// tiles the panel can show. Four at a time would be better than this
+    /// one-per-tile start, but each completion repaints the grid as it lands.
+    fn fetch_gif_previews(&mut self, cx: &mut Context<Self>) {
+        let urls: Vec<(usize, String)> = self
+            .gif_results
+            .iter()
+            .take(12)
+            .enumerate()
+            .filter_map(|(index, preview)| {
+                preview.result.preview_url.clone().map(|url| (index, url))
+            })
+            .collect();
+        for (index, url) in urls {
+            let task = crate::platform::gif::fetch(cx, url);
+            cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                let Ok(bytes) = task.await else {
+                    return;
+                };
+                let _ = this.update(cx, |view, cx| {
+                    let Some(preview) = view.gif_results.get_mut(index) else {
+                        return;
+                    };
+                    let Some(mime) = crate::platform::picker::previewable_image_mime(&bytes) else {
+                        return;
+                    };
+                    let Some(format) = gpui::ImageFormat::from_mime_type(mime) else {
+                        return;
+                    };
+                    preview.animated = matches!(mime, "image/webp" | "image/gif");
+                    preview.image = Some(crate::retained_image::RetainedImage::new(
+                        gpui::Image::from_bytes(format, bytes.as_ref().clone()),
+                    ));
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    fn choose_gif(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(preview) = self.gif_results.get(index) else {
+            return;
+        };
+        let Some(url) = preview.result.video_url.clone() else {
+            return;
+        };
+        let task = crate::platform::gif::fetch(cx, url);
+        cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            let Ok(bytes) = task.await else {
+                return;
+            };
+            let _ = this.update(cx, |view, cx| {
+                view.emoji_open = false;
+                cx.emit(InputAreaEvent::SendGif { bytes });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The ordinary state: attach, field, emoji, and either record or send.
@@ -670,9 +1564,15 @@ impl InputAreaView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .capture_action::<Paste>(
-                        cx.listener(|view, _: &Paste, _window, cx| view.paste_image(cx)),
-                    )
+                    .capture_action::<Paste>(cx.listener(|view, _: &Paste, _window, cx| {
+                        // Only consume the key when there is media to send.
+                        // A text clipboard still belongs to the textarea, and
+                        // a copied picture must not leave its path behind.
+                        if crate::platform::clipboard::holds_media(cx) {
+                            view.paste_image(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
                     // A soft pill with no outline, the way the desktop
                     // messengers draw their composer: the caret says where
                     // focus is; a coloured ring around the whole field
@@ -681,10 +1581,26 @@ impl InputAreaView {
                     .bg(cx.theme().secondary)
                     .px(metrics.space_md())
                     .child(
-                        Textarea::new(&self.input)
-                            .readonly(self.edit_pending)
-                            .bordered(false)
-                            .w_full(),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(metrics.space_xxs())
+                            .w_full()
+                            .children(
+                                self.draft_link_preview
+                                    .as_ref()
+                                    .map(|preview| render_draft_link_preview(preview, metrics, cx)),
+                            )
+                            .when(
+                                self.draft_link_pending && self.draft_link_preview.is_none(),
+                                |column| column.child(render_draft_link_skeleton(metrics, cx)),
+                            )
+                            .child(
+                                Textarea::new(&self.input)
+                                    .readonly(self.edit_pending)
+                                    .bordered(false)
+                                    .w_full(),
+                            ),
                     ),
             )
             .child(
@@ -908,6 +1824,97 @@ fn render_reply_bar(
         )
 }
 
+/// The card read for the address currently being composed.
+///
+/// A line rather than a picture: the composer only needs to say that the
+/// metadata is there, and decoding a thumbnail in the field would spend more
+/// than the message itself.
+fn render_draft_link_preview(
+    preview: &velo_core::LinkPreview,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let host = SharedString::from(preview.host().to_string());
+    let site = SharedString::from(
+        preview
+            .site_name
+            .clone()
+            .filter(|site| !site.trim().is_empty())
+            .unwrap_or_else(|| host.to_string()),
+    );
+    let title = SharedString::from(
+        preview
+            .title
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| site.to_string()),
+    );
+    div()
+        .id("draft-link-preview")
+        .debug_selector(|| "draft-link-preview".into())
+        .w_full()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap(metrics.space_xs())
+        .px(metrics.space_xs())
+        .py(metrics.space_xxs())
+        .rounded(metrics.radius_sm())
+        .bg(cx.theme().background)
+        .child(
+            Icon::new(IconName::ExternalLink)
+                .size(metrics.icon_small())
+                .text_color(cx.theme().primary),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_size(metrics.text_micro())
+                        .text_color(cx.theme().muted_foreground)
+                        .truncate()
+                        .child(site),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.text_small())
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(cx.theme().foreground)
+                        .truncate()
+                        .child(title),
+                ),
+        )
+}
+
+fn render_draft_link_skeleton(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
+    div()
+        .id("draft-link-preview-loading")
+        .debug_selector(|| "draft-link-preview-loading".into())
+        .w_full()
+        .flex()
+        .items_center()
+        .gap(metrics.space_xs())
+        .px(metrics.space_xs())
+        .py(metrics.space_xxs())
+        .rounded(metrics.radius_sm())
+        .bg(cx.theme().background)
+        .child(
+            Icon::new(IconName::LoaderCircle)
+                .size(metrics.icon_small())
+                .text_color(cx.theme().muted_foreground),
+        )
+        .child(
+            div()
+                .text_size(metrics.text_micro())
+                .text_color(cx.theme().muted_foreground)
+                .child(crate::tr!(ReadingLinkPreview)),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cell::RefCell, rc::Rc, sync::Arc};
@@ -1030,6 +2037,7 @@ mod tests {
 
     struct VisualComposerFixture {
         cx: gpui::VisualTestContext,
+        input: Entity<InputAreaView>,
         attachment_categories: Rc<RefCell<Vec<AttachmentCategory>>>,
         _events: Subscription,
     }
@@ -1060,6 +2068,7 @@ mod tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         VisualComposerFixture {
             cx,
+            input,
             attachment_categories,
             _events: events,
         }
@@ -1077,7 +2086,7 @@ mod tests {
         let observed = sent.clone();
         let _subscription = cx.update(|cx| {
             cx.subscribe(&input, move |_, event: &InputAreaEvent, _| {
-                if let InputAreaEvent::SendMessage(text) = event {
+                if let InputAreaEvent::SendMessage { text, .. } = event {
                     observed.borrow_mut().push(text.clone());
                 }
             })
@@ -1130,7 +2139,7 @@ mod tests {
         let observed = sent.clone();
         let _subscription = cx.update(|cx| {
             cx.subscribe(&input, move |_, event: &InputAreaEvent, _| {
-                if let InputAreaEvent::SendMessage(text) = event {
+                if let InputAreaEvent::SendMessage { text, .. } = event {
                     observed.borrow_mut().push(text.clone());
                 }
             })
@@ -1197,7 +2206,56 @@ mod tests {
         paste(&mut cx, &window);
 
         cx.update(|cx| assert_eq!(input.read(cx).input.read(cx).text(), "hello"));
-        assert_eq!(*paste_requests.borrow(), 1);
+        assert_eq!(
+            *paste_requests.borrow(),
+            0,
+            "a text clipboard belongs to the textarea, not to the media path"
+        );
+    }
+
+    #[gpui::test]
+    fn typing_at_offers_the_group_and_enter_inserts_a_name(cx: &mut gpui::TestAppContext) {
+        let VisualComposerFixture { mut cx, input, .. } = visual_setup(cx);
+        let everyone = vec!["559900000001@s.whatsapp.net".to_string()];
+        cx.update(|window, cx| {
+            input.update(cx, |view, cx| {
+                view.set_mentions(
+                    vec![
+                        mention("Ana", "559900000001@s.whatsapp.net"),
+                        mention("Bia", "559900000002@s.whatsapp.net"),
+                    ],
+                    everyone.clone(),
+                    cx,
+                );
+                view.input.update(cx, |field, cx| {
+                    field.set_value("hola @a", window, cx);
+                    field.set_cursor_position(
+                        gpui_component::input::Position::new(0, 7),
+                        window,
+                        cx,
+                    );
+                });
+                view.refresh_mention_query(cx);
+                view.focus_handle(cx).focus(window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            cx.debug_bounds("mention-picker").is_some(),
+            "typing @ in a group should open the picker"
+        );
+        cx.simulate_keystrokes("down enter");
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(
+                input.read(cx).input.read(cx).text().to_string(),
+                "hola @Bia "
+            );
+        });
+        assert!(
+            cx.debug_bounds("mention-picker").is_none(),
+            "the picker closes once a name is inserted"
+        );
     }
 
     #[gpui::test]
@@ -1249,5 +2307,63 @@ mod tests {
                 AttachmentCategory::PhotosVideos
             ]
         );
+    }
+
+    fn mention(label: &str, jid: &str) -> super::MentionMember {
+        super::MentionMember {
+            jid: jid.to_string(),
+            label: label.to_string(),
+            picture: None,
+            is_all: false,
+        }
+    }
+
+    #[test]
+    fn an_at_token_opens_only_where_a_word_starts() {
+        assert_eq!(
+            super::mention_query_at("hola @an", 8).map(|q| (q.start, q.text)),
+            Some((5, "an".to_string()))
+        );
+        assert_eq!(
+            super::mention_query_at("@", 1).map(|q| q.text),
+            Some(String::new())
+        );
+        assert!(super::mention_query_at("mail a@b", 8).is_none());
+        assert!(super::mention_query_at("@ana done", 9).is_none());
+        assert!(super::mention_query_at("no at here", 10).is_none());
+    }
+
+    #[test]
+    fn mention_labels_leave_as_addresses_and_all_names_everyone() {
+        let ana = mention("Ana", "559900000001:4@s.whatsapp.net");
+        let ana_maria = mention("Ana Maria", "559900000002@s.whatsapp.net");
+        let everybody = super::MentionMember {
+            jid: String::new(),
+            label: "all".to_string(),
+            picture: None,
+            is_all: true,
+        };
+        let (wire, jids) = super::wire_mentions(
+            "hola @Ana Maria y @Ana, @all",
+            &[ana, ana_maria, everybody],
+            &["559900000001@s.whatsapp.net".to_string()],
+        );
+        assert_eq!(wire, "hola @559900000002 y @559900000001, @all");
+        assert_eq!(
+            jids,
+            [
+                "559900000002@s.whatsapp.net".to_string(),
+                "559900000001:4@s.whatsapp.net".to_string(),
+                "559900000001@s.whatsapp.net".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_deleted_mention_is_not_sent() {
+        let ana = mention("Ana", "559900000001@s.whatsapp.net");
+        let (wire, jids) = super::wire_mentions("hola", &[ana], &[]);
+        assert_eq!(wire, "hola");
+        assert!(jids.is_empty());
     }
 }

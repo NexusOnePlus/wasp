@@ -1,8 +1,13 @@
-//! Confirmation surface for files waiting to be sent.
+//! Files waiting above the composer.
 //!
-//! Pasted from the clipboard or dropped onto the conversation: a preview of
-//! what would go out, a caption box, and Send/Cancel. Nothing is uploaded
-//! before Send is pressed.
+//! Pasted from the clipboard or dropped onto the conversation: a compact tray
+//! with what would go out, a caption box, and Send/Cancel. Nothing is
+//! uploaded before Send is pressed.
+//!
+//! This used to be a full-screen modal. A modal makes the conversation
+//! disappear at the exact moment the reader wants to check what they are
+//! replying to, and it hid the composer behind a scrim for a caption that
+//! belongs next to it. The state is the same; only the surface moved.
 
 use std::sync::Arc;
 
@@ -11,16 +16,19 @@ use gpui::{
     ParentElement as _, StatefulInteractiveElement as _, Styled as _, StyledImage as _, div, img,
     prelude::FluentBuilder as _,
 };
+use gpui_component::ActiveTheme as _;
+use gpui_component::Disableable as _;
+use gpui_component::IconName;
+use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Input, InputState};
-use gpui_component::{Disableable as _, FocusTrapElement as _};
+use gpui_component::input::Paste;
 use velo_core::OutgoingMedia;
 
 use crate::app::WhatsAppApp;
-use crate::components::{ProductIcon, parts};
+use crate::components::parts;
 use crate::theme::Metrics;
 
-/// One file waiting in the modal, with its preview decoded where drawable.
+/// One file waiting in the tray, with its preview decoded where drawable.
 ///
 /// The selected media kind and the file's byte signature both gate previews:
 /// a document stays a document, and mislabeled bytes are decoded according to
@@ -31,31 +39,27 @@ pub struct PreviewFile {
 }
 
 impl PreviewFile {
-    /// One file waiting in the modal, decoding its preview image only where
-    /// asked: the modal draws the picture for a sole file and rows for a
+    /// One file waiting in the tray, decoding its preview image only where
+    /// asked: the tray draws the picture for a sole file and a badge for a
     /// batch, so decoding every image of a batch retains copies nothing
     /// draws.
     pub fn with_preview(file: crate::platform::picker::Picked, decode: bool) -> Self {
-        let image = (decode && matches!(file.kind, OutgoingMedia::Image | OutgoingMedia::Sticker))
-            .then(|| crate::platform::picker::previewable_image_mime(&file.bytes))
-            .flatten()
-            .and_then(gpui::ImageFormat::from_mime_type)
-            .map(|format| Arc::new(Image::from_bytes(format, file.bytes.clone())));
+        let image = (decode
+            && matches!(
+                file.kind,
+                OutgoingMedia::Image | OutgoingMedia::Sticker | OutgoingMedia::Gif
+            ))
+        .then(|| crate::platform::picker::previewable_image_mime(&file.bytes))
+        .flatten()
+        .and_then(gpui::ImageFormat::from_mime_type)
+        .map(|format| Arc::new(Image::from_bytes(format, file.bytes.clone())));
         Self { file, image }
-    }
-
-    fn kind(&self) -> OutgoingMedia {
-        self.file.kind
     }
 }
 
-/// What the send-confirmation modal draws, borrowed for the frame.
-///
-/// One struct rather than eight arguments: the modal outgrew the argument
-/// list when the file list learned to scroll.
+/// What the tray draws, borrowed for the frame.
 pub struct PastePreviewProps<'a> {
     pub files: &'a [PreviewFile],
-    pub caption: Option<&'a Entity<InputState>>,
     pub list_scroll: &'a gpui::ScrollHandle,
     pub app: Entity<WhatsAppApp>,
     pub can_send: bool,
@@ -63,54 +67,62 @@ pub struct PastePreviewProps<'a> {
     pub metrics: Metrics,
 }
 
-pub fn render_paste_preview(props: PastePreviewProps<'_>, cx: &App) -> impl IntoElement + use<> {
+pub fn render_attachment_tray(props: PastePreviewProps<'_>, cx: &App) -> impl IntoElement + use<> {
     let PastePreviewProps {
         files,
-        caption,
-        list_scroll,
+        list_scroll: _list_scroll,
         app,
         can_send,
         focus_handle,
         metrics,
     } = props;
+
+    let cancel_app = app.clone();
+    let send_app = app.clone();
+    let add_app = app.clone();
+    let paste_app = app.clone();
+
     div()
         .id("paste-preview")
         .debug_selector(|| "paste-preview".into())
         .track_focus(focus_handle)
-        .absolute()
-        .inset_0()
+        // Ctrl-V while the caption owns the keyboard belongs to the tray:
+        // another picture appends, and text still reaches the caption through
+        // propagation when the clipboard holds no media.
+        .capture_action::<Paste>(move |_, _, cx| {
+            if crate::platform::clipboard::holds_media(cx) {
+                paste_app.update(cx, |app, cx| app.paste_media(cx));
+                cx.stop_propagation();
+            } else {
+                cx.propagate();
+            }
+        })
+        .flex_shrink_0()
         .flex()
-        .flex_col()
-        .gap(metrics.space_xl())
-        .p(metrics.space_xxl())
-        .bg(parts::scrim(cx).opacity(0.92))
-        .on_scroll(|_, _window, cx| cx.stop_propagation())
-        .on_mouse_down(gpui::MouseButton::Left, |_, _window, cx| {
-            cx.stop_propagation();
-        })
-        .on_mouse_up(gpui::MouseButton::Left, |_, _window, cx| {
-            cx.stop_propagation();
-        })
-        .on_click(|_, _window, cx| cx.stop_propagation())
-        .occlude()
+        .items_center()
+        .gap(metrics.space_lg())
+        .px(metrics.space_xl())
+        .py(metrics.space_md())
+        .bg(cx.theme().secondary)
+        .border_t_1()
+        .border_color(cx.theme().border)
+        .child(render_thumbnails(files, app, metrics, cx))
         .child(
-            div()
-                .text_size(metrics.text_title())
-                .text_color(parts::on_scrim(cx))
-                .child(title_for(files)),
+            Button::new("paste-preview-add")
+                .icon(IconName::Plus)
+                .ghost()
+                .small()
+                .tooltip("Add more files")
+                .on_click(move |_, _, cx| {
+                    add_app.update(cx, |app, cx| app.add_to_pending_files(cx));
+                }),
         )
-        .child(render_files(files, list_scroll, metrics, cx))
-        .children(caption.map(|caption| {
-            div()
-                .id("paste-preview-caption")
-                .debug_selector(|| "paste-preview-caption".into())
-                .child(Input::new(caption).w_full())
-        }))
         .child(
             div()
+                .flex_shrink_0()
                 .flex()
-                .justify_end()
-                .gap(metrics.space_lg())
+                .items_center()
+                .gap(metrics.space_md())
                 .child(
                     div()
                         .id("paste-preview-cancel")
@@ -119,13 +131,10 @@ pub fn render_paste_preview(props: PastePreviewProps<'_>, cx: &App) -> impl Into
                             Button::new("paste-preview-cancel-button")
                                 .label(crate::tr!(Cancel))
                                 .cursor_pointer()
-                                .on_click({
-                                    let app = app.clone();
-                                    move |_event, _window, cx| {
-                                        app.update(cx, |app, cx| {
-                                            app.cancel_paste_preview(cx);
-                                        });
-                                    }
+                                .on_click(move |_event, _window, cx| {
+                                    cancel_app.update(cx, |app, cx| {
+                                        app.cancel_paste_preview(cx);
+                                    });
                                 }),
                         ),
                 )
@@ -140,200 +149,147 @@ pub fn render_paste_preview(props: PastePreviewProps<'_>, cx: &App) -> impl Into
                                 .disabled(!can_send)
                                 .when(can_send, |button| button.cursor_pointer())
                                 .on_click(move |_event, _window, cx| {
-                                    app.update(cx, |app, cx| app.confirm_paste_preview(cx));
+                                    send_app.update(cx, |app, cx| app.confirm_paste_preview(cx));
                                 }),
                         ),
                 ),
         )
-        .focus_trap("paste-preview-trap", focus_handle)
 }
 
-/// What the modal is confirming, in one line.
-fn title_for(files: &[PreviewFile]) -> String {
-    if files.len() > 1 {
-        return crate::tr!(send_files, files.len());
-    }
-    match files.first().map(PreviewFile::kind) {
-        Some(OutgoingMedia::Image) => crate::tr!(SendThisImage),
-        Some(OutgoingMedia::Video) => crate::tr!(SendThisVideo),
-        _ => crate::tr!(SendThisFile),
-    }
-    .to_string()
-}
-
-/// The preview itself: the picture where there is one picture, a file list
-/// otherwise.
-///
-/// A video has no poster frame this side can draw — the composer holds no
-/// decoder — and a document has nothing to draw at all, so both are a row
-/// naming what would go out rather than a blank frame pretending to show it.
-fn render_files(
+/// Every waiting picture, each removable and each openable full-size.
+fn render_thumbnails(
     files: &[PreviewFile],
-    list_scroll: &gpui::ScrollHandle,
+    app: Entity<WhatsAppApp>,
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    if let [only] = files
-        && let Some(image) = only.image.clone()
-    {
-        return div()
-            .id("paste-preview-image")
-            .debug_selector(|| "paste-preview-image".into())
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                img(ImageSource::Image(image))
-                    .size_full()
-                    .object_fit(ObjectFit::Contain),
-            )
-            .into_any_element();
-    }
-    // Scrollable rather than centred: the picker bounds a selection in
-    // bytes, not in rows, so a batch of small files can outgrow the modal —
-    // and the modal swallows wheel events, so the list must catch them
-    // first. The wheel reaches this region before the root's stop, which is
-    // what keeps the caption and the controls where they are while the rows
-    // move. Start alignment matters: centering overflow puts the first rows
-    // above the scroll origin, where no scroll offset can reveal them. The
-    // `id` wraps the region in `Stateful`, which owns the scroll builders.
+    let size = metrics.touch_target() * 1.7;
     div()
-        .id("paste-preview-files")
-        .debug_selector(|| "paste-preview-files".into())
-        .flex_1()
-        .min_h_0()
-        .flex()
-        .flex_col()
-        .gap(metrics.space_md())
-        .overflow_y_scroll()
-        .track_scroll(list_scroll)
-        .children(files.iter().map(|file| render_file_row(file, metrics, cx)))
-        .into_any_element()
-}
-
-fn render_file_row(file: &PreviewFile, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
-    let icon = match file.kind() {
-        OutgoingMedia::Image | OutgoingMedia::Sticker => ProductIcon::Image,
-        OutgoingMedia::Video | OutgoingMedia::Gif => ProductIcon::Video,
-        OutgoingMedia::Document => ProductIcon::FileText,
-    };
-    div()
+        .id("paste-preview-thumbs")
+        .flex_shrink_0()
         .flex()
         .items_center()
-        .gap(metrics.space_lg())
-        .child(
-            gpui_component::Icon::new(icon)
-                .size(metrics.icon_media())
-                .text_color(parts::on_scrim(cx)),
-        )
-        .child(
-            parts::detail_stack()
-                .child(
-                    parts::one_line()
-                        .text_size(metrics.text_body())
-                        .text_color(parts::on_scrim(cx))
-                        .child(file.file.file_name.clone()),
-                )
+        .gap(metrics.space_sm())
+        .children(files.iter().enumerate().map(|(index, file)| {
+            let expand_app = app.clone();
+            let remove_app = app.clone();
+            let image = file.image.clone();
+            let has_image = image.is_some();
+            div()
+                .relative()
+                .w(size)
+                .h(size)
+                .flex_shrink_0()
                 .child(
                     div()
-                        .text_size(metrics.text_secondary())
-                        .text_color(parts::on_scrim(cx).opacity(0.7))
-                        .child(crate::utils::format_size(file.file.bytes.len() as u64)),
-                ),
-        )
+                        .id(("attachment-thumb", index))
+                        .debug_selector(move || {
+                            if has_image {
+                                "paste-preview-image".into()
+                            } else {
+                                "paste-preview-file".into()
+                            }
+                        })
+                        .size_full()
+                        .overflow_hidden()
+                        .rounded(metrics.radius_md())
+                        .bg(cx.theme().background)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            expand_app.update(cx, |app, cx| {
+                                app.expand_pending_file(index, cx);
+                            });
+                        })
+                        .map(|el| match image {
+                            Some(image) => el.child(
+                                img(ImageSource::Image(image))
+                                    .id(("attachment-image", index))
+                                    .size_full()
+                                    .object_fit(ObjectFit::Contain),
+                            ),
+                            None => el.child(
+                                div()
+                                    .px(metrics.space_xs())
+                                    .text_size(metrics.text_micro())
+                                    .text_color(parts::subtle(cx))
+                                    .truncate()
+                                    .child(file.file.file_name.clone()),
+                            ),
+                        }),
+                )
+                .child(
+                    div().absolute().top_0().right_0().child(
+                        Button::new(("attachment-remove", index))
+                            .icon(IconName::Close)
+                            .danger()
+                            .ghost()
+                            .small()
+                            .tooltip("Remove")
+                            .on_click(move |_, _, cx| {
+                                remove_app.update(cx, |app, cx| {
+                                    app.remove_pending_file(index, cx);
+                                });
+                            }),
+                    ),
+                )
+        }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{PreviewFile, title_for};
-    use crate::platform::picker::Picked;
-
-    fn picked(file_name: &str, mime_type: &str) -> Picked {
-        let bytes = if mime_type == "image/png" {
-            b"\x89PNG\r\n\x1a\nrest".to_vec()
-        } else {
-            vec![1, 2, 3]
-        };
-        Picked::automatic(file_name.to_string(), mime_type.to_string(), bytes)
-    }
-
-    #[test]
-    fn title_names_what_would_go_out() {
-        assert_eq!(
-            title_for(&[PreviewFile::with_preview(
-                picked("foto.png", "image/png"),
-                true
-            )]),
-            "Send this image?"
-        );
-        assert_eq!(
-            title_for(&[PreviewFile::with_preview(
-                picked("clipe.mp4", "video/mp4"),
-                true
-            )]),
-            "Send this video?"
-        );
-        assert_eq!(
-            title_for(&[PreviewFile::with_preview(
-                picked("nota.pdf", "application/pdf"),
-                true
-            )]),
-            "Send this file?"
-        );
-        assert_eq!(
-            title_for(&[
-                PreviewFile::with_preview(picked("foto.png", "image/png"), true),
-                PreviewFile::with_preview(picked("clipe.mp4", "video/mp4"), true),
-            ]),
-            "Send 2 files?"
-        );
-    }
-
-    #[test]
-    fn only_drawable_pictures_decode_a_preview() {
-        assert!(
-            PreviewFile::with_preview(picked("foto.png", "image/png"), true)
-                .image
-                .is_some()
-        );
-        // An SVG goes as a document, so there is nothing to draw.
-        assert!(
-            PreviewFile::with_preview(picked("desenho.svg", "image/svg+xml"), true)
-                .image
-                .is_none()
-        );
-        assert!(
-            PreviewFile::with_preview(picked("clipe.mp4", "video/mp4"), true)
-                .image
-                .is_none()
-        );
-        let document = Picked {
-            file_name: "foto.jpg".to_string(),
-            mime_type: "image/jpeg".to_string(),
-            kind: velo_core::OutgoingMedia::Document,
-            bytes: b"\x89PNG\r\n\x1a\nrest".to_vec(),
-        };
-        assert!(PreviewFile::with_preview(document, true).image.is_none());
-
-        let mislabeled = Picked {
-            file_name: "foto.jpg".to_string(),
-            mime_type: "image/jpeg".to_string(),
-            kind: velo_core::OutgoingMedia::Image,
-            bytes: b"\x89PNG\r\n\x1a\nrest".to_vec(),
-        };
-        assert!(PreviewFile::with_preview(mislabeled, true).image.is_some());
-    }
-
-    #[test]
-    fn a_batch_holds_no_preview_copies() {
-        // The modal draws rows for a batch, not pictures, so decoding there
-        // retains bytes nothing draws.
-        assert!(
-            PreviewFile::with_preview(picked("foto.png", "image/png"), false)
-                .image
-                .is_none()
-        );
-    }
+/// One waiting picture, as large as the window allows.
+pub fn render_attachment_lightbox(
+    image: Arc<Image>,
+    app: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let close_app = app.clone();
+    let close_button_app = app;
+    div()
+        .id("attachment-lightbox")
+        .debug_selector(|| "attachment-lightbox".into())
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .p(metrics.space_xxxl())
+        .bg(parts::scrim(cx).opacity(0.94))
+        .on_click(move |_, _, cx| {
+            close_app.update(cx, |app, cx| {
+                app.collapse_pending_file(cx);
+            });
+        })
+        .child(
+            div()
+                .id("attachment-lightbox-image")
+                .max_w_full()
+                .max_h_full()
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(
+                    img(ImageSource::Image(image))
+                        .id("attachment-lightbox-content")
+                        .max_w_full()
+                        .max_h_full()
+                        .object_fit(ObjectFit::Contain),
+                ),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(metrics.space_lg())
+                .right(metrics.space_lg())
+                .child(
+                    Button::new("attachment-lightbox-close")
+                        .icon(IconName::Close)
+                        .ghost()
+                        .on_click(move |_, _, cx| {
+                            close_button_app.update(cx, |app, cx| {
+                                app.collapse_pending_file(cx);
+                            });
+                        }),
+                ),
+        )
 }

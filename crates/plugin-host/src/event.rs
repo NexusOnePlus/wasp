@@ -206,6 +206,7 @@ pub fn from_session(event: &UiEvent) -> Option<Event> {
             chat_jid,
             message_ids,
             receipt_type,
+            ..
         } => Event::new(abi::kinds::RECEIPT)
             .str(fields::CHAT_JID, chat_jid.clone())
             .flag(fields::IS_GROUP, is_group(chat_jid))

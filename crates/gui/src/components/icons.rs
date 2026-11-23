@@ -50,8 +50,8 @@ pub enum ProductIcon {
     Pin,
     /// A muted chat, at the end of its row.
     BellOff,
-    /// Velo's own mark in one colour, for the window's title strip.
-    VeloMark,
+    /// Wasp's own mark in one colour, for the window's title strip.
+    WaspMark,
     /// The picture of a person who has not set one.
     AvatarPerson,
     /// The picture of a group that has not set one.
@@ -94,7 +94,7 @@ impl ProductIcon {
         Self::Channels,
         Self::Pin,
         Self::BellOff,
-        Self::VeloMark,
+        Self::WaspMark,
         Self::AvatarPerson,
         Self::AvatarGroup,
     ];
@@ -135,7 +135,7 @@ impl ProductIcon {
             Self::MinimizeCard => "icons/minimize-card.svg",
             Self::CircleDashed => "icons/circle-dashed.svg",
             Self::Channels => "icons/channels.svg",
-            Self::VeloMark => "icons/velo-mark.svg",
+            Self::WaspMark => "icons/wasp-mark.svg",
             Self::AvatarPerson => "icons/avatar-person.svg",
             Self::AvatarGroup => "icons/avatar-group.svg",
         }

@@ -7,7 +7,7 @@
 //! `asInvoker`. gpui's own manifest, linked into every app it builds, says
 //! exactly that; Velo installs per user and asks for nothing more.
 //!
-//! The payload is read from `VELO_PAYLOAD_DIR` when it is set (the release
+//! The payload is read from `WASP_PAYLOAD_DIR` when it is set (the release
 //! task sets it after building the program) and compressed into
 //! `OUT_DIR/payload.bin`. Unset, the payload is empty and the installer says
 //! so instead of installing nothing.
@@ -19,16 +19,16 @@ include!("../../packaging/windows/version_resource.rs");
 
 /// What the installer carries, in the order it writes them.
 const FILES: &[&str] = &[
-    "velo.exe",
-    "velod.exe",
-    "velo-cli.exe",
+    "wasp.exe",
+    "waspd.exe",
+    "wasp-cli.exe",
     "LICENSE.txt",
     "THIRD-PARTY-NOTICES.txt",
 ];
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=VELO_PAYLOAD_DIR");
+    println!("cargo:rerun-if-env-changed=WASP_PAYLOAD_DIR");
     embed_installer_resources();
     pack_payload();
 }
@@ -38,9 +38,9 @@ fn embed_installer_resources() {
         return;
     }
     embed_windows_resources(
-        "../../packaging/windows/velo.ico",
-        "Velo Setup",
-        "velo-setup.exe",
+        "../../packaging/windows/wasp.ico",
+        "Wasp Setup",
+        "wasp-setup.exe",
     );
     // No manifest of ours: gpui links one into every app it builds, and it
     // already says `asInvoker` (so the "setup" in this file's name does not
@@ -48,13 +48,13 @@ fn embed_installer_resources() {
     // DPI awareness. A second one fails the link with "duplicate resource".
 }
 
-/// `VELO1`, a count, then for each file: its name, its size, its
+/// `WASP1`, a count, then for each file: its name, its size, its
 /// compressed size and the zlib stream.
 fn pack_payload() {
     let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("payload.bin");
     let mut payload = Vec::new();
-    payload.extend_from_slice(b"VELO1");
-    let Some(dir) = std::env::var_os("VELO_PAYLOAD_DIR").map(PathBuf::from) else {
+    payload.extend_from_slice(b"WASP1");
+    let Some(dir) = std::env::var_os("WASP_PAYLOAD_DIR").map(PathBuf::from) else {
         payload.extend_from_slice(&0u32.to_le_bytes());
         std::fs::write(&out, payload).unwrap();
         return;

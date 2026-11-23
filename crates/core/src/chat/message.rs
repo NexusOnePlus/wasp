@@ -68,6 +68,16 @@ pub struct ChatMessage {
     /// Display-only template, interactive card or business response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub business: Option<crate::BusinessContent>,
+    /// The link card WhatsApp sent with the text, when it sent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_preview: Option<crate::LinkPreview>,
+    /// Who has delivered, read or played this outgoing message, keyed by JID.
+    ///
+    /// The aggregate `status` is what the ticks draw; this is what the message
+    /// info panel and the "read by" line can name. Incoming messages leave it
+    /// empty.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub receipts: HashMap<String, MessageStatus>,
 }
 
 /// What a failed message can be sent again as.
@@ -132,6 +142,8 @@ impl ChatMessage {
             system: None,
             poll: None,
             business: None,
+            link_preview: None,
+            receipts: HashMap::new(),
         }
     }
 
@@ -165,6 +177,8 @@ impl ChatMessage {
             system: None,
             poll: None,
             business: None,
+            link_preview: None,
+            receipts: HashMap::new(),
         }
     }
 

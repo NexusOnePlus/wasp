@@ -211,6 +211,18 @@ pub fn mime_for_name(file_name: &str) -> &'static str {
 /// just applies it to the pictures this tree cannot turn into photos.
 #[must_use]
 pub fn kind_for(mime_type: &str) -> OutgoingMedia {
+    // A GIF is an animation, not a still photo: the session turns one into
+    // the MP4 WhatsApp plays. Leaving it as `Image` was what made a pasted
+    // GIF fail with "perderia a animação como foto".
+    if mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("image/gif")
+    {
+        return OutgoingMedia::Gif;
+    }
     match OutgoingMedia::for_mime(mime_type) {
         OutgoingMedia::Image if !arrives_as_a_photo(mime_type) => OutgoingMedia::Document,
         kind => kind,
@@ -235,6 +247,11 @@ fn kind_for_category(
         Some(AttachmentCategory::PhotosVideos) => match kind_for(mime_type) {
             OutgoingMedia::Image => Ok(OutgoingMedia::Image),
             OutgoingMedia::Video => Ok(OutgoingMedia::Video),
+            // A GIF picked from Photos is still an animation; the send path
+            // turns it into the MP4 WhatsApp plays.
+            OutgoingMedia::Gif if mime_type.eq_ignore_ascii_case("image/gif") => {
+                Ok(OutgoingMedia::Gif)
+            }
             OutgoingMedia::Document | OutgoingMedia::Sticker | OutgoingMedia::Gif => {
                 Err(crate::tr!(unsupported_media, file_name))
             }
@@ -289,7 +306,8 @@ fn selected_kind_and_mime(
         let valid = match kind {
             OutgoingMedia::Image => image_mime_from_bytes(bytes).is_some_and(arrives_as_a_photo),
             OutgoingMedia::Video => recognizable_video_container(bytes),
-            OutgoingMedia::Document | OutgoingMedia::Sticker | OutgoingMedia::Gif => false,
+            OutgoingMedia::Gif => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+            OutgoingMedia::Document | OutgoingMedia::Sticker => false,
         };
         if !valid {
             return Err(crate::tr!(unverified_media, file_name));
@@ -872,7 +890,6 @@ mod tests {
         for photo in [
             "image/jpeg",
             "image/png",
-            "image/gif",
             "image/webp",
             "IMAGE/JPEG",
             "image/jpeg; charset=binary",
@@ -881,6 +898,7 @@ mod tests {
         ] {
             assert_eq!(kind_for(photo), OutgoingMedia::Image, "{photo}");
         }
+        assert_eq!(kind_for("image/gif"), OutgoingMedia::Gif);
         // And the kinds this rule has no opinion about are left alone.
         assert_eq!(kind_for("video/mp4"), OutgoingMedia::Video);
         assert_eq!(kind_for("application/pdf"), OutgoingMedia::Document);
@@ -956,7 +974,6 @@ mod tests {
         );
         for (name, mime, bytes) in [
             ("photo.png", "image/png", &b"\x89PNG\r\n\x1a\n"[..]),
-            ("photo.gif", "image/gif", &b"GIF89a"[..]),
             ("photo.webp", "image/webp", &b"RIFF\0\0\0\0WEBP"[..]),
         ] {
             assert_eq!(
@@ -965,6 +982,15 @@ mod tests {
                 "{name}"
             );
         }
+        assert_eq!(
+            selected_kind_and_mime(
+                "photo.gif",
+                "image/gif",
+                b"GIF89a",
+                Some(AttachmentCategory::PhotosVideos),
+            ),
+            Ok((OutgoingMedia::Gif, "image/gif".into()))
+        );
         let mp4 = b"\0\0\0\x18ftypisom";
         assert_eq!(
             selected_kind_and_mime(

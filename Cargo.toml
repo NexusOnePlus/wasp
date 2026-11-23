@@ -1,5 +1,5 @@
 # Workspace root. `crates/gui` is the only member today; the daemon
-# (`velod`) and a TUI front end land beside it, which is why the front end
+# (`waspd`) and a TUI front end land beside it, which is why the front end
 # is already a member instead of the root package.
 [workspace]
 members = [
@@ -34,8 +34,8 @@ edition = "2024"
 # Keep the workspace compiler floor aligned with rust-toolchain.toml and CI.
 rust-version = "1.100.0"
 license = "MIT"
-authors = ["João Lucas <jlucaso@hotmail.com>"]
-repository = "https://github.com/Ruchin-Audichya/velo"
+authors = ["Wasp contributors"]
+repository = "https://github.com/NexusOnePlus/wasp"
 
 # Mirror the library's safeguards (see /clippy.toml): wacore::time instead of
 # std clocks, portable-atomic for 64-bit atomics.

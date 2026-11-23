@@ -207,12 +207,12 @@ impl ResponsiveLayout {
             .clamp(minimum, maximum)
     }
 
+    /// The rail is gone: destinations live at the foot of the sidebar, so the
+    /// window's columns start at the sidebar's left edge. Kept as a named
+    /// answer rather than deleted because the width arithmetic below reads it
+    /// as "space reserved for navigation", and zero is the reservation now.
     pub fn rail_width(&self) -> Pixels {
-        if self.is_mobile() {
-            Pixels::ZERO
-        } else {
-            self.metrics.icon_button() + self.metrics.space_lg()
-        }
+        Pixels::ZERO
     }
 
     pub fn can_show_details(&self) -> bool {

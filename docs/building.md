@@ -43,9 +43,9 @@ cargo test --manifest-path xtask/Cargo.toml
 cargo xtask help    # what there is to run; from the repository root
 
 # Running it: the window and the daemon, and the window looks for the daemon
-# beside itself. `--bin velo-cli` is the scriptable front end onto the same
+# beside itself. `--bin wasp-cli` is the scriptable front end onto the same
 # daemon; see docs/cli.md.
-cargo build --release --bin Velo --bin velod && ./target/release/velo
+cargo build --release --bin wasp --bin waspd && ./target/release/wasp
 
 # A plugin. Its own workspace, its own target, and the file's name is its id.
 # `examples/template` is the same command; `cargo test` in either directory
@@ -60,7 +60,7 @@ cargo build --release --bin Velo --bin velod && ./target/release/velo
 # should be, since `CARGO_TARGET_DIR` moves it.
 rustup target add wasm32-unknown-unknown
 module="$(cargo xtask plugin build examples/autoreply)"
-cp "$module" ~/.local/share/velo/plugins/
+cp "$module" ~/.local/share/wasp/plugins/
 # And the one test that exercises the real SDK against the real host: it loads
 # the module the line above built. CI runs both, in the Linux `Check` job.
 cargo test -p velo-plugin-host --all-features -- --ignored
@@ -90,7 +90,7 @@ TRUNK_ACTION=serve cargo xtask web build
 # token file is, not the token — that is a bearer credential and a log is
 # what people paste into issues. The token goes after a `#`, never a `?`: a
 # query reaches whoever served the page, a fragment never leaves the browser.
-cargo run --bin velod -- --web
+cargo run --bin waspd -- --web
 
 # The same bundle with its symbols, for when a profile or a panic trace has
 # to name something. `[profile.web-debug]` inherits `[profile.web]` and turns
